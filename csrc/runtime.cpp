@@ -153,6 +153,12 @@ void debugging(RuntimeContext* ctx) {
   DP_LOG(DEBUG, "runtime debugging function.");
   DEBUGGING_MODE = true;
 
+  if (ctx->rank == 0)
+    comm_p2p_master();
+  if (ctx->rank == 1)
+    comm_p2p_slave();
+
+/*
   ServerContext serverCtx;
   ScheduleTrainingRequest req;
   StandardReply reply;
@@ -165,6 +171,7 @@ void debugging(RuntimeContext* ctx) {
   ctx->grpcService->ScheduleTraining(&serverCtx, &req, &reply);
 
   DP_LOG(DEBUG, "runtime debugging function exits.");
+*/
 }
 
 void parse_args(RuntimeContext* ctx, int argc, char** argv) {

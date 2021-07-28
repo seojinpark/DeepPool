@@ -70,7 +70,7 @@ target_link_libraries(dp_grpc_proto
 # Linking info for runtime.
 add_executable(runtime
   "runtime.cpp" "runnableModule.cpp" "taskManager.cpp" "logger.cpp" 
-  "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" )
+  "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" "comm_p2p_master.cpp" "comm_p2p_slave.cpp")
 target_link_libraries(runtime
   dp_grpc_proto
   ${_REFLECTION}
