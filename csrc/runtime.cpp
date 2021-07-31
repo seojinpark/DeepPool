@@ -28,6 +28,8 @@
 #include "communication.h"
 #include "utils.h"
 #include "logger.h"
+#include "nccl.h"
+#include "cuda_runtime.h"
 
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/grpcpp.h>
@@ -133,6 +135,87 @@ class RuntimeServiceImpl final : public Runtime::Service {
     return Status::OK;
   }
 
+  Status InitCommBackend(ServerContext* context, const InitCommBackendMsg* request,
+                         InitCommBackendMsg* reply) override {
+    DP_LOG(NOTICE, "InitCommBackend requested.");
+
+    int msg_type = request->msg_type();
+    int id_size = request->id_size();
+    char bytes[128];
+
+    if (msg_type == 0) { // Generate comm group ID at rank 0
+      if (rtctx->rank == 0) {
+        ncclUniqueId cliqueId;
+        ncclGetUniqueId(&cliqueId);
+
+        memcpy(bytes, cliqueId.internal, 128);
+        std::string replyMsg("Comm group ID generation: generated at rank 0.");
+        reply->set_message(replyMsg);
+      }
+      else {
+        memset(bytes, 0, 128);
+        std::string replyMsg("Comm group ID generation: nothing done at rank 1+.");
+        reply->set_message(replyMsg);
+      }
+    }
+    else if (msg_type == 1) { // Broadcast comm group ID and join
+      memcpy(bytes, (request->group_id()).c_str(), 128);
+
+      ncclComm_t comm;
+      ncclUniqueId cliqueId;
+      cudaStream_t* s = (cudaStream_t*)malloc(sizeof(cudaStream_t));
+
+      cudaSetDevice(0);
+      cudaStreamCreate(s);
+      memcpy(cliqueId.internal, bytes, 128);
+
+      ncclCommInitRank(&comm, rtctx->worldSize, cliqueId, rtctx->rank);
+
+      // NCCL P2P communication simple test routine
+      torch::Tensor send_tensor = torch::ones({3,3}, torch::Device(torch::kCUDA, 0));
+      torch::Tensor recv_tensor = torch::zeros({9}, torch::Device(torch::kCUDA, 0));
+
+      std::cout << send_tensor << std::endl;
+      std::cout << send_tensor.data_ptr() << std::endl;
+      std::cout << recv_tensor << std::endl;
+      std::cout << recv_tensor.data_ptr() << std::endl;
+
+      ncclGroupStart();
+      printf("rank %d sending to rank %d\n", rtctx->rank, (rtctx->rank+1)%2);
+      ncclSend((void*)send_tensor.data_ptr(), 9, ncclFloat, (rtctx->rank+1)%2, comm, s[0]);
+      printf("rank %d recving from rank %d\n", rtctx->rank, (rtctx->rank+1)%2);
+      ncclRecv((void*)recv_tensor.data_ptr(), 9, ncclFloat, (rtctx->rank+1)%2, comm, s[0]);
+      ncclGroupEnd();
+
+      std::cout << send_tensor << std::endl;
+      std::cout << send_tensor.data_ptr() << std::endl;
+      std::cout << recv_tensor << std::endl;
+      std::cout << recv_tensor.data_ptr() << std::endl;
+
+      //synchronizing on CUDA streams to wait for completion of NCCL operation
+      cudaSetDevice(0);
+      cudaStreamSynchronize(s[0]);
+
+      //finalizing NCCL
+      ncclCommDestroy(comm);
+
+      std::string replyMsg("Comm group ID broadcast & joined.");
+      reply->set_message(replyMsg);
+    }
+    else {
+      memcpy(bytes, (request->group_id()).c_str(), 128);
+
+      std::string replyMsg("Undefined request.");
+      reply->set_message(replyMsg);
+    }
+
+    reply->set_group_id(bytes, id_size);
+    reply->set_msg_type(msg_type);
+    reply->set_id_size(id_size);
+
+    return Status::OK;
+  }
+
   RuntimeContext* rtctx;
 };
 
@@ -152,11 +235,6 @@ void initGrpcServer(RuntimeContext* ctx) {
 void debugging(RuntimeContext* ctx) {
   DP_LOG(DEBUG, "runtime debugging function.");
   DEBUGGING_MODE = true;
-
-  if (ctx->rank == 0)
-    comm_p2p_master();
-  if (ctx->rank == 1)
-    comm_p2p_slave();
 
 /*
   ServerContext serverCtx;

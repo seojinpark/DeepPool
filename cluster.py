@@ -28,6 +28,7 @@ from jobDescription import TrainingJob
 import grpc
 import runtime_pb2
 import runtime_pb2_grpc
+from codecs import encode
 
 # import examples.vgg as vgg  # TODO: this is used for debugging. Remove this later.
 
@@ -51,10 +52,11 @@ class CppRuntimeProxy:
         response = self.stub.Shutdown(runtime_pb2.Empty())
         print("received: " + response.message)
 
-    def initCommBackend(self):
-        # response = self.stub.(runtime_pb2.Empty())
-        # print("received: " + response.message)
-        print("initCommBackend() not implemented")
+    def initCommBackend(self, message, msgType, groupId, idSize):
+        response = self.stub.InitCommBackend(runtime_pb2.InitCommBackendMsg(
+            message=message, msg_type=msgType, group_id=groupId, id_size=idSize))
+        print("received: " + response.message)
+        return response.group_id;
     
     def initCommGroups(self, jobName, commGroupsInJson):
         print("initCommGroups not implemented")
@@ -349,11 +351,12 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
                 print("GRPC error while shuting down %s" % location.address)
 
     def initCommBackendAll(self):
+        group_id = self.locations[0].getProxy().initCommBackend("Generate comm group", 0, bytes(128), 128)
         threadList = []
-        def requestInitCommBackend(proxy):
-            print(proxy.initCommBackend())
+        def requestInitCommBackend(proxy, message, msgType, groupId, idSize):
+            proxy.initCommBackend(message, msgType, groupId, idSize)
         for i, location in enumerate(self.locations):
-            thread = threading.Thread(name='init_comm%d'%i, target=requestInitCommBackend, args=(location.getProxy(),))
+            thread = threading.Thread(name='init_comm%d'%i, target=requestInitCommBackend, args=(location.getProxy(), "Join comm group", 1, group_id, 128,))
             threadList.append(thread)
         for thread in threadList:
             thread.start()

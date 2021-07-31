@@ -5,11 +5,11 @@ syntax = "proto3";
 
 // Interface exported by the server.
 service Runtime {
-  // rpc InitCommBackend(Empty) returns (StandardReply) {}
   // rpc initCommGroups() returns (string) {}
   rpc ScheduleTraining(ScheduleTrainingRequest) returns (StandardReply) {}
   rpc Poke(Empty) returns (StandardReply) {}
   rpc Shutdown(Empty) returns (StandardReply) {}
+  rpc InitCommBackend(InitCommBackendMsg) returns (InitCommBackendMsg) {}
 }
 
 message Empty {}
@@ -24,4 +24,11 @@ message ScheduleTrainingRequest {
 
 message StandardReply {
   string message = 1;
+}
+
+message InitCommBackendMsg {
+  string message = 1;
+  int32 msg_type = 2;
+  bytes group_id = 3;
+  int32 id_size = 4;
 }
