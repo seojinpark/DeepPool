@@ -399,7 +399,7 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
       if (job->run_with_be && be_bsize > 0) be_controller.Pause();
       c10::cuda::device_synchronize();
       DP_LOG(NOTICE, "Starting capture.");
-      job->model->graph.capture_begin();
+      job->model->maingraph.capture_begin();
       job->commHandler->precapture();
     } else if (job->totiters > job->iters_before_graph_capture) {
       /* skip to forward phase */
@@ -420,9 +420,9 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
 
       static CUDAPipeline p(8);
       p.Lap();
-      job->model->graph.replay();
-      job->model->gradientSync(true);
-      job->model->graph1.replay();
+      job->model->maingraph.replay();
+      job->model->syncgraph.replay();
+      job->model->stepgraph.replay();
       job->state = JobState::FINISH;
       return 1;
     }
@@ -459,12 +459,13 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
 
     if (job->totiters == job->iters_before_graph_capture) {
       job->commHandler->postcapture();
-      job->model->graph.capture_end();
-      job->model->gradientSync(true); // retain grads in param list
-      job->model->graph1.capture_begin();
-      job->commHandler->precapture();
+      job->model->maingraph.capture_end();
+      job->model->syncgraph.capture_begin();
+      job->model->gradientSync();
+      job->model->syncgraph.capture_end();
+      job->model->stepgraph.capture_begin();
     } else {
-      job->model->gradientSync(false);
+      job->model->gradientSync();
     }
     job->timers[CT_SYNC].record();
     job->state = JobState::STEP;
@@ -480,8 +481,7 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
       CUDA_API_CALL(cudaProfilerStop());
 
     if (job->totiters == job->iters_before_graph_capture) {
-      job->commHandler->postcapture();
-      job->model->graph1.capture_end();
+      job->model->stepgraph.capture_end();
       if (job->run_with_be && be_bsize > 0) be_controller.Resume();
       DP_LOG(NOTICE, "Ending capture.");
     }

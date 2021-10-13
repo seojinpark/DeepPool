@@ -265,7 +265,7 @@ class RunnableModule : public torch::nn::Module {
   JobStatus forwardAStep(bool captureLayer = false);
   JobStatus backwardAStep(bool captureLayer = false);
   void loss();
-  void gradientSync(bool retain_params);
+  void gradientSync();
   void initProfileTimers(CudaTimer* ct_load, CudaTimer* ct_loss);
   void resetProfileTimers();
   void printProfileTimers(int warmupIters);
@@ -298,7 +298,7 @@ class RunnableModule : public torch::nn::Module {
 
   bool backwards_did_sync{false};
 
-  at::cuda::CUDAGraph graph, graph1;
+  at::cuda::CUDAGraph maingraph, syncgraph, stepgraph;
   // Performance Stat
   CpuTimer detachTimer;
 

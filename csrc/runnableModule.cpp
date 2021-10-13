@@ -790,17 +790,15 @@ RunnableModule::backwardAStep(bool captureLayer)
 }
 
 void
-RunnableModule::gradientSync(bool retain_params) {
+RunnableModule::gradientSync() {
   if (bytes_inflight) {
       commHandler->comm_start(rtctx->grad_sync_stream);
       for (auto &p : pending_grads)
         commHandler->all_reduce(p, c10d::ReduceOp::SUM, true);
       commHandler->comm_end();
       backwards_did_sync = true;
-      if (!retain_params) {
-        bytes_inflight = 0;
-        pending_grads.clear();
-      }
+      bytes_inflight = 0;
+      pending_grads.clear();
   }
   if (backwards_did_sync) {
     commHandler->sync(rtctx->grad_sync_stream);
