@@ -401,7 +401,7 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
       DP_LOG(NOTICE, "Starting capture.");
       job->model->graph.capture_begin();
       job->commHandler->precapture();
-    } else if (job->totiters >= rtctx->iters_per_capture + job->iters_before_graph_capture) {
+    } else if (job->totiters > job->iters_before_graph_capture) {
       /* skip to forward phase */
       job->state = JobState::FORWARD;
       return 1;
@@ -415,18 +415,14 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     DP_LOG(DEBUG, "Foward pass is starting soon.");
   } else if (job->state == JobState::FORWARD) {
     DP_LOG(DEBUG, "JobState::FORWARD.");
-    if (job->totiters >= rtctx->iters_per_capture + job->iters_before_graph_capture) {
+    if (job->totiters > job->iters_before_graph_capture) {
       DP_LOG(DEBUG, "Replay iter.");
-
-      if ((job->totiters - job->iters_before_graph_capture) % rtctx->iters_per_capture) {
-        /* advance state machine, no replay */
-        job->state = JobState::FINISH;
-        return 1;
-      }
 
       static CUDAPipeline p(8);
       p.Lap();
       job->model->graph.replay();
+      job->model->gradientSync(true);
+      job->model->graph1.replay();
       job->state = JobState::FINISH;
       return 1;
     }
@@ -460,8 +456,16 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     }
   } else if (job->state == JobState::SYNC) {
     DP_LOG(DEBUG, "JobState::SYNC.");
-    // DP_LOG(DEBUG, "All-reduce parameter sync is not implemented yet.");
-    job->model->gradientSync();
+
+    if (job->totiters == job->iters_before_graph_capture) {
+      job->commHandler->postcapture();
+      job->model->graph.capture_end();
+      job->model->gradientSync(true); // retain grads in param list
+      job->model->graph1.capture_begin();
+      job->commHandler->precapture();
+    } else {
+      job->model->gradientSync(false);
+    }
     job->timers[CT_SYNC].record();
     job->state = JobState::STEP;
   } else if (job->state == JobState::STEP) {
@@ -475,9 +479,9 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     if (job->totiters == job->profile_iter_start + job->niter_to_profile)
       CUDA_API_CALL(cudaProfilerStop());
 
-    if (job->totiters == rtctx->iters_per_capture - 1 + job->iters_before_graph_capture) {
+    if (job->totiters == job->iters_before_graph_capture) {
       job->commHandler->postcapture();
-      job->model->graph.capture_end();
+      job->model->graph1.capture_end();
       if (job->run_with_be && be_bsize > 0) be_controller.Resume();
       DP_LOG(NOTICE, "Ending capture.");
     }
