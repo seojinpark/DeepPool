@@ -13,6 +13,15 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -std=c++14 -Wall -Wex
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
 
+enable_language(CUDA)
+set(CUDA_ATTACH_VS_BUILD_RULE_TO_CUDA_FILE ON)
+set(BUILD_SHARED_LIBS ON)
+set(CUDA_SEPARABLE_COMPILATION ON)
+
+cuda_add_library("cudasleep"
+  CUDASleep.cu
+)
+
 
 # cloning gRPC at configure time.
 message(STATUS "Using gRPC via add_subdirectory (FetchContent).")
@@ -75,6 +84,7 @@ add_executable(runtime
   "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" )
 target_link_libraries(runtime
   dp_grpc_proto
+  cudasleep
   ${_REFLECTION}
   ${_GRPC_GRPCPP}
   ${_PROTOBUF_LIBPROTOBUF}

@@ -149,6 +149,7 @@ void parse_args(RuntimeContext* ctx, int argc, char** argv) {
       {"iters_per_capture", required_argument, NULL, 'i'},
       {"min_layer_sync", required_argument, NULL, 'h'},
       {"sync_bucket_size", required_argument, NULL, 'k'},
+      {"be_graph_split_ms", required_argument, NULL, 'n'},
       {NULL, 0, NULL, 0}
   };
 
@@ -173,6 +174,9 @@ void parse_args(RuntimeContext* ctx, int argc, char** argv) {
         break;
       case 'm':
         ctx->myAddr = optarg;
+        break;
+      case 'n':
+        ctx->be_graph_split_ms = atof(optarg);
         break;
       case 'd':
         ctx->device = atoi(optarg);

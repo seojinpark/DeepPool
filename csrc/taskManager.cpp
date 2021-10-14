@@ -23,6 +23,8 @@
 #include "communication.h"
 #include "logger.h"
 
+#include "CUDASleep.h"
+
 #include <cuda_profiler_api.h>
 
 #include <ATen/autocast_mode.h>
@@ -46,6 +48,154 @@ class CUDAPipeline {
   size_t cur_idx_{0};
   at::cuda::CUDAEvent ev_;
 };
+
+static cudaGraphExec_t GraphSubset(std::set<cudaGraphNode_t> lnodes,
+                                   cudaGraph_t graph) {
+  std::vector<cudaGraphNode_t> nodes;
+  size_t nr;
+  CUDA_API_CALL(cudaGraphGetNodes(graph, nullptr, &nr));
+  nodes.resize(nr);
+  CUDA_API_CALL(cudaGraphGetNodes(graph, nodes.data(), &nr));
+
+  cudaGraph_t gclone;
+  CUDA_API_CALL(cudaGraphClone(&gclone, graph));
+  for (auto& n : nodes) {
+    if (lnodes.count(n)) continue;
+    cudaGraphNode_t clnode;
+    CUDA_API_CALL(cudaGraphNodeFindInClone(&clnode, n, gclone));
+    CUDA_API_CALL(cudaGraphDestroyNode(clnode));
+  }
+
+  cudaGraphExec_t exec;
+  CUDA_API_CALL(cudaGraphInstantiate(&exec, gclone, nullptr, nullptr, 0));
+  CUDA_API_CALL(cudaGraphDestroy(gclone));
+
+  return exec;
+}
+
+static float TimeGraphNode(std::set<cudaGraphNode_t> lnodes,
+                           cudaGraph_t graph) {
+  cudaGraphExec_t exec = GraphSubset(lnodes, graph);
+  CUDA_API_CALL(cudaGraphUpload(exec, 0));
+
+  cudaEvent_t begin, end;
+  CUDA_API_CALL(cudaEventCreateWithFlags(&begin, cudaEventDefault));
+  CUDA_API_CALL(cudaEventCreateWithFlags(&end, cudaEventDefault));
+  CUDA_API_CALL(cudaDeviceSynchronize());
+  gpu_nsleep(5000000, 0);
+  CUDA_API_CALL(cudaEventRecord(begin));
+  CUDA_API_CALL(cudaGraphLaunch(exec, 0));
+  CUDA_API_CALL(cudaEventRecord(end));
+  CUDA_API_CALL(cudaDeviceSynchronize());
+
+  float ms;
+  CUDA_API_CALL(cudaEventElapsedTime(&ms, begin, end));
+  CUDA_API_CALL(cudaEventDestroy(begin));
+  CUDA_API_CALL(cudaEventDestroy(end));
+
+  CUDA_API_CALL(cudaGraphExecDestroy(exec));
+
+  return ms;
+}
+
+std::vector<cudaGraphExec_t> GraphPartitioner(cudaGraph_t graph,
+                                              float ms_piece_split) {
+  assert(graph != nullptr);
+
+  if (ms_piece_split <= 0) {
+    cudaGraph_t clone;
+    CUDA_API_CALL(cudaGraphClone(&clone, graph));
+    cudaGraphExec_t gr;
+    CUDA_API_CALL(cudaGraphInstantiate(&gr, clone, nullptr, nullptr, 0));
+    CUDA_API_CALL(cudaGraphDestroy(clone));
+    return {gr};
+  }
+
+  size_t nr;
+
+  std::vector<cudaGraphNode_t> nodes;
+  std::queue<cudaGraphNode_t> stack;
+  std::set<cudaGraphNode_t> seen;
+
+  assert(graph != nullptr);
+  CUDA_API_CALL(cudaGraphGetRootNodes(graph, nullptr, &nr));
+  nodes.resize(nr);
+  CUDA_API_CALL(cudaGraphGetRootNodes(graph, nodes.data(), &nr));
+  assert(nr == 1);
+
+  std::vector<std::set<cudaGraphNode_t>> layers;
+  std::vector<float> layers_time;
+
+  std::set<cudaGraphNode_t> cur_layer;
+
+  auto visit = [&](std::vector<cudaGraphNode_t>& nodes) {
+    for (auto& p : nodes) {
+      if (seen.count(p) != 0) continue;
+      seen.insert(p);
+      stack.push(p);
+      cur_layer.insert(p);
+    }
+  };
+
+  visit(nodes);
+  float ms_tot = 0.0;
+
+  while (stack.size() > 0) {
+    while (stack.size() > 1) {
+      auto node = stack.front();
+      stack.pop();
+
+      CUDA_API_CALL(cudaGraphNodeGetDependentNodes(node, nullptr, &nr));
+      if (!nr) continue;
+      nodes.resize(nr);
+      CUDA_API_CALL(cudaGraphNodeGetDependentNodes(node, nodes.data(), &nr));
+      visit(nodes);
+    }
+
+    if (stack.size() == 0)  // Handle?
+      continue;
+
+    assert(stack.size() == 1);
+    layers.push_back(cur_layer);
+
+    float layer_ms = TimeGraphNode(cur_layer, graph);
+    layers_time.push_back(layer_ms);
+    ms_tot += layer_ms;
+    cur_layer.clear();
+
+    auto node = stack.front();
+    stack.pop();
+
+    CUDA_API_CALL(cudaGraphNodeGetDependentNodes(node, nullptr, &nr));
+    if (!nr) continue;
+    nodes.resize(nr);
+    CUDA_API_CALL(cudaGraphNodeGetDependentNodes(node, nodes.data(), &nr));
+    visit(nodes);
+  }
+
+  assert(stack.size() == 0);
+  assert(cur_layer.size() == 0);
+
+  float cur_layer_ms = 0;
+
+  cur_layer.clear();
+  std::vector<cudaGraphExec_t> merged_layers;
+
+  for (size_t i = 0; i < layers.size(); i++) {
+    auto& l = layers.at(i);
+    cur_layer.insert(l.begin(), l.end());
+    cur_layer_ms += layers_time.at(i);
+
+    if (cur_layer_ms >= ms_piece_split) {
+      merged_layers.push_back(GraphSubset(cur_layer, graph));
+      cur_layer.clear();
+      cur_layer_ms = 0;
+    }
+  }
+  merged_layers.push_back(GraphSubset(cur_layer, graph));
+
+  return merged_layers;
+}
 
 class BeRunner {
 public:
@@ -137,9 +287,12 @@ static long be_bsize = 0;
 /* tremendous WIP */
 void BeRunner(long bsize) {
   be_bsize = bsize;
+  bool use_graph_partitioner = rtctx->be_graph_split_ms > 0.0;
   int samplePerKernel = rtctx->samplePerKernel;
   assert(bsize % samplePerKernel == 0);
   long splitways = bsize / samplePerKernel;
+  assert(!use_graph_partitioner || splitways == 1);
+  assert(!use_graph_partitioner || rtctx->use_be_graph);
 
   torch::jit::script::Module m = torch::jit::load(rtctx->be_jit_file);
   m.train();
@@ -164,6 +317,7 @@ void BeRunner(long bsize) {
 
   at::autocast::set_enabled(true);
 
+  assert(static_cast<size_t>(splitways) == tenss.size());
   auto fn = [&] {
     auto orig_stream = c10::cuda::getCurrentCUDAStream();
     optim.zero_grad();
@@ -171,14 +325,18 @@ void BeRunner(long bsize) {
     ev.record(orig_stream);
     for (size_t i = 0; i < tenss.size(); i++) {
       auto &st = streams.at(i);
-      c10::cuda::setCurrentCUDAStream(st);
-      ev.block(st);
+      if (splitways > 1) {
+        c10::cuda::setCurrentCUDAStream(st);
+        ev.block(st);
+      }
       auto ret = m.operator()({tenss.at(i)});
       auto loss = torch::nll_loss(ret.toTensor().log_softmax(1), targs.at(i));
       loss.backward();
-      at::cuda::CUDAEvent ev2;
-      ev2.record(st);
-      ev2.block(orig_stream);
+      if (splitways > 1) {
+        at::cuda::CUDAEvent ev2;
+        ev2.record(st);
+        ev2.block(orig_stream);
+      }
     }
 
     c10::cuda::setCurrentCUDAStream(orig_stream);
@@ -202,10 +360,24 @@ void BeRunner(long bsize) {
     beinited = true;
   }
 
+  CUDAPipeline p(1);
+
+  if (use_graph_partitioner) {
+    auto parts = GraphPartitioner(graph.getGRAPH(), rtctx->be_graph_split_ms);
+    be_controller.Resume();
+    cv.notify_one();
+    while (true) {
+      for (auto &pp : parts) {
+        be_controller.Lap();
+        p.Lap();
+        CUDACHECK(cudaGraphLaunch(pp, cstream));
+      }
+      becounter.store(becounter.load() + bsize);
+    }
+  }
+
   be_controller.Resume();
   cv.notify_one();
-
-  CUDAPipeline p(1);
 
   while (true) {
     be_controller.Lap();
@@ -399,7 +571,8 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
       if (job->run_with_be && be_bsize > 0) be_controller.Pause();
       c10::cuda::device_synchronize();
       DP_LOG(NOTICE, "Starting capture.");
-      job->model->maingraph.capture_begin();
+      job->model->graph_mempool = at::cuda::graph_pool_handle();
+      job->model->maingraph.capture_begin(job->model->graph_mempool);
       job->commHandler->precapture();
     } else if (job->totiters > job->iters_before_graph_capture) {
       /* skip to forward phase */
@@ -460,10 +633,10 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     if (job->totiters == job->iters_before_graph_capture) {
       job->commHandler->postcapture();
       job->model->maingraph.capture_end();
-      job->model->syncgraph.capture_begin();
+      job->model->syncgraph.capture_begin(job->model->graph_mempool);
       job->model->gradientSync();
       job->model->syncgraph.capture_end();
-      job->model->stepgraph.capture_begin();
+      job->model->stepgraph.capture_begin(job->model->graph_mempool);
     } else {
       job->model->gradientSync();
     }
