@@ -443,9 +443,9 @@ def parse_args():
     """
     parser = ArgumentParser(description="Runtime")
     # Optional arguments for the launch helper
-    parser.add_argument("--coordinatorAddr", type=str, default="localhost:12340",
+    parser.add_argument("--coordinatorAddr", type=str, default="localhost:22340",
                         help="IP:port to the cluster coordinator")
-    parser.add_argument("--myAddr", type=str, default="localhost:1234",
+    parser.add_argument("--myAddr", type=str, default="localhost:2234",
                         help="IP:port this runtime should listen to."
                         "coordinator will talk to this node on this address")
     parser.add_argument("--device", type=int, default=0,

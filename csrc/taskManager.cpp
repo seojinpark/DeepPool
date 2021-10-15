@@ -230,7 +230,8 @@ TaskManager::poll()
   trainSingleStep(mainJob, &jobCompleted);
   if (jobCompleted) {
     size_t warmupIters = 100;
-    mainJob->model->printProfileTimers(warmupIters);
+    FILE * pFile = fopen(format("%s_rank_%d_timings.txt", mainJob->name.c_str(), rtctx->rank).c_str(),"w");
+    mainJob->model->printProfileTimers(warmupIters, pFile);
     size_t totiters = mainJob->totiters - warmupIters;
     using msec = std::chrono::duration<double, std::milli>;
     double elapsed_ms = std::chrono::duration_cast<msec>(mainJob->end - mainJob->start).count();
@@ -251,6 +252,21 @@ TaskManager::poll()
         mainJob->timers[CT_LOSS].getP50(warmupIters),
         mainJob->timers[CT_BP].getP50(warmupIters),
         mainJob->timers[CT_STOP].getP50(warmupIters));
+
+    fprintf (pFile, "A training job %s is completed (%lu iters, %.2f ms/iter, %.2f iter/s, %.2f be img/s)."
+        " AverageTiming (ms) => load:%.1f, fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f"
+        " P50 (ms) => fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f",
+        mainJob->name.c_str(), totiters, total_iter_ms, total_iter_ps, be_img_ps,
+        mainJob->timers[CT_LOAD].getAvg(warmupIters),
+        mainJob->timers[CT_FP].getAvg(warmupIters),
+        mainJob->timers[CT_LOSS].getAvg(warmupIters),
+        mainJob->timers[CT_BP].getAvg(warmupIters),
+        mainJob->timers[CT_STOP].getAvg(warmupIters),
+        mainJob->timers[CT_FP].getP50(warmupIters),
+        mainJob->timers[CT_LOSS].getP50(warmupIters),
+        mainJob->timers[CT_BP].getP50(warmupIters),
+        mainJob->timers[CT_STOP].getP50(warmupIters));
+    fclose (pFile);
 
     jobList.erase(jobList.begin());
     DP_LOG(NOTICE, "Removed the completed job. Remaining: %d",
@@ -352,29 +368,36 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
         // DP_LOG(NOTICE, "outputToVerify: %s", tsrToStr(job->outputToVerify).c_str());
       }
       
-      job->model->loss();
+      // job->model->loss();
       job->timers[CT_LOSS].record();
       assert(job->model->layerQ.empty());
-      job->model->layerQ.push_back(&job->model->layers.back());
-      DP_LOG(DEBUG, "Moving to backward pass.");
+      // job->model->layerQ.push_back(&job->model->layers.back());
+      // DP_LOG(DEBUG, "Moving to backward pass.");
       job->state = JobState::BACKWARD;
     }
   } else if (job->state == JobState::BACKWARD) {
     DP_LOG(DEBUG, "JobState::BACKWARD.");
     // DP_LOG(WARNING, "Backward pass is not implemented yet.");
-    bool completed = job->model->backwardAStep();
-    if (completed) {
-      job->timers[CT_BP].record();
-      job->state = JobState::SYNC;
-      DP_LOG(DEBUG, "Backward pass is completed. Moving to gradient all-reduce.");
+    // bool completed = job->model->backwardAStep();
+    // if (completed) {
+    //   job->timers[CT_BP].record();
+    //   job->state = JobState::SYNC;
+    //   DP_LOG(DEBUG, "Backward pass is completed. Moving to gradient all-reduce.");
+    // }
+    for (auto & l : job->model->layers) {
+      l.status = LayerStatus::PENDING_FP;
     }
+    job->timers[CT_BP].record();
+    job->state = JobState::SYNC;
+    DP_LOG(DEBUG, "Backward pass is completed. Moving to gradient all-reduce.");
+
   } else if (job->state == JobState::SYNC) {
     DP_LOG(DEBUG, "JobState::SYNC.");
-    if (job->iter == job->iters_before_graph_capture) {
-      job->commHandler->postcapture();
-      job->model->graph.capture_end();
-      DP_LOG(NOTICE, "Ending capture.");
-    }
+    // if (job->iter == job->iters_before_graph_capture) {
+    //   job->commHandler->postcapture();
+    //   job->model->graph.capture_end();
+    //   DP_LOG(NOTICE, "Ending capture.");
+    // }
 
     job->totiters++;
     job->iter++;

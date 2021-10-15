@@ -56,12 +56,19 @@ class CppRuntimeProxy:
         # print("received: " + response.message)
         print("initCommBackend() not implemented")
 
+    # def initCommNCCL(self, message, msgType, groupId, groupsDict):
+    #     groupSize = len(groupsDict["world"])
+    #     response = self.stub.InitCommNCCL(runtime_pb2.InitCommNCCLMsg(
+    #         message=message, msg_type=msgType, group_id=groupId, group_size=groupSize))
+    #     print("received: " + response.message)
+    #     return response.group_id;
+
     def initCommNCCL(self, message, msgType, groupId, groupsDict):
         groupSize = len(groupsDict["world"])
         response = self.stub.InitCommNCCL(runtime_pb2.InitCommNCCLMsg(
-            message=message, msg_type=msgType, group_id=groupId, group_size=groupSize))
+            message=str(message), msg_type=msgType, group_id=groupId, group_size=groupSize))
         print("received: " + response.message)
-        return response.group_id;
+        return response.group_id
 
     def initCommGRPC(self, rankToIpMap):
         rankToIpMapInJson = json.dumps(rankToIpMap)
@@ -142,9 +149,12 @@ class Location:
         return
     
     def rshAsync(self, command, **kwargs):
-        print("Sending cmd: %s" % command)
-        sh_command = ['ssh', '-i', self.sshKeyPath, '-o StrictHostKeyChecking=no', '%s@%s' % (self.userId, self.address),
-                    '%s' % command]
+        print("Sending cmd: /DeepPool/csrc/build/runtime %s" % command)
+        # sh_command = ['ssh', '-i', self.sshKeyPath, '%s@%s' % (self.userId, self.address),
+        #             '%s' % command]
+        
+        sh_command = ['/DeepPool/csrc/build/runtime']+('%s' % command).split(' ')
+        print(sh_command)
         p = subprocess.Popen(sh_command, **kwargs)
         return p
 
@@ -166,6 +176,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         self.myPort = portToBind
         self.locations = locations
         self.workDir = workDir
+        self.worldSize = 4
         self.processes = []  # from subprocess calls used for launching runtime.
         self.nextTagStartOffset = 1
         self.be_batch_size = be_batch_size
@@ -298,18 +309,20 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         """
         
         # Using the absolute path for compatibility with C++ runtime.
-        homedir = expanduser("~")
-        logdir = homedir + "/DeepPoolRuntime/logs/"
+        # homedir = expanduser("~")
+        logdir =  "/DeepPool/logs/"
         upSyncedAddrs = set()
         for i, location in enumerate(self.locations):
+            # if i in [0,1,2,3]: #1, 2, 3, 4, 5]:
+            #     continue
             if (location.address not in upSyncedAddrs):
                 # TODO: skip if location's addr is same as the current node.
                 # location.upSync(".", self.workDir)
                 upSyncedAddrs.add(location.address)
 
             # pass master ip and port.
-            stdoutFp = open("logs/runtime%d.out"%i, "w", buffering=1)
-            stderrFp = open("logs/runtime%d.err"%i, "w", buffering=1)
+            stdoutFp = open("/DeepPool/logs/runtime%d.out"%i, "w", buffering=1)
+            stderrFp = open("/DeepPool/logs/runtime%d.err"%i, "w", buffering=1)
             if profile:# and location.device == 0: # Only run 1 nsys per host.
                 nsysPrefix = "nsys profile -f true -o net%d -c cudaProfilerApi --stop-on-range-end true -t cuda,nvtx --export sqlite " % i # -s none
             else:
@@ -318,9 +331,19 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
                 print("Skipping ssh launching runtime. Must have launched them manually.")
             elif cppRuntime:
                 self.processes.append(location.rshAsync(
-                    "CUDA_VISIBLE_DEVICES=" + str(location.device) + " " + self.workDir + "csrc/build/runtime" + \
-                    " --coordinatorAddr %s:%d --myAddr %s:%d --device 0 --c10dBackend %s --rank %d --worldSize %d --logdir %s --be_batch_size %d %s" % \
-                        (self.myAddr, self.myPort, location.address, location.port, c10dBackend, i, len(self.locations), logdir, self.be_batch_size, "--profile" if profile else "") #+ \
+                    # "CUDA_VISIBLE_DEVICES=" + str(location.device) + " " + self.workDir + "csrc/build/runtime" + \
+                    # " --coordinatorAddr %s:%d --myAddr %s:%d --device 0 --c10dBackend %s --rank %d --worldSize %d --logdir %s --be_batch_size %d %s" % \
+                    #     (self.myAddr, self.myPort, location.address, location.port, c10dBackend, i, len(self.locations), logdir, self.be_batch_size, "--profile" if profile else "") #+ \
+                    # , stdout=stdoutFp, stderr=stderrFp))
+                
+                    "CUDA_VISIBLE_DEVICES=" + str(location.device) + " " + \
+                    #+ self.workDir + "csrc/build/runtime" + \
+                    # " --coordinatorAddr %s:%d --myAddr %s:%d --device 0 --c10dBackend %s --rank %d --worldSize %d --logdir %s --be_batch_size %d %s" % \
+                    #     (self.myAddr, self.myPort, location.address, location.port, c10dBackend, i, len(self.locations), logdir, self.be_batch_size, "--profile" if profile else "") #+ \
+                    
+                    # self.workDir + "csrc/build/runtime" + \
+                    " --coordinatorAddr %s:%d --myAddr %s:%d --device %d --c10dBackend %s --rank %d --worldSize %d --logdir %s --be_batch_size %d %s" % \
+                        (self.myAddr, self.myPort, location.address, location.port, location.device, c10dBackend, i, self.worldSize, logdir, self.be_batch_size, "--profile" if profile else "") #+ \
                     , stdout=stdoutFp, stderr=stderrFp))
             else:
                 self.processes.append(location.rshAsync(
@@ -478,7 +501,7 @@ def main():
         for deviceConfig in serverConfig["deviceList"]:
             rankToIpMap[str(len(locations))] = serverConfig["addr"] + ":" + str(deviceConfig["port"])
             commGrpRanksWorld.append(len(locations))
-            locations.append(Location(serverConfig["addr"], deviceConfig["port"], deviceConfig["device"], serverConfig["userId"], serverConfig["sshKeyPath"], args.cpp))
+            locations.append(Location(serverConfig["addr"], deviceConfig["port"], deviceConfig["device"], serverConfig["userId"], None, args.cpp))
     addrToBindCombo = re.split('[-:]', args.addrToBind)
     addrToBind = addrToBindCombo[0]
     portToBind = int(addrToBindCombo[1])

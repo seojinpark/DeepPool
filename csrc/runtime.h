@@ -43,18 +43,53 @@ namespace torch {
   }
 }
 
+struct RuntimeContext_params {
+  RuntimeContext_params() : coordinatorAddr(0), myAddr(0), device(0), c10dBackend(0),
+      c10dMasterPort(0), rank(), worldSize(), logdir(), be_batch_size(0),
+      profile(true), debug(false), verify(false)
+      {
+      }
+
+  ~RuntimeContext_params(){}; // Defined in cpp file because of incomplete unique_ptrs.
+
+  /**
+   * Populated by commandline arguments
+   */
+  char* coordinatorAddr;  // includes port number.
+  char* myAddr;           // includes port number.
+  int device;
+  char* c10dBackend;
+  int c10dMasterPort;
+  int rank;
+  int worldSize;
+  char* logdir;
+  int be_batch_size;
+  bool profile;
+  bool debug;
+  bool verify;
+};
+
+/**
+ * Context holding data for Runtime.
+ */
+
 /**
  * Context holding data for Runtime.
  */
 struct RuntimeContext {
-  RuntimeContext() : coordinatorAddr(0), myAddr(0), device(0), c10dBackend(0),
-      c10dMasterPort(0), rank(), worldSize(), logdir(), be_batch_size(0),
-      profile(false), debug(false), verify(false), homedir(0), c10dev(c10::DeviceType::CUDA, 0),
+  
+  RuntimeContext(const RuntimeContext_params params) : 
+      coordinatorAddr(params.coordinatorAddr), myAddr(params.myAddr), device(params.device), c10dBackend(params.c10dBackend),
+      c10dMasterPort(params.c10dMasterPort), rank(params.rank), worldSize(params.worldSize), logdir(params.logdir), be_batch_size(params.be_batch_size),
+      profile(params.profile), debug(params.debug), verify(params.verify), homedir(0), c10dev(c10::DeviceType::CUDA, params.device),
       grpcService(), grpcServer(), taskManager(), shutdownRequested(),
-      commHandlerMap(), rankToIpAndPort(), grpcCommReady(),
+      commHandlerMap(), rankToIpAndPort(), grpcCommReady(), 
       ncclGroupId(), ncclGroupSize(), ranks(), ncclCommReady(), ncclCommObj(),
-      torch_stream(c10::cuda::getStreamFromPool(true)), xfer_stream(c10::cuda::getStreamFromPool(true)) {
+      xfer_stream(c10::cuda::getStreamFromPool(true, params.device)),
+      torch_stream(c10::cuda::getStreamFromPool(true, params.device)) {
         c10::cuda::setCurrentCUDAStream(torch_stream);
+        assert(xfer_stream != NULL);
+        assert(torch_stream != NULL);
       }
 
   ~RuntimeContext(); // Defined in cpp file because of incomplete unique_ptrs.

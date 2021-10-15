@@ -23,7 +23,7 @@ class ClusterClient:
 
     def __init__(self, coordinatorAddr: str = None, coordinatorPort: int = None, maxRetries = 5):
         if coordinatorAddr == None:
-            coordinatorAddr = "127.0.0.1"
+            coordinatorAddr = "localhost"
             print("[ClusterClient] auto filled coodinator address: ", coordinatorAddr)
 
             # with open(PRIVATE_ADDR_FILENAME, "r") as f:
@@ -44,7 +44,7 @@ class ClusterClient:
                 self.proxy.poke()
                 return
             except ConnectionRefusedError:
-                print("Cannot connect to %s:%d. Will retry in %d sec." %
+                print("Client: Cannot connect to %s:%d. Will retry in %d sec." %
                     (coordinatorAddr, coordinatorPort, retryGap))
                 time.sleep(retryGap)
                 retryGap *= 2 # exponential back off.

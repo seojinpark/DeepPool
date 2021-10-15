@@ -31,15 +31,15 @@ import sys
 # 172.31.112.36	g1lmd6.fleet.perspectalabs.com g1lmd6
 
 # ipAddresses = ["172.31.112.32", "172.31.112.33"] # g1lmd2 and g1lmd3
-ipAddresses = ["172.31.112.33"] # g1lmd3
-# ipAddresses = ["172.31.112.34"] # g1lmd4
-pkeyPath = '~/.ssh/fastnic.pem'
-userId = "seojin"
+# ipAddresses = ["172.31.112.33"] # g1lmd3
+ipAddresses = ["localhost"] # g1lmd4
+# pkeyPath = '~/.ssh/fastnic.pem'
+userId = "root"
 workDir = "~/DeepPoolRuntime/"
 gpuIdxOffset = 1
 # gpuCount = 1
 gpuCount = 2
-portPrefix = 11240 # prefix + Device# is used for port.
+portPrefix = 11270 # prefix + Device# is used for port.
 coordinatorPort = 12345
 
 # with open(PUBLIC_ADDR_FILENAME, "r") as f:
@@ -90,7 +90,7 @@ def executeCommand(command):
         kwargs = dict()
         kwargs['stderr'] = subprocess.STDOUT
         
-        sh_command = ['ssh', '-i', pkeyPath, '-o', 'StrictHostKeyChecking=no', '%s@%s' % (userId, address), '%s' % command]
+        sh_command = ['%s' % command]
         try:
             subprocess.check_call(sh_command, **kwargs)
         except subprocess.CalledProcessError as e:
@@ -116,11 +116,11 @@ def downloadResults():
             print("Downloaded \"%s\" from %s"%(remotePath, host))
 
 def main():
-    downloadResults()
+    # downloadResults()
     generateConfigFile()
-    uploadCode()
+    # uploadCode()
     print("*** To start coordinator, execute following commands ***")
-    print("ssh -i %s %s@%s" % (pkeyPath, userId, ipAddresses[0]))
+    print("ssh %s@%s" % (userId, ipAddresses[0]))
     print("cd %s" % workDir)
     print("python3 cluster.py --addrToBind %s:%d --c10dBackend nccl --be_batch_size=0 --cpp" % (ipAddresses[0], coordinatorPort) )
 

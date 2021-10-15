@@ -711,7 +711,7 @@ def runStrongScalingBench():
     inputSize = (3,299,299)
     model = Inception3(aux_logits=False)
 
-    fakeInputSize = (16,3,299,299)
+    fakeInputSize = (32,3,299,299)
     fakeInput = torch.zeros(fakeInputSize)
     traced = torch.jit.script(model, fakeInput)
     torch.jit.save(traced, "modules/inception.pt")

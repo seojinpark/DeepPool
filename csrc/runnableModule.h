@@ -189,7 +189,7 @@ class RunnableModule : public torch::nn::Module {
   void loss();
   void initProfileTimers(CudaTimer* ct_load, CudaTimer* ct_loss);
   void resetProfileTimers();
-  void printProfileTimers(int warmupIters);
+  void printProfileTimers(int warmupIters, FILE* pFile=NULL);
 
   ////////////////////////////////////////////
   // Internal data structure.

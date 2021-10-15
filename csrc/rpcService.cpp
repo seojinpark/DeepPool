@@ -84,6 +84,7 @@ RuntimeServiceImpl::InitCommNCCL(ServerContext* context,
     if (rtctx->rank != 0) // Ranks 1+ need to receive ID before joining
       memcpy(&rtctx->ncclGroupId, request->group_id().c_str(), sizeof(rtctx->ncclGroupId));
 
+    CUDACHECK(cudaSetDevice(rtctx->device));    
     NCCL_API_CALL(ncclCommInitRank(&rtctx->ncclCommObj, rtctx->worldSize, rtctx->ncclGroupId, rtctx->rank));
     rtctx->ncclCommReady = true;
 

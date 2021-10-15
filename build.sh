@@ -8,6 +8,6 @@ python -m grpc_tools.protoc -Icsrc/protos --python_out=. --grpc_python_out=. csr
 # CPP runtime build.
 mkdir -p csrc/build
 pushd csrc/build/
-cmake ..
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/libtorch .
 make -j
 popd

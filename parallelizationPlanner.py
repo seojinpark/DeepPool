@@ -66,7 +66,7 @@ class CostSim:
         self.NET_LATENCY = 140 #40
         self.verbose = verbose
         self.layerProfileCache = {}
-        if gpuProfileLoc != None:
+        if gpuProfileLoc != None and False:
             self.loadGpuProfile(gpuProfileLoc)
         else:
             print("!!! gpuProfileLoc is not supplied for CostSim")
@@ -1613,17 +1613,17 @@ class CostSim:
         for rank, times in enumerate(gpuTimes):
             # if rank >= 8:
             #     break
-            print("rank%d" % (rank))
-            print(times)
+            # print("rank%d" % (rank))
+            # print(times)
             lastT = 0
             for start, end in sorted(times):
                 if start == end:
-                    print("skip")
+                    # print("skip")
                     continue
                 idx = totalGpus - rank - 1
                 # idx = 8 - rank - 1
-                if lastT > start:
-                    print("%5.3f %5.3f %5.3f" % (lastT, start, end))
+                # if lastT > start:
+                #     print("%5.3f %5.3f %5.3f" % (lastT, start, end))
                 # axs[idx].axvspan(lastT, start, facecolor='gray', alpha=0.3)
                 axs[idx].axvspan(start, end, facecolor='red', alpha=1)
                 lastT = end

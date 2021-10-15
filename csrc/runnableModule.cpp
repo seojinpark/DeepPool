@@ -184,8 +184,7 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
     if (name == "concat") {
       specialModule = SpecialModuleTypes::CONCAT;
     }
-    torch::jit::Module module = torch::jit::load(std::string(rtctx->homedir) +
-        "/DeepPoolRuntime/" + moduleLoc);
+    torch::jit::Module module = torch::jit::load("/DeepPool/" + moduleLoc);
     DP_LOG(DEBUG, " layer's module is loaded.");
     if (name == "concat") {
       DP_LOG(DEBUG, " layer is concat.");
@@ -763,7 +762,7 @@ RunnableModule::resetProfileTimers() {
  * Reset timers for profiling each layer. Happens every iteration.
  */
 void
-RunnableModule::printProfileTimers(int warmupIters) {
+RunnableModule::printProfileTimers(int warmupIters, FILE* pFile) {
   if (!rtctx->profile) {
     return;
   }
@@ -849,4 +848,23 @@ RunnableModule::printProfileTimers(int warmupIters) {
            p90Times[name], p99Times[name]);
   }
   printf("%100s  %.3f\n", "SUM(avg)", sum);
+  printf("\n\n\n\n");
+
+  // FILE * pFile;
+  // pFile = fopen(format("%s_timings.txt", mainJob->name.c_str()).c_str(),"w");
+  if (pFile != NULL){
+    fprintf (pFile, "%110s  avg(ms)    p50     p90     p99\n", "#config");
+    float sum = 0;
+    for (auto& timeName : fpTimes) {
+      const char* name = timeName.second;
+      float avgT = nameToTime[name];
+      sum += avgT;
+      fprintf(pFile, "%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50Times[name],
+            p90Times[name], p99Times[name]);
+    }
+    fprintf(pFile, "%100s  %.3f\n", "SUM(avg)", sum);
+    fprintf(pFile, "\n\n\n\n");
+    // fclose (pFile);
+  }
+    
 }
