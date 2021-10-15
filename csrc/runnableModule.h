@@ -259,6 +259,9 @@ class RunnableModule : public torch::nn::Module {
   RunnableModule(RuntimeContext* rtctx, json specInJson,
       CommunicationHandler* commHandler, c10::Device device);
 
+
+  ~RunnableModule();
+
   void getParameters(std::vector<torch::Tensor>* parameters);
   void getActiveParameters(std::vector<torch::Tensor>* parameters);
   void iterInit();
@@ -299,6 +302,7 @@ class RunnableModule : public torch::nn::Module {
   bool backwards_did_sync{false};
 
   at::cuda::CUDAGraph maingraph, syncgraph, stepgraph;
+  std::vector<cudaGraphExec_t> maingraph_parts, stepgraph_parts;
   at::cuda::MempoolId_t graph_mempool;
   // Performance Stat
   CpuTimer detachTimer;

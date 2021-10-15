@@ -593,13 +593,25 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
 
       static CUDAPipeline p(8);
       p.Lap();
-      job->model->maingraph.replay();
+      if (job->model->maingraph_parts.size() > 0) {
+        for (auto& p : job->model->maingraph_parts)
+          CUDACHECK(cudaGraphLaunch(p, rtctx->torch_stream));
+      } else {
+        job->model->maingraph.replay();
+      }
+
       job->model->syncgraph.replay();
-      job->model->stepgraph.replay();
+      if (job->model->stepgraph_parts.size() > 0) {
+        for (auto& p : job->model->stepgraph_parts)
+          CUDACHECK(cudaGraphLaunch(p, rtctx->torch_stream));
+      } else {
+        job->model->stepgraph.replay();
+      }
+
       job->state = JobState::FINISH;
       return 1;
     }
-    
+
     bool capture = rtctx->profile && job->totiters == job->iters_before_graph_capture - 1;
     JobStatus status = job->model->forwardAStep(capture);
 
@@ -655,6 +667,10 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
 
     if (job->totiters == job->iters_before_graph_capture) {
       job->model->stepgraph.capture_end();
+
+      // job->model->maingraph_parts = GraphPartitioner(job->model->maingraph.getGRAPH(), 10.0);
+      // job->model->stepgraph_parts =  GraphPartitioner(job->model->stepgraph.getGRAPH(), 2.0);
+
       if (job->run_with_be && be_bsize > 0) be_controller.Resume();
       DP_LOG(NOTICE, "Ending capture.");
     }

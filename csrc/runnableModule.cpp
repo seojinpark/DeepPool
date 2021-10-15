@@ -841,6 +841,15 @@ RunnableModule::gradientSync() {
   // // Need another internal sync? Included in the 1st sync?
 }
 
+RunnableModule::~RunnableModule() {
+  for (auto& p : maingraph_parts)
+    CUDACHECK(cudaGraphExecDestroy(p));
+
+  for (auto& p : stepgraph_parts)
+    CUDACHECK(cudaGraphExecDestroy(p));
+}
+
+
 /**
  * Initialize timers for profiling each layer.
  */
