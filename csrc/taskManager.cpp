@@ -230,7 +230,7 @@ TaskManager::poll()
   trainSingleStep(mainJob, &jobCompleted);
   if (jobCompleted) {
     size_t warmupIters = 100;
-    FILE * pFile = fopen(format("%s_rank_%d_timings.txt", mainJob->name.c_str(), rtctx->rank).c_str(),"w");
+    FILE * pFile = fopen(format("/DeepPool/%s_rank_%d_timings.txt", mainJob->name.c_str(), rtctx->rank).c_str(),"w");
     mainJob->model->printProfileTimers(warmupIters, pFile);
     size_t totiters = mainJob->totiters - warmupIters;
     using msec = std::chrono::duration<double, std::milli>;
