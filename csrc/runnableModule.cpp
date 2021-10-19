@@ -26,6 +26,8 @@ using torch::autograd::Variable;
 using torch::autograd::AutogradContext;
 using torch::autograd::variable_list;
 
+#define TIME_COLLECTIVES
+
 ////////////////////////////////////////////////
 // TsrXferFunc
 ////////////////////////////////////////////////
@@ -34,6 +36,16 @@ TsrXferFunc::forward(AutogradContext* ctx, Variable x, TsrXfer* xfer)
 {
   ctx->saved_data["xfer"] = reinterpret_cast<int64_t>(xfer);
   DP_LOG(DEBUG, "TsrXferFunc::forward entered.. type: %d", xfer->type);
+
+  #ifdef TIME_COLLECTIVES
+  float elapsed_milliseconds = 0;
+  cudaEvent_t start_time, end_time;
+  CUDA_API_CALL(cudaEventCreateWithFlags(&start_time, cudaEventBlockingSync));
+  CUDA_API_CALL(cudaEventCreateWithFlags(&end_time, cudaEventBlockingSync));
+
+  CUDA_API_CALL(cudaEventRecord(start_time, ((CommunicationHandlerNCCL*)xfer->commHandler)->getCommStream()));
+  CUDA_API_CALL(cudaEventSynchronize(start_time));
+  #endif
 
   if (xfer->type == TsrXfer::Send) {
     std::vector<torch::Tensor> splittedTsrs =
@@ -48,7 +60,16 @@ TsrXferFunc::forward(AutogradContext* ctx, Variable x, TsrXfer* xfer)
           tsrSizeToStr(tsr).c_str());
 
       xfer->commHandler->send(tsr, tag, dest, /*async*/ true);
+      // std::cout << "Send type: " << xfer->type << ", tsr shape " << tsrSizeToStr(tsr).c_str() << std::endl;
     }
+
+    #ifdef TIME_COLLECTIVES
+    ((CommunicationHandlerNCCL*)xfer->commHandler)->sync();
+    CUDA_API_CALL(cudaEventRecord(end_time, ((CommunicationHandlerNCCL*)xfer->commHandler)->getCommStream()));
+    CUDA_API_CALL(cudaEventSynchronize(end_time));
+    CUDA_API_CALL(cudaEventElapsedTime(&elapsed_milliseconds, start_time, end_time));
+    std::cout << "Send time: " << elapsed_milliseconds << " ms" << std::endl;
+    #endif
     return splittedTsrs[i];
   }
   else if (xfer->type == TsrXfer::Recv) {
@@ -67,12 +88,22 @@ TsrXferFunc::forward(AutogradContext* ctx, Variable x, TsrXfer* xfer)
           tsrSizeToStr(tsr).c_str());
       xfer->commHandler->recv(tsr, tag, src, /*async*/ true);
       tsrList.push_back(tsr);
+      // std::cout << "Recv type: " << xfer->type << ", tsr shape " << tsrSizeToStr(tsr).c_str() << std::endl;
     }
     tsrList.push_back(x);
     xfer->commHandler->sync();
     DP_LOG(DEBUG, "Concating %d tensors", static_cast<int>(tsrList.size()));
     auto concated = torch::cat(tsrList, xfer->splitCatDim);
     DP_LOG(DEBUG, "Concated tensor: %s", tsrSizeToStr(concated).c_str());
+
+    #ifdef TIME_COLLECTIVES
+    ((CommunicationHandlerNCCL*)xfer->commHandler)->sync();
+    CUDA_API_CALL(cudaEventRecord(end_time, ((CommunicationHandlerNCCL*)xfer->commHandler)->getCommStream()));
+    CUDA_API_CALL(cudaEventSynchronize(end_time));
+    CUDA_API_CALL(cudaEventElapsedTime(&elapsed_milliseconds, start_time, end_time));
+    std::cout << "Recv time: " << elapsed_milliseconds << " ms" << std::endl;
+    #endif
+
     return concated;
   } else {
     DP_LOG(ERROR, "xfer type is %d, which is not supported.", xfer->type);
@@ -513,6 +544,7 @@ RunnableModule::forwardAStep()
       std::vector<torch::jit::IValue> ivalVec;
       ivalVec.push_back(inputVec[0]);
       output = layer->module.forward(ivalVec).toTensor();
+      // std::cout << "Layer ID " << layer->id << ", output shape - " << tsrSizeToStr(output).c_str() <<std::endl;
       DP_LOG(DEBUG, "module.forward called.");
     }
 

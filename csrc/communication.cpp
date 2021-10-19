@@ -199,7 +199,7 @@ CommunicationHandlerNCCL::CommunicationHandlerNCCL(RuntimeContext* rtctx,
   DP_LOG(DEBUG, "set CommunicationHandlerNCCL to commHandlerMap.");
 
   cudaStream_t stream;
-
+  CUDA_API_CALL(cudaSetDevice(rtctx->device));
   int lpri, hipri;
   CUDA_API_CALL(cudaDeviceGetStreamPriorityRange(&lpri, &hipri));
 

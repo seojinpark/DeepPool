@@ -95,6 +95,8 @@ class CommunicationHandlerNCCL : public CommunicationHandler {
   void testRingP2P();
   void testAllReduce();
 
+  cudaStream_t getCommStream(void) {return comm_sync_stream;};
+
  private:
   RuntimeContext* rtctx;
   std::string taskName;
