@@ -230,43 +230,72 @@ TaskManager::poll()
   trainSingleStep(mainJob, &jobCompleted);
   if (jobCompleted) {
     size_t warmupIters = 100;
-    FILE * pFile = fopen(format("/DeepPool/%s_rank_%d_timings.txt", mainJob->name.c_str(), rtctx->rank).c_str(),"w");
-    mainJob->model->printProfileTimers(warmupIters, pFile);
-    size_t totiters = mainJob->totiters - warmupIters;
-    using msec = std::chrono::duration<double, std::milli>;
-    double elapsed_ms = std::chrono::duration_cast<msec>(mainJob->end - mainJob->start).count();
-    double total_iter_ms = elapsed_ms / (double)totiters;
-    double total_iter_ps = 1e3 / total_iter_ms;
-    double be_img_ps = mainJob->be_img_end - mainJob->be_img_start;
-    be_img_ps = 1e3 * be_img_ps / elapsed_ms;
-    DP_LOG(NOTICE, "A training job %s is completed (%lu iters, %.2f ms/iter, %.2f iter/s, %.2f be img/s)."
-        " AverageTiming (ms) => load:%.1f, fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f"
-        " P50 (ms) => fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f",
-        mainJob->name.c_str(), totiters, total_iter_ms, total_iter_ps, be_img_ps,
-        mainJob->timers[CT_LOAD].getAvg(warmupIters),
-        mainJob->timers[CT_FP].getAvg(warmupIters),
-        mainJob->timers[CT_LOSS].getAvg(warmupIters),
-        mainJob->timers[CT_BP].getAvg(warmupIters),
-        mainJob->timers[CT_STOP].getAvg(warmupIters),
-        mainJob->timers[CT_FP].getP50(warmupIters),
-        mainJob->timers[CT_LOSS].getP50(warmupIters),
-        mainJob->timers[CT_BP].getP50(warmupIters),
-        mainJob->timers[CT_STOP].getP50(warmupIters));
 
-    fprintf (pFile, "A training job %s is completed (%lu iters, %.2f ms/iter, %.2f iter/s, %.2f be img/s)."
-        " AverageTiming (ms) => load:%.1f, fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f"
-        " P50 (ms) => fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f",
-        mainJob->name.c_str(), totiters, total_iter_ms, total_iter_ps, be_img_ps,
-        mainJob->timers[CT_LOAD].getAvg(warmupIters),
-        mainJob->timers[CT_FP].getAvg(warmupIters),
-        mainJob->timers[CT_LOSS].getAvg(warmupIters),
-        mainJob->timers[CT_BP].getAvg(warmupIters),
-        mainJob->timers[CT_STOP].getAvg(warmupIters),
-        mainJob->timers[CT_FP].getP50(warmupIters),
-        mainJob->timers[CT_LOSS].getP50(warmupIters),
-        mainJob->timers[CT_BP].getP50(warmupIters),
-        mainJob->timers[CT_STOP].getP50(warmupIters));
-    fclose (pFile);
+    if (!rtctx->profile_comms){
+      FILE * pFile = fopen(format("/DeepPool/%s_rank_%d_FP_timings.txt", mainJob->name.c_str(), rtctx->rank).c_str(),"w");
+      mainJob->model->printProfileTimers(warmupIters, pFile, LayerTimingStage::FP);
+      size_t totiters = mainJob->totiters - warmupIters;
+      using msec = std::chrono::duration<double, std::milli>;
+      double elapsed_ms = std::chrono::duration_cast<msec>(mainJob->end - mainJob->start).count();
+      double total_iter_ms = elapsed_ms / (double)totiters;
+      double total_iter_ps = 1e3 / total_iter_ms;
+      double be_img_ps = mainJob->be_img_end - mainJob->be_img_start;
+      be_img_ps = 1e3 * be_img_ps / elapsed_ms;
+      DP_LOG(NOTICE, "A training job %s is completed (%lu iters, %.2f ms/iter, %.2f iter/s, %.2f be img/s)."
+          " AverageTiming (ms) => load:%.1f, fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f"
+          " P50 (ms) => fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f",
+          mainJob->name.c_str(), totiters, total_iter_ms, total_iter_ps, be_img_ps,
+          mainJob->timers[CT_LOAD].getAvg(warmupIters),
+          mainJob->timers[CT_FP].getAvg(warmupIters),
+          mainJob->timers[CT_LOSS].getAvg(warmupIters),
+          mainJob->timers[CT_BP].getAvg(warmupIters),
+          mainJob->timers[CT_STOP].getAvg(warmupIters),
+          mainJob->timers[CT_FP].getP50(warmupIters),
+          mainJob->timers[CT_LOSS].getP50(warmupIters),
+          mainJob->timers[CT_BP].getP50(warmupIters),
+          mainJob->timers[CT_STOP].getP50(warmupIters));
+
+      fprintf (pFile, "A training job %s is completed (%lu iters, %.2f ms/iter, %.2f iter/s, %.2f be img/s)."
+          " AverageTiming (ms) => load:%.1f, fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f"
+          " P50 (ms) => fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f",
+          mainJob->name.c_str(), totiters, total_iter_ms, total_iter_ps, be_img_ps,
+          mainJob->timers[CT_LOAD].getAvg(warmupIters),
+          mainJob->timers[CT_FP].getAvg(warmupIters),
+          mainJob->timers[CT_LOSS].getAvg(warmupIters),
+          mainJob->timers[CT_BP].getAvg(warmupIters),
+          mainJob->timers[CT_STOP].getAvg(warmupIters),
+          mainJob->timers[CT_FP].getP50(warmupIters),
+          mainJob->timers[CT_LOSS].getP50(warmupIters),
+          mainJob->timers[CT_BP].getP50(warmupIters),
+          mainJob->timers[CT_STOP].getP50(warmupIters));
+      fclose (pFile);
+    }
+    else{
+      FILE * pFileComm = fopen(format("/DeepPool/%s_rank_%d_COMMS_timings.txt", mainJob->name.c_str(), rtctx->rank).c_str(),"w");
+      mainJob->model->printProfileTimers(warmupIters, pFileComm, LayerTimingStage::COMMS);
+      size_t totiters = mainJob->totiters - warmupIters;
+      using msec = std::chrono::duration<double, std::milli>;
+      double elapsed_ms = std::chrono::duration_cast<msec>(mainJob->end - mainJob->start).count();
+      double total_iter_ms = elapsed_ms / (double)totiters;
+      double total_iter_ps = 1e3 / total_iter_ms;
+      double be_img_ps = mainJob->be_img_end - mainJob->be_img_start;
+      be_img_ps = 1e3 * be_img_ps / elapsed_ms;
+      fprintf (pFileComm, "A training job %s is completed (%lu iters, %.2f ms/iter, %.2f iter/s, %.2f be img/s)."
+          " AverageTiming (ms) => load:%.1f, fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f"
+          " P50 (ms) => fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f",
+          mainJob->name.c_str(), totiters, total_iter_ms, total_iter_ps, be_img_ps,
+          mainJob->timers[CT_LOAD].getAvg(warmupIters),
+          mainJob->timers[CT_FP].getAvg(warmupIters),
+          mainJob->timers[CT_LOSS].getAvg(warmupIters),
+          mainJob->timers[CT_BP].getAvg(warmupIters),
+          mainJob->timers[CT_STOP].getAvg(warmupIters),
+          mainJob->timers[CT_FP].getP50(warmupIters),
+          mainJob->timers[CT_LOSS].getP50(warmupIters),
+          mainJob->timers[CT_BP].getP50(warmupIters),
+          mainJob->timers[CT_STOP].getP50(warmupIters));
+      fclose (pFileComm);
+    }
+    
 
     jobList.erase(jobList.begin());
     DP_LOG(NOTICE, "Removed the completed job. Remaining: %d",

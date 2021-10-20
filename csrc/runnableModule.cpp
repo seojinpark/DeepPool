@@ -26,7 +26,7 @@ using torch::autograd::Variable;
 using torch::autograd::AutogradContext;
 using torch::autograd::variable_list;
 
-#define TIME_COLLECTIVES
+// #define TIME_COLLECTIVES
 
 ////////////////////////////////////////////////
 // TsrXferFunc
@@ -38,13 +38,13 @@ TsrXferFunc::forward(AutogradContext* ctx, Variable x, TsrXfer* xfer)
   DP_LOG(DEBUG, "TsrXferFunc::forward entered.. type: %d", xfer->type);
 
   #ifdef TIME_COLLECTIVES
-  float elapsed_milliseconds = 0;
-  cudaEvent_t start_time, end_time;
-  CUDA_API_CALL(cudaEventCreateWithFlags(&start_time, cudaEventBlockingSync));
-  CUDA_API_CALL(cudaEventCreateWithFlags(&end_time, cudaEventBlockingSync));
+  CUDA_API_CALL(cudaSetDevice(rtctx->device));
 
-  CUDA_API_CALL(cudaEventRecord(start_time, ((CommunicationHandlerNCCL*)xfer->commHandler)->getCommStream()));
-  CUDA_API_CALL(cudaEventSynchronize(start_time));
+  async = false;
+  xfer->elapsed_milliseconds = 0;
+
+  CUDA_API_CALL(cudaEventRecord(xfer->start_time, ((CommunicationHandlerNCCL*)xfer->commHandler)->getCommStream()));
+  CUDA_API_CALL(cudaEventSynchronize(xfer->start_time));
   #endif
 
   if (xfer->type == TsrXfer::Send) {
@@ -62,10 +62,10 @@ TsrXferFunc::forward(AutogradContext* ctx, Variable x, TsrXfer* xfer)
       xfer->commHandler->send(tsr, tag, dest, /*async*/ true);
       // std::cout << "Send type: " << xfer->type << ", tsr shape " << tsrSizeToStr(tsr).c_str() << std::endl;
     }
-
+    if (rtctx->profile && rtctx->profile_comms)
+      ((CommunicationHandlerNCCL*)xfer->commHandler)->sync();
     #ifdef TIME_COLLECTIVES
-    ((CommunicationHandlerNCCL*)xfer->commHandler)->sync();
-    CUDA_API_CALL(cudaEventRecord(end_time, ((CommunicationHandlerNCCL*)xfer->commHandler)->getCommStream()));
+    CUDA_API_CALL(cudaEventRecord(end_time, rtctx->torch_stream));
     CUDA_API_CALL(cudaEventSynchronize(end_time));
     CUDA_API_CALL(cudaEventElapsedTime(&elapsed_milliseconds, start_time, end_time));
     std::cout << "Send time: " << elapsed_milliseconds << " ms" << std::endl;
@@ -97,7 +97,7 @@ TsrXferFunc::forward(AutogradContext* ctx, Variable x, TsrXfer* xfer)
     DP_LOG(DEBUG, "Concated tensor: %s", tsrSizeToStr(concated).c_str());
 
     #ifdef TIME_COLLECTIVES
-    ((CommunicationHandlerNCCL*)xfer->commHandler)->sync();
+    // ((CommunicationHandlerNCCL*)xfer->commHandler)->sync();
     CUDA_API_CALL(cudaEventRecord(end_time, ((CommunicationHandlerNCCL*)xfer->commHandler)->getCommStream()));
     CUDA_API_CALL(cudaEventSynchronize(end_time));
     CUDA_API_CALL(cudaEventElapsedTime(&elapsed_milliseconds, start_time, end_time));
@@ -561,10 +561,16 @@ RunnableModule::forwardAStep()
     // Send samples after running this layer.
     DP_LOG(DEBUG, "len(layer->xferOuts): %d", static_cast<int>(layer->xferOuts.size()));
     layer->outputsAfterXfer.clear();
+    if (rtctx->profile && rtctx->profile_comms && layer->xferOuts.size() > 0) {
+        layer->commTimer->record();
+    }
     for (TsrXfer& xfer : layer->xferOuts) {
       torch::Tensor remainingOutput = TsrXferFunc::apply(output, &xfer);
       layer->outputsAfterXfer[xfer.nextLayerId] = remainingOutput;
       DP_LOG(DEBUG, "Split & sent samples.");
+    }
+    if (rtctx->profile && rtctx->profile_comms && layer->xferOuts.size() > 0 && layer->xferIns.size() == 0) {
+      layer->commTimer->saveAndReset();
     }
     layer->output = output;
 
@@ -583,7 +589,9 @@ RunnableModule::forwardAStep()
     // fpCtx.runCriterionAndLoss = false;
     // fpCtx.fpTensorToReturn.reset();
   }
-
+  if (rtctx->profile && rtctx->profile_comms && layer->xferIns.size() > 0 && layer->xferOuts.size() == 0) {
+        layer->commTimer->record();
+  }
   // Recv parts of output processed by another GPU.
   for (TsrXfer& xfer : layer->xferIns) {
     //TODO: assert that next layer is active.
@@ -609,7 +617,9 @@ RunnableModule::forwardAStep()
     DP_LOG(DEBUG, "Received (nextLayer: %d) & concatenated samples. %s",
         xfer.nextLayerId, tsrSizeToStr(remainingOutput).c_str());
   }
-  
+  if (rtctx->profile && rtctx->profile_comms && layer->xferIns.size() > 0) {
+    layer->commTimer->saveAndReset();
+  }
   layer->status = LayerStatus::PENDING_BP;
   DP_LOG(DEBUG, " ** Layer %d is processed.", layer->id);
   
@@ -773,6 +783,7 @@ RunnableModule::initProfileTimers(CudaTimer* ct_load, CudaTimer* ct_loss) {
     for (auto& layer : layers) {
       layer.fpTimer = std::make_unique<CudaTimer>(ct_load);
       layer.bpTimer = std::make_unique<CudaTimer>(ct_loss);
+      layer.commTimer = std::make_unique<CudaSelfTimer>();
     }
   }
 }
@@ -786,6 +797,7 @@ RunnableModule::resetProfileTimers() {
     for (auto& layer : layers) {
       layer.fpTimer->saveAndReset();
       layer.bpTimer->saveAndReset();
+      // layer.commTimer->saveAndReset();
     }
   }
 }
@@ -794,40 +806,64 @@ RunnableModule::resetProfileTimers() {
  * Reset timers for profiling each layer. Happens every iteration.
  */
 void
-RunnableModule::printProfileTimers(int warmupIters, FILE* pFile) {
+RunnableModule::printProfileTimers(int warmupIters, FILE* pFile, LayerTimingStage printStage) {
   if (!rtctx->profile) {
     return;
   }
 
-  auto getName2LayerTime = [&] (float percentile) {
+  auto getName2LayerTime = [&] (float percentile, LayerTimingStage stage) {
     std::vector<std::pair<float, const char*> > fpTimes;
     std::vector<std::pair<float, const char*> > bpTimes;
+    std::vector<std::pair<float, const char*> > commTimes;
     for (auto& layer : layers) {
       if (!layer.detachInput) {
         continue;
       }
-      fpTimes.push_back(std::make_pair<float, const char*>(
-          layer.fpTimer->getPercentile(percentile, warmupIters),
-          layer.moduleName.c_str()));
-      bpTimes.push_back(std::make_pair<float, const char*>(
-          layer.bpTimer->getPercentile(percentile, warmupIters),
-          layer.moduleName.c_str()));
+      if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::FP)
+        fpTimes.push_back(std::make_pair<float, const char*>(
+            layer.fpTimer->getPercentile(percentile, warmupIters),
+            layer.moduleName.c_str()));
+      if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::BP)
+        bpTimes.push_back(std::make_pair<float, const char*>(
+            layer.bpTimer->getPercentile(percentile, warmupIters),
+            layer.moduleName.c_str()));
+      if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::COMMS)
+        commTimes.push_back(std::make_pair<float, const char*>(
+            layer.commTimer->getPercentile(percentile, warmupIters),
+            layer.moduleName.c_str()));
     }
-    std::sort(fpTimes.begin(), fpTimes.end());
-    std::sort(bpTimes.begin(), bpTimes.end());
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::FP)
+      std::sort(fpTimes.begin(), fpTimes.end());
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::BP)
+      std::sort(bpTimes.begin(), bpTimes.end());
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::COMMS)
+      std::sort(commTimes.begin(), commTimes.end());
 
     float lastTime = 0;
     std::unordered_map<const char*, float> nameToTime;
-    for (auto& timeName : fpTimes) {
-      float layerTime = timeName.first - lastTime;
-      nameToTime[timeName.second] = layerTime;
-      lastTime = timeName.first;
+
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::FP){
+      for (auto& timeName : fpTimes) {
+        float layerTime = timeName.first - lastTime;
+        nameToTime[timeName.second] = layerTime;
+        lastTime = timeName.first;
+      }
     }
-    lastTime = 0;
-    for (auto& timeName : bpTimes) {
-      float layerTime = timeName.first - lastTime;
-      nameToTime[timeName.second] += layerTime;
-      lastTime = timeName.first;
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::BP){
+      lastTime = 0;
+      for (auto& timeName : bpTimes) {
+        float layerTime = timeName.first - lastTime;
+        nameToTime[timeName.second] += layerTime;
+        lastTime = timeName.first;
+      }
+    }
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::COMMS){
+      lastTime = 0;
+      for (auto& timeName : commTimes) {
+        float layerTime = timeName.first - lastTime;
+        nameToTime[timeName.second] += layerTime;
+        lastTime = timeName.first;
+      }
     }
     return nameToTime;
   };
@@ -835,6 +871,7 @@ RunnableModule::printProfileTimers(int warmupIters, FILE* pFile) {
   // Get average.
   std::vector<std::pair<float, const char*> > fpTimes;
   std::vector<std::pair<float, const char*> > bpTimes;
+  std::vector<std::pair<float, const char*> > commTimes;
   for (auto& layer : layers) {
     if (!layer.detachInput) {
       continue;
@@ -843,16 +880,21 @@ RunnableModule::printProfileTimers(int warmupIters, FILE* pFile) {
         layer.fpTimer->getAvg(warmupIters), layer.moduleName.c_str()));
     bpTimes.push_back(std::make_pair<float, const char*>(
         layer.bpTimer->getAvg(warmupIters), layer.moduleName.c_str()));
+    commTimes.push_back(std::make_pair<float, const char*>(
+        layer.commTimer->getAvg(warmupIters), layer.moduleName.c_str()));
   }
   std::sort(fpTimes.begin(), fpTimes.end());
   std::sort(bpTimes.begin(), bpTimes.end());
+  std::sort(commTimes.begin(), commTimes.end());
   // printf("## Forward time\n");
   float lastTime = 0;
-  std::unordered_map<const char*, float> nameToTime;
+  std::unordered_map<const char*, float> nameToTimeFP;
+  std::unordered_map<const char*, float> nameToTimeBP;
+  std::unordered_map<const char*, float> nameToTimeComms;
   for (auto& timeName : fpTimes) {
     float layerTime = timeName.first - lastTime;
     // printf("%110s  %.3f\n", timeName.second, layerTime);
-    nameToTime[timeName.second] = layerTime;
+    nameToTimeFP[timeName.second] = layerTime;
     lastTime = timeName.first;
   }
   // printf("## Backward time\n");
@@ -860,43 +902,77 @@ RunnableModule::printProfileTimers(int warmupIters, FILE* pFile) {
   for (auto& timeName : bpTimes) {
     float layerTime = timeName.first - lastTime;
     // printf("%110s  %.3f\n", timeName.second, layerTime);
-    nameToTime[timeName.second] += layerTime;
+    nameToTimeBP[timeName.second] += layerTime;
+    lastTime = timeName.first;
+  }
+
+  lastTime = 0;
+  for (auto& timeName : commTimes) {
+    float layerTime = timeName.first - lastTime;
+    // printf("%110s  %.3f\n", timeName.second, layerTime);
+    nameToTimeComms[timeName.second] += layerTime;
     lastTime = timeName.first;
   }
 
   
-  std::unordered_map<const char*, float> p50Times = getName2LayerTime(50);
-  std::unordered_map<const char*, float> p90Times = getName2LayerTime(90);
-  std::unordered_map<const char*, float> p99Times = getName2LayerTime(99);
+  std::unordered_map<const char*, float> p50TimesFP = getName2LayerTime(50, LayerTimingStage::FP);
+  std::unordered_map<const char*, float> p90TimesFP = getName2LayerTime(90, LayerTimingStage::FP);
+  std::unordered_map<const char*, float> p99TimesFP = getName2LayerTime(99, LayerTimingStage::FP);
   
-  // printf("## Sum\n");
-  printf("%110s  avg(ms)    p50     p90     p99\n", "#config");
-  float sum = 0;
-  for (auto& timeName : fpTimes) {
-    const char* name = timeName.second;
-    float avgT = nameToTime[name];
-    sum += avgT;
-    printf("%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50Times[name],
-           p90Times[name], p99Times[name]);
+  std::unordered_map<const char*, float> p50TimesCOMM = getName2LayerTime(50, LayerTimingStage::COMMS);
+  std::unordered_map<const char*, float> p90TimesCOMM = getName2LayerTime(90, LayerTimingStage::COMMS);
+  std::unordered_map<const char*, float> p99TimesCOMM = getName2LayerTime(99, LayerTimingStage::COMMS);
+  
+  if (printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::FP){
+    // printf("## Sum\n");
+    printf("%110s  avg(ms)    p50     p90     p99\n", "#config");
+    float sum = 0;
+    for (auto& timeName : fpTimes) {
+      const char* name = timeName.second;
+      float avgT = nameToTimeFP[name];
+      sum += avgT;
+      printf("%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50TimesFP[name],
+            p90TimesFP[name], p99TimesFP[name]);
+    }
+    printf("%100s  %.3f\n", "SUM(avg)", sum);
+    printf("\n\n\n\n");
   }
-  printf("%100s  %.3f\n", "SUM(avg)", sum);
-  printf("\n\n\n\n");
 
   // FILE * pFile;
   // pFile = fopen(format("%s_timings.txt", mainJob->name.c_str()).c_str(),"w");
   if (pFile != NULL){
-    fprintf (pFile, "%110s  avg(ms)    p50     p90     p99\n", "#config");
     float sum = 0;
-    for (auto& timeName : fpTimes) {
-      const char* name = timeName.second;
-      float avgT = nameToTime[name];
-      sum += avgT;
-      fprintf(pFile, "%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50Times[name],
-            p90Times[name], p99Times[name]);
+    if (!rtctx->profile_comms && printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::FP){
+      fprintf (pFile, "%100s LAYER avg(ms)    p50     p90     p99\n", "#config");
+      for (auto& timeName : fpTimes) {
+        const char* name = timeName.second;
+        float avgT = nameToTimeFP[name];
+        sum += avgT;
+        fprintf(pFile, "%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50TimesFP[name],
+              p90TimesFP[name], p99TimesFP[name]);
+      }
+      fprintf(pFile, "%100s  %.3f\n", "SUM(avg)", sum);
+      fprintf(pFile, "\n\n\n\n");
+      // fclose (pFile);
     }
-    fprintf(pFile, "%100s  %.3f\n", "SUM(avg)", sum);
-    fprintf(pFile, "\n\n\n\n");
-    // fclose (pFile);
+    else if(printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::FP)
+      fprintf (pFile, "Must skip layer timings when measuing comms\n");
+
+
+    if (printStage == LayerTimingStage::COMMS){
+      fprintf (pFile, "%100s COMMS avg(ms)    p50     p90     p99\n", "#config");
+      sum = 0;
+      for (auto& timeName : commTimes) {
+        const char* name = timeName.second;
+        float avgT = nameToTimeComms[name];
+        sum += avgT;
+        fprintf(pFile, "%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50TimesCOMM[name],
+              p90TimesCOMM[name], p99TimesCOMM[name]);
+      }
+      fprintf(pFile, "%100s  %.3f\n", "SUM(avg)", sum);
+      fprintf(pFile, "\n\n\n\n");
+      // fclose (pFile);
+    }
   }
     
 }

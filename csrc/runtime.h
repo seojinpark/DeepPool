@@ -46,7 +46,7 @@ namespace torch {
 struct RuntimeContext_params {
   RuntimeContext_params() : coordinatorAddr(0), myAddr(0), device(0), c10dBackend(0),
       c10dMasterPort(0), rank(), worldSize(), logdir(), be_batch_size(0),
-      profile(true), debug(false), verify(false)
+      profile(true), profile_comms(true), debug(false), verify(false)
       {
       }
 
@@ -64,7 +64,7 @@ struct RuntimeContext_params {
   int worldSize;
   char* logdir;
   int be_batch_size;
-  bool profile;
+  bool profile, profile_comms;
   bool debug;
   bool verify;
 };
@@ -81,7 +81,7 @@ struct RuntimeContext {
   RuntimeContext(const RuntimeContext_params params) : 
       coordinatorAddr(params.coordinatorAddr), myAddr(params.myAddr), device(params.device), c10dBackend(params.c10dBackend),
       c10dMasterPort(params.c10dMasterPort), rank(params.rank), worldSize(params.worldSize), logdir(params.logdir), be_batch_size(params.be_batch_size),
-      profile(params.profile), debug(params.debug), verify(params.verify), homedir(0), c10dev(c10::DeviceType::CUDA, params.device),
+      profile(params.profile), profile_comms(params.profile_comms), debug(params.debug), verify(params.verify), homedir(0), c10dev(c10::DeviceType::CUDA, params.device),
       grpcService(), grpcServer(), taskManager(), shutdownRequested(),
       commHandlerMap(), rankToIpAndPort(), grpcCommReady(), 
       ncclGroupId(), ncclGroupSize(), ranks(), ncclCommReady(), ncclCommObj(),
@@ -106,7 +106,7 @@ struct RuntimeContext {
   int worldSize;
   char* logdir;
   int be_batch_size;
-  bool profile;
+  bool profile, profile_comms;
   bool debug;
   bool verify;
   char *homedir;

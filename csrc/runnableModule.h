@@ -39,19 +39,34 @@ using torch::autograd::variable_list;
  */
 class CommunicationHandler;
 class CudaTimer;
+class CudaSelfTimer;
 struct Layer;
 
 typedef int Tag;
 typedef int Rank;
 
+enum class LayerTimingStage {
+  FP = 0,
+  BP,
+  COMMS,
+  ALL
+};
+
 struct TsrXfer {
   TsrXfer(CommunicationHandler* comm) : commHandler(comm), type(None),
-      splitSizes(), splitCatDim(0), xferTagAndRank(), xferTagAndRankBack() {}
+      splitSizes(), splitCatDim(0), xferTagAndRank(), xferTagAndRankBack() 
+    {
+      // CUDA_API_CALL(cudaEventCreateWithFlags(&start_time, cudaEventBlockingSync));
+      // CUDA_API_CALL(cudaEventCreateWithFlags(&end_time, cudaEventBlockingSync));
+    }
   
   CommunicationHandler* commHandler;
   enum Type {
     None, Send, Recv
   };
+
+  // float elapsed_milliseconds;
+  // cudaEvent_t start_time, end_time;
   Type type;
   std::vector<int64_t> splitSizes; // used only for send's forward or recv's backward.
   int splitCatDim;
@@ -128,6 +143,7 @@ struct Layer {
   std::vector<int64_t> emptyInSizes;  // primarily used for creating empty tensors for recv.
   std::vector<int64_t> emptyOutSizes; // primarily used for creating empty tensors for recv.
   std::unique_ptr<CudaTimer> fpTimer, bpTimer; // Used during profile mode only.
+  std::unique_ptr<CudaSelfTimer> commTimer; // Used during profile mode only.
   std::string moduleName; // Used to output profiled runtimes.
 };
 
@@ -189,7 +205,7 @@ class RunnableModule : public torch::nn::Module {
   void loss();
   void initProfileTimers(CudaTimer* ct_load, CudaTimer* ct_loss);
   void resetProfileTimers();
-  void printProfileTimers(int warmupIters, FILE* pFile=NULL);
+  void printProfileTimers(int warmupIters, FILE* pFile=NULL, LayerTimingStage printStage=LayerTimingStage::ALL);
 
   ////////////////////////////////////////////
   // Internal data structure.
