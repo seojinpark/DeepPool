@@ -21,6 +21,13 @@
 #include "json.hpp"
 #include "rpcService.h"
 
+#include "utils.h"
+
+#include <c10/cuda/CUDAStream.h>
+#include <ATen/cuda/CUDAEvent.h>
+#include <torch/csrc/cuda/nccl.h>
+
+
 using json = nlohmann::json;
 
 /**
@@ -52,11 +59,13 @@ class CommunicationHandler {
   virtual void all_reduce(torch::Tensor& tensor, c10d::ReduceOp op, bool async = false) = 0;
 
   /* block until all outstanding send/recvs have completed */
-  virtual void sync() = 0;
+  virtual void sync(c10::optional<c10::cuda::CUDAStream> stream = {}) = 0;
 
   /* used to prepare streams for cuda graph capture, WIP */
   virtual void precapture() = 0;
   virtual void postcapture() = 0;
+  virtual void comm_start(c10::optional<c10::cuda::CUDAStream> stream = {}) = 0;
+  virtual void comm_end() = 0;
 
   /**
    * Returns the tag for p2p communication send/recv.
@@ -88,14 +97,17 @@ class CommunicationHandlerNCCL : public CommunicationHandler {
             bool async = false);
   void recv(torch::Tensor& tensor, int tag, int src,
             bool async = false);
-  void sync();
+  void sync(c10::optional<c10::cuda::CUDAStream> stream = {});
   void precapture();
   void postcapture();
+  void comm_start(c10::optional<c10::cuda::CUDAStream> stream = {});
+  void comm_end();
+
   void all_reduce(torch::Tensor& tensor, c10d::ReduceOp op, bool async = false);
   void testRingP2P();
   void testAllReduce();
 
-  cudaStream_t getCommStream(void) {return comm_sync_stream;};
+  c10::optional<c10::cuda::CUDAStream> getCommStream(void) {return group_call_stream;};
 
  private:
   RuntimeContext* rtctx;
@@ -104,12 +116,12 @@ class CommunicationHandlerNCCL : public CommunicationHandler {
   std::unordered_map<int, std::string> receivedData;
   std::unordered_map<int, std::unique_ptr<RuntimeClient> > clientPool;
 
-  cudaEvent_t sync_event; // already created event used to immediately sync two streams
+  at::cuda::CUDAEvent sync_event;
 
-  std::vector<cudaStream_t> send_streams;
-  std::vector<cudaStream_t> recv_streams;
-  cudaStream_t comm_sync_stream;
-  cudaStream_t all_reduce_stream;
+  c10::cuda::CUDAStream default_comm_stream;
+
+  c10::optional<c10::cuda::CUDAStream> group_call_stream;
+  bool in_group_call{false};
 };
 
 class CommunicationHandlerGRPC : public CommunicationHandler {
@@ -124,9 +136,12 @@ class CommunicationHandlerGRPC : public CommunicationHandler {
   void recv(torch::Tensor& tensor, int tag, int src,
             bool async = false);
   void testRingP2P();
-  void sync() {};
+  void sync(c10::optional<c10::cuda::CUDAStream> stream = {}) { UNUSED(stream); };
   void precapture() {};
   void postcapture() {};
+  void comm_start(c10::optional<c10::cuda::CUDAStream> stream = {}) { UNUSED(stream); };
+  void comm_end() {};
+
   void all_reduce(torch::Tensor& tensor, c10d::ReduceOp op, bool async = false);
 
 

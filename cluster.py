@@ -31,16 +31,18 @@ import runtime_pb2_grpc
 
 # import examples.vgg as vgg  # TODO: this is used for debugging. Remove this later.
 
+extra_args = [] # unparsed arguments stored here are forwarded to runtimes
+
 class CppRuntimeProxy:
     def __init__(self, addressWithPort: str):
         self.channel = grpc.insecure_channel(addressWithPort) # ex) 'localhost:50051'
         self.stub = runtime_pb2_grpc.RuntimeStub(self.channel)
 
-    def scheduleTraining(self, name, jobInJson, dataDir, tensorTagsInJson, jobRankToGlobalRankInJson):
+    def scheduleTraining(self, name, jobInJson, dataDir, tensorTagsInJson, jobRankToGlobalRankInJson, runbe):
         response = self.stub.ScheduleTraining(runtime_pb2.ScheduleTrainingRequest(
             name=name, job_in_json=jobInJson, data_dir=dataDir,
             tensor_tags_in_json=tensorTagsInJson,
-            job_rank_to_global_rank_in_json=jobRankToGlobalRankInJson))
+            job_rank_to_global_rank_in_json=jobRankToGlobalRankInJson, run_be=1 if runbe else 0))
         print("received: " + response.message)
     
     def poke(self):
@@ -202,7 +204,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
     def export_poke(self):
         return 'Returned from poke at %s' % self.myAddr
 
-    def export_scheduleTraining(self, jobName: str, trainingJobInJSON: str):
+    def export_scheduleTraining(self, jobName: str, trainingJobInJSON: str, runbe):
         job = TrainingJob("test", None, None, 0, 0, "")
         job.loadJSON(trainingJobInJSON)
         print("received job")
@@ -224,15 +226,13 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
 
         threadList = []
         def requestScheduleTraining(proxy, name, jobInJson, dataDir, tensorTagsInJson, jobRankToGlobalRankInJson):
-            proxy.scheduleTraining(name, jobInJson, dataDir, tensorTagsInJson, jobRankToGlobalRankInJson)
+            proxy.scheduleTraining(name, jobInJson, dataDir, tensorTagsInJson, jobRankToGlobalRankInJson, runbe)
         for rank in range(gpusUsed):
             location = self.locations[rank]
             moduleDesc = moduleDescList[rank]
             thread = threading.Thread(name='reqScheTrain%d'%rank, target=requestScheduleTraining, args=(location.getProxy(), jobName, moduleDesc, "SYNTHETIC", tensorTagsInJson, jobRankToGlobalRankInJson))
             threadList.append(thread)
-        for thread in threadList:
             thread.start()
-            time.sleep(1)
         for thread in threadList:
             thread.join()
 
@@ -313,7 +313,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         logdir =  "/DeepPool/logs/"
         upSyncedAddrs = set()
         for i, location in enumerate(self.locations):
-            # if i in [0,1,2,3]: #1, 2, 3, 4, 5]:
+            # if i in [0,1,2,3,4,5,6,7]: #1, 2, 3, 4, 5]:
             #     continue
             if (location.address not in upSyncedAddrs):
                 # TODO: skip if location's addr is same as the current node.
@@ -331,19 +331,11 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
                 print("Skipping ssh launching runtime. Must have launched them manually.")
             elif cppRuntime:
                 self.processes.append(location.rshAsync(
+                    # "LD_LIBRARY_PATH=/home/friedj/cuda/lib64:/home/friedj/nfsnccl/lib  CUDA_VISIBLE_DEVICES=" + str(location.device) + " " + self.workDir + "csrc/build/runtime" + \
                     # "CUDA_VISIBLE_DEVICES=" + str(location.device) + " " + self.workDir + "csrc/build/runtime" + \
-                    # " --coordinatorAddr %s:%d --myAddr %s:%d --device 0 --c10dBackend %s --rank %d --worldSize %d --logdir %s --be_batch_size %d %s" % \
-                    #     (self.myAddr, self.myPort, location.address, location.port, c10dBackend, i, len(self.locations), logdir, self.be_batch_size, "--profile" if profile else "") #+ \
-                    # , stdout=stdoutFp, stderr=stderrFp))
-                
-                    "CUDA_VISIBLE_DEVICES=" + str(location.device) + " " + \
-                    #+ self.workDir + "csrc/build/runtime" + \
-                    # " --coordinatorAddr %s:%d --myAddr %s:%d --device 0 --c10dBackend %s --rank %d --worldSize %d --logdir %s --be_batch_size %d %s" % \
-                    #     (self.myAddr, self.myPort, location.address, location.port, c10dBackend, i, len(self.locations), logdir, self.be_batch_size, "--profile" if profile else "") #+ \
-                    
-                    # self.workDir + "csrc/build/runtime" + \
-                    " --coordinatorAddr %s:%d --myAddr %s:%d --device %d --c10dBackend %s --rank %d --worldSize %d --logdir %s --be_batch_size %d %s" % \
-                        (self.myAddr, self.myPort, location.address, location.port, location.device, c10dBackend, i, self.worldSize, logdir, self.be_batch_size, "--profile" if profile else "") #+ \
+                    # "CUDA_VISIBLE_DEVICES=" + str(location.device) + " " + \
+                    " --coordinatorAddr %s:%d --myAddr %s:%d --device %d --c10dBackend %s --rank %d --worldSize %d --logdir %s --be_batch_size %d --min_layer_sync %d %s %s" % \
+                        (self.myAddr, self.myPort, location.address, location.port, location.device, c10dBackend, i, len(self.locations), logdir, self.be_batch_size, len(self.locations), "--profile" if profile else "", " ".join(extra_args)) #+ \
                     , stdout=stdoutFp, stderr=stderrFp))
             else:
                 self.processes.append(location.rshAsync(
@@ -401,13 +393,14 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
             if c10dBackend == "grpc":
                 print(proxy.initCommGRPC(rankToIpMap))
             if c10dBackend == "nccl":
-                proxy.initCommNCCL("Join comm group", 1, group_id, commGrpRanksDict);
+                proxy.initCommNCCL("Join comm group", 1, group_id, commGrpRanksDict)
         for i, location in enumerate(self.locations):
             thread = threading.Thread(name='init_comm%d'%i, target=requestInitCommBackend, args=(location.getProxy(),))
-            threadList.append(thread)
-        for thread in threadList:
             thread.start()
-            time.sleep(1)
+            threadList.append(thread)
+        # for thread in threadList:
+        #     thread.start()
+        #     time.sleep(1)
         for thread in threadList:
             thread.join()
 
@@ -431,10 +424,11 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         for i, location in enumerate(self.locations):
             thread = threading.Thread(name='init_commGroups%d'%i, target=requestInitCommGroups,
                                       args=(location.getProxy(), jobName, commGrpDictWithGlobalRanksInJson,))
-            threadList.append(thread)
-        for thread in threadList:
             thread.start()
-            time.sleep(1)
+            threadList.append(thread)
+        # for thread in threadList:
+            # thread.start()
+            # time.sleep(1)
         for thread in threadList:
             thread.join()
             
@@ -487,10 +481,11 @@ def parse_args():
     # sudo apt-get update
     # sudo apt-get -y install cuda
 
-    return parser.parse_args()
+    return parser.parse_known_args()
 
 def main():
-    args = parse_args()
+    global extra_args
+    args, extra_args = parse_args()
     clusterConfig = json.load(open(args.pathToConfig))
     rankToIpMap = {}
     commGrpRanksDict = {}

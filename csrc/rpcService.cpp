@@ -24,7 +24,6 @@
 #include "logger.h"
 #include "runnableModule.h"
 #include "taskManager.h"
-#include "nccl.h"
 #include "cuda_runtime.h"
 
 #include <grpcpp/grpcpp.h>
@@ -70,10 +69,12 @@ RuntimeServiceImpl::InitCommNCCL(ServerContext* context,
   int msg_type = request->msg_type();
   int group_size = request->group_size();
 
+  CUDA_API_CALL(cudaSetDevice(rtctx->device));
+
   if (msg_type == 0) { // Generate comm group ID
     if (rtctx->rank == 0) { // Only rank 0 generates ID
       rtctx->ncclGroupSize = group_size;
-      NCCL_API_CALL(ncclGetUniqueId(&rtctx->ncclGroupId));
+      torch::cuda::nccl::get_unique_id(rtctx->ncclGroupId);
 
       std::string replyMsg("Comm group ID generated at rank 0.");
       reply->set_message(replyMsg);
@@ -84,8 +85,7 @@ RuntimeServiceImpl::InitCommNCCL(ServerContext* context,
     if (rtctx->rank != 0) // Ranks 1+ need to receive ID before joining
       memcpy(&rtctx->ncclGroupId, request->group_id().c_str(), sizeof(rtctx->ncclGroupId));
 
-    CUDACHECK(cudaSetDevice(rtctx->device));    
-    NCCL_API_CALL(ncclCommInitRank(&rtctx->ncclCommObj, rtctx->worldSize, rtctx->ncclGroupId, rtctx->rank));
+    rtctx->ncclCommObj = torch::cuda::nccl::comm_init_rank(rtctx->worldSize, rtctx->ncclGroupId, rtctx->rank);
     rtctx->ncclCommReady = true;
 
     std::string replyMsg("Comm group ID broadcast & joined.");
@@ -105,7 +105,6 @@ RuntimeServiceImpl::ScheduleTraining(ServerContext* context,
   c10::cuda::setCurrentCUDAStream(rtctx->torch_stream);
 
   //TODO(seojin): currently ignoring request->data_dir();
-
   DP_LOG(DEBUG, "Received ScheduleTraining().");
 
   if (!rtctx->debug) {
@@ -119,50 +118,8 @@ RuntimeServiceImpl::ScheduleTraining(ServerContext* context,
     ofs.close();
     DP_LOG(DEBUG, "Saved the serialized ScheduleTrainingRequest.");
   }
-  
-  std::string name = request->name();
-  DP_LOG(DEBUG, "retrieved name. %s", name.c_str());
-  json jobSpec = json::parse(request->job_in_json());
-  DP_LOG(DEBUG, "parsed jobSpec into json");
-  int rank = jobSpec["rank"].get<int>();
-  int worldSize = jobSpec["maxGpusUsed"].get<int>();
-  DP_LOG(DEBUG, "rank:%d worldSize: %d", rank, worldSize);
-  json tensorTags = json::parse(request->tensor_tags_in_json());
-  DP_LOG(DEBUG, "parsed tensorTags %s", tensorTags.dump().c_str());
-  json jobRankToGlobalRank = json::parse(request->job_rank_to_global_rank_in_json());
-  DP_LOG(DEBUG, "parsed jobRankToGlobalRank %s", jobRankToGlobalRank.dump().c_str());
-  
-  c10::Device dev(c10::DeviceType::CUDA, rtctx->device);
-  DP_LOG(DEBUG, "dev constructed.");
 
-  std::unique_ptr<CommunicationHandler> commHandler;
-  if (strcmp(rtctx->c10dBackend, "nccl") == 0) {
-    commHandler = std::make_unique<CommunicationHandlerNCCL>(
-          rtctx, name, worldSize, tensorTags, rank, jobRankToGlobalRank, dev);
-  } else if (strcmp(rtctx->c10dBackend, "grpc") == 0) {
-    commHandler = std::make_unique<CommunicationHandlerGRPC>(
-          rtctx, name, worldSize, tensorTags, rank, jobRankToGlobalRank, dev);
-  }
-  
-  DP_LOG(DEBUG, "commHandler constructed.");
-  auto runnableModule = std::make_unique<RunnableModule>(rtctx, jobSpec, commHandler.get(), dev);
-  DP_LOG(DEBUG, "runnableModule constructed.");
-  std::vector<torch::Tensor> parameters;
-  runnableModule->getParameters(&parameters);
-  auto optimizer = std::make_unique<torch::optim::SGD>(parameters, /*lr=*/0.01);
-  DP_LOG(DEBUG, "optimizer constructed.");
-
-  auto job = std::make_unique<JobContext>(std::move(runnableModule), name,
-      nullptr, std::move(commHandler), nullptr, std::move(dev), 1, std::move(optimizer));
-  if (rtctx->verify) {
-    job->modelToVerify = torch::jit::load(std::string(rtctx->homedir) +
-        "/DeepPoolRuntime/modules/vgg16.pt");
-    job->modelToVerify.to(dev);
-    job->modelToVerify.train();
-    DP_LOG(DEBUG, "model for verification is loaded.");
-  }
-  DP_LOG(DEBUG, "job constructed.");
-
+  auto job = parseAndCreateTrainingTask(request);
   rtctx->taskManager->addTrainingJob(std::move(job));
   DP_LOG(DEBUG, "added the training job.");
 
@@ -178,7 +135,7 @@ RuntimeServiceImpl::Poke(ServerContext* context, const Empty* request,
   UNUSED(context);
   UNUSED(request);
 
-  DP_LOG(NOTICE, "poked.");
+  DP_LOG(DEBUG, "poked.");
   std::string replyMsg("Poke invoked.");
   reply->set_message(replyMsg);
   return Status::OK;
@@ -227,6 +184,49 @@ RuntimeServiceImpl::P2PCommunication(ServerContext* context,
   return Status::OK;
 }
 
+std::unique_ptr<JobContext>
+RuntimeServiceImpl::parseAndCreateTrainingTask(const ScheduleTrainingRequest* request) 
+{
+  std::string name = request->name();
+  DP_LOG(DEBUG, "retrieved name. %s", name.c_str());
+  json jobSpec = json::parse(request->job_in_json());
+  DP_LOG(DEBUG, "parsed jobSpec into json");
+  int rank = jobSpec["rank"].get<int>();
+  int worldSize = jobSpec["maxGpusUsed"].get<int>();
+  DP_LOG(DEBUG, "rank:%d worldSize: %d", rank, worldSize);
+  json tensorTags = json::parse(request->tensor_tags_in_json());
+  DP_LOG(DEBUG, "parsed tensorTags %s", tensorTags.dump().c_str());
+  json jobRankToGlobalRank = json::parse(request->job_rank_to_global_rank_in_json());
+  DP_LOG(DEBUG, "parsed jobRankToGlobalRank %s", jobRankToGlobalRank.dump().c_str());
+  
+  c10::Device dev(c10::DeviceType::CUDA, rtctx->device);
+  DP_LOG(DEBUG, "dev constructed.");
+
+  std::unique_ptr<CommunicationHandler> commHandler;
+  if (strcmp(rtctx->c10dBackend, "nccl") == 0) {
+    commHandler = std::make_unique<CommunicationHandlerNCCL>(
+          rtctx, name, worldSize, tensorTags, rank, jobRankToGlobalRank, dev);
+  } else if (strcmp(rtctx->c10dBackend, "grpc") == 0) {
+    commHandler = std::make_unique<CommunicationHandlerGRPC>(
+          rtctx, name, worldSize, tensorTags, rank, jobRankToGlobalRank, dev);
+  }
+  
+  DP_LOG(DEBUG, "commHandler constructed.");
+  auto runnableModule = std::make_unique<RunnableModule>(rtctx, jobSpec, commHandler.get(), dev);
+  DP_LOG(DEBUG, "runnableModule constructed.");
+  std::vector<torch::Tensor> parameters;
+  runnableModule->getActiveParameters(&parameters);
+  auto optimizer = std::make_unique<torch::optim::SGD>(parameters, /*lr=*/0.01);
+  DP_LOG(DEBUG, "optimizer constructed.");
+
+  auto job = std::make_unique<JobContext>(std::move(runnableModule), name,
+      nullptr, std::move(commHandler), nullptr, std::move(dev), 1, std::move(optimizer));
+  job->run_with_be = request->run_be() > 0;
+  job->model->idleCtxPtr = &job->idleCtx;
+
+  DP_LOG(DEBUG, "job constructed.");
+  return job;
+}
 
 ////////////////////////////////////////////////////////
 // GRPC Client code.

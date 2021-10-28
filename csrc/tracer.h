@@ -20,8 +20,34 @@
 #include "logger.h"
 #include "utils.h"
 #include "runtime.h"
+#include "Cycles.h"
 
-#define ENABLE_TIMERS 1
+#define ENABLE_TIMERS 0
+
+class CpuTimer {
+ public:
+  CpuTimer(const char* name)
+    : name(name) {}
+
+  inline void start() {
+    lastStartTick = RAMCloud::Cycles::rdtsc();
+  }
+
+  inline void stop() {
+    totalCycles += RAMCloud::Cycles::rdtsc() - lastStartTick;
+    count++;
+  }
+
+  uint64_t avgMicros() {
+    return RAMCloud::Cycles::toMicroseconds(
+        totalCycles / count);
+  }
+
+  const char* name;
+  uint64_t lastStartTick {0};
+  uint64_t totalCycles {0};
+  uint64_t count {0};
+};
 
 class CudaTimer {
  public:
@@ -31,6 +57,8 @@ class CudaTimer {
 #if ENABLE_TIMERS
     elapsedTimes.reserve(reservedEntries);
     CUDACHECK(cudaEventCreateWithFlags(&evt, cudaEventBlockingSync));
+#else
+    UNUSED(reservedEntries);
 #endif
   }
 
@@ -71,6 +99,7 @@ class CudaTimer {
     }
     return sum / (elapsedTimes.size() - skipIterCount);
 #else
+    UNUSED(skipIterCount);
     return 0;
 #endif
   }
@@ -89,6 +118,8 @@ class CudaTimer {
     size_t idx = sortedTimes.size() * percentile / 100.0;
     return sortedTimes[idx];
 #else
+    UNUSED(percentile);
+    UNUSED(skipIterCount);
     return 0;
 #endif
   }
@@ -98,7 +129,7 @@ class CudaTimer {
 
   cudaEvent_t* getCudaEvent() { return &evt; }
   bool isRecorded() { return recorded; }
-  
+
  private:
   CudaTimer* fromTimer;
   cudaEvent_t evt;

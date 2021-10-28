@@ -34,13 +34,13 @@ model_urls = {
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
     """3x3 convolution with padding"""
-    return cs.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
                      padding=dilation, groups=groups, bias=False, dilation=dilation)
 
 
-def conv1x1(in_planes: int, out_planes: int, stride: int = 1, custom_previous_layers: list = None) -> nn.Conv2d:
+def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
     """1x1 convolution"""
-    return cs.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False, custom_previous_layers=custom_previous_layers)
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 
 class BasicBlock(nn.Module):
@@ -118,22 +118,18 @@ class Bottleneck(nn.Module):
             norm_layer = nn.BatchNorm2d
         width = int(planes * (base_width / 64.)) * groups
         # Both self.conv2 and self.downsample layers downsample the input when stride != 1
-        layerSideBranch = cs.layers[-1]
         self.conv1 = conv1x1(inplanes, width)
         self.bn1 = norm_layer(width)
         self.conv2 = conv3x3(width, width, stride, groups, dilation)
         self.bn2 = norm_layer(width)
         self.conv3 = conv1x1(width, planes * self.expansion)
         self.bn3 = norm_layer(planes * self.expansion)
-        layerMainBranch = cs.layers[-1]
-        if False and downsampleParams is not None: # hack to test resnet152
-            convDownsample = conv1x1(*(downsampleParams[0]), [layerSideBranch])
-            layerSideBranch = cs.layers[-1]
+        if downsampleParams is not None: # hack to test resnet152
+            convDownsample = conv1x1(*(downsampleParams[0]))
             self.downsample = nn.Sequential(convDownsample, norm_layer((downsampleParams[1])))
         else:
             self.downsample = None
-        # self.relu = cs.ReLU(inplace=True, custom_previous_layers=[layerMainBranch, layerSideBranch])
-        self.relu = cs.ReLU(inplace=True)
+        self.relu = nn.ReLU(inplace=True)
         self.stride = stride
 
     def forward(self, x: Tensor) -> Tensor:
@@ -157,7 +153,6 @@ class Bottleneck(nn.Module):
         out = self.relu(out)
 
         return out
-
 
 class ResNet(nn.Module):
 
@@ -238,13 +233,20 @@ class ResNet(nn.Module):
             downsampleParams = ( (self.inplanes, planes * block.expansion, stride), (planes * block.expansion) )
 
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsampleParams, self.groups,
-                            self.base_width, previous_dilation, norm_layer))
+
+        kwargs = {"inplanes": self.inplanes, "planes": planes, "stride": stride, "downsampleParams": downsampleParams,
+            "groups": self.groups, "base_width": self.base_width, "dilation": previous_dilation}
+        blockModule = block(**kwargs, norm_layer=norm_layer)
+        layers.append(blockModule)
+        cs.GeneralLayer(blockModule, "ResnetBottleneck", kwargs, mustTrace=False)
+
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes, groups=self.groups,
-                                base_width=self.base_width, dilation=self.dilation,
-                                norm_layer=norm_layer))
+            kwargs = {"inplanes": self.inplanes, "planes": planes, "groups": self.groups, "base_width": self.base_width,
+                    "dilation": previous_dilation}
+            blockModule = block(**kwargs, norm_layer=norm_layer)
+            layers.append(blockModule)
+            cs.GeneralLayer(blockModule, "ResnetBottleneck", kwargs, mustTrace=False)
 
         return nn.Sequential(*layers)
 
@@ -430,31 +432,27 @@ def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fal
     profiler = GpuProfiler("cuda")
     profiler.loadProfile()
     global cs
-    cs = CostSim(profiler, netBw=netBw, verbose=True, gpuProfileLoc="resnetLayerGpuProfileA100V2.txt", gpuProfileLocSub="resnetLayerGpuProfileA100.txt")
-    model = resnet34()
-    # model = resnet152()
-    # model = wide_resnet101_2()
+    cs = CostSim(profiler, netBw=netBw, verbose=True, gpuProfileLoc="profile/A100_wrn.prof")
+    model = wide_resnet101_2()
     cs.printAllLayers(slient=True)
     cs.computeInputDimensions((3,224,224))
-    job, iterMs, gpuMs = cs.searchBestSplits(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
+    # job, iterMs, gpuMs = cs.searchBestSplits(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
     job, iterMs, gpuMs, maxGpusUsed = cs.searchBestSplitsV3(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
-    print("  %2d    %2d   %4.1f  %4.1f\n" % (globalBatch, maxGpusUsed, iterMs, gpuMs))
-
     jobInJson = job.dumpInJSON()
     profiler.saveProfile()
     # for rank in range(4):
     #     print("GPU rank: %d"%rank)
     #     print(job.dumpSingleRunnableModule(rank))
 
-    # job2 = TrainingJob("test", None, None, 0, 0, "")
-    # job2.loadJSON(jobInJson)
-    # assert(jobInJson == job2.dumpInJSON())
-    # print("Load/Dump returned the same output? %s" % ("true" if jobInJson == job2.dumpInJSON() else "false"))
+    job2 = TrainingJob("test", None, None, 0, 0, "")
+    job2.loadJSON(jobInJson)
+    assert(jobInJson == job2.dumpInJSON())
+    print("Load/Dump returned the same output? %s" % ("true" if jobInJson == job2.dumpInJSON() else "false"))
     # print(jobInJson)
     
     if not spatialSplit and not simOnly:
         cc = ClusterClient()
-        jobName = "Resnet34_%d_%d_%2.1f%s" % (gpuCount, globalBatch, amplificationLimit, "_DP" if dataParallelBaseline else "")
+        jobName = "wrn101_%d_%d_%2.1f%s" % (gpuCount, globalBatch, amplificationLimit, "_DP" if dataParallelBaseline else "")
         jobName += "_BE" if use_be else ""
         cc.submitTrainingJob(jobName, jobInJson, use_be)
 
@@ -479,9 +477,9 @@ def runAllConfigs(modelName: str, clusterType: str, simOnly=True):
     else:
         print("Wrong cluster type. Put either V100 or A100")
 
-    gpuCounts = [1, 2, 4, 8, 16]
+    gpuCounts = [1, 2, 4, 8]
     # gpuCounts = [1, 2, 4]
-    globalBatchSize = 128
+    globalBatchSize = 16
     # globalBatchSize = 16
     # globalBatchSize = 8
     limitAndBaseline = [(2.0, True, False), (99, False, False), (1.5, False, False), (2.0, False, False), (2.5, False, False)]
@@ -515,56 +513,6 @@ def runAllConfigs(modelName: str, clusterType: str, simOnly=True):
         fr = open('runtimeResult.data', "w")
         fr.close()
 
-    # #################################
-    # ## Profiling by batch size.
-    # #################################
-    # globalBatchSizes = [1,2,4,8,16,32,64,128]
-    # lim, baseline, spatialSplit = (2.0, True, False)
-    # simResultFilename = "%s_%s_varyBatch_sim.data" % (modelName, "DP" if baseline else "MP")
-    # f = open(simResultFilename, "w")
-    # f.write("#batch GPUs IterMs  GpuMs\n")
-    # f.close()
-
-    # # for gpuCount in gpuCounts:
-    # gpuCount = 1
-    # for globalBatchSize in globalBatchSizes:
-    #     preSize = os.stat('runtimeResult.data').st_size
-    #     main(gpuCount, globalBatchSize, amplificationLimit=lim, dataParallelBaseline=baseline, netBw=netBw, spatialSplit=spatialSplit, simResultFilename=simResultFilename)
-    #     # check exp finished.
-    #     print("runtimeResult.data's original size: ", preSize)
-    #     while os.stat('runtimeResult.data').st_size == preSize and not spatialSplit:
-    #         time.sleep(10)
-    #     print("runtimeResult.data's current size: ", os.stat('runtimeResult.data').st_size)
-    
-    # if not spatialSplit:
-    #     fw = open("%s_%s_varyBatch_run.data" % (modelName, "DP" if baseline else "MP"), "w")
-    #     fr = open('runtimeResult.data', "r")
-    #     fw.write("#batch GPUs IterMs  GpuMs\n")
-    #     fw.write(fr.read())
-    #     fw.close()
-    #     fr.close()
-
-    # fr = open('runtimeResult.data', "w")
-    # fr.close()
-
-def runStrongScalingBench(modelName='resnet50'):
-    profiler = GpuProfiler("cuda")
-    global cs
-    netBw = 2.66E5
-    cs = CostSim(profiler, netBw=netBw, verbose=False)
-    inputSize = (3,224,224)
-    if modelName == 'resnet50':
-        model = resnet50(pretrained=False)
-    elif modelName == 'resnet34':
-        model = resnet34(pretrained=False)
-    
-    print("Model: ", modelName)
-    print("BatchSize  iterMs    fpMs    bpMs")
-    for batchSize in [2 ** exp for exp in range(1, 9)]:
-        iterTime, fpTime, bpTime = profiler.benchModel(model, inputSize, batchSize)
-        print(" %8d  %6.1f  %6.1f  %6.1f" %
-            (batchSize, iterTime / 1000, fpTime / 10000, bpTime / 1000))
-
 def generateJit():
     global cs
     netBw = 2.66E5
@@ -573,18 +521,21 @@ def generateJit():
     fakeInputSize = (16,3,224,224)
     fakeInput = torch.zeros(fakeInputSize)
 
-    model = resnet152()
-    traced = torch.jit.trace(model, fakeInput)
-    torch.jit.save(traced, "beModules/resnet152.jit")
+    # model = resnet152()
+    # traced = torch.jit.trace(model, fakeInput)
+    # torch.jit.save(traced, "beModules/resnet152.jit")
     
-    model = resnext101_32x8d()
-    traced = torch.jit.trace(model, fakeInput)
-    torch.jit.save(traced, "beModules/resnext101_32x8d.jit")
+    # model = resnext101_32x8d()
+    # traced = torch.jit.trace(model, fakeInput)
+    # torch.jit.save(traced, "beModules/resnext101_32x8d.jit")
 
     model = wide_resnet101_2()
+    pytorch_total_params = sum(p.numel() for p in model.parameters())
+    print("Number of parameters: ", pytorch_total_params)
+
     traced = torch.jit.trace(model, fakeInput)
     torch.jit.save(traced, "beModules/wide_resnet101_2.jit")
-    
+
 
 if __name__ == "__main__":
     print(len(sys.argv))
@@ -598,10 +549,8 @@ if __name__ == "__main__":
             main(int(sys.argv[1]), int(sys.argv[2]), amplificationLimit=float(sys.argv[3]), use_be=use_be)
     elif len(sys.argv) == 2:
         print("Run all configs")
-        runAllConfigs("resnet34", sys.argv[1])
+        runAllConfigs("wrn101", sys.argv[1])
     elif len(sys.argv) == 1:
         generateJit()
-        # for modelName in ['resnet50', 'resnet34']:
-        #     runStrongScalingBench(modelName)
     else:
         print("Wrong number of arguments.\nUsage: ")

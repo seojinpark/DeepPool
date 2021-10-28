@@ -21,6 +21,8 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 
+#include <nccl.h>
+
 #define UNUSED(expr) (void)(expr)
 
 template<typename ... Args>
@@ -58,6 +60,16 @@ std::string tsrSizeToStr(torch::Tensor tensor)
   return stream.str();
 }
 
+#define NCCL_API_CALL(apiFuncCall)                                            \
+  do {                                                                        \
+    ncclResult_t _status = apiFuncCall;                                        \
+    if (_status != ncclSuccess) {                                             \
+      fprintf(stderr, "%s:%d: error: function %s failed with error %d.\n",    \
+              __FILE__, __LINE__, #apiFuncCall, _status); \
+      exit(-1);                                                               \
+    }                                                                         \
+  } while (0)
+
 #define CUDA_API_CALL(apiFuncCall)                                            \
   do {                                                                        \
     cudaError_t _status = apiFuncCall;                                        \
@@ -69,15 +81,5 @@ std::string tsrSizeToStr(torch::Tensor tensor)
   } while (0)
 
 #define CUDACHECK(cmd) CUDA_API_CALL(cmd)
-
-#define NCCL_API_CALL(apiFuncCall)                                            \
-  do {                                                                        \
-    ncclResult_t _status = apiFuncCall;                                        \
-    if (_status != ncclSuccess) {                                             \
-      fprintf(stderr, "%s:%d: error: function %s failed with error %d.\n",    \
-              __FILE__, __LINE__, #apiFuncCall, _status); \
-      exit(-1);                                                               \
-    }                                                                         \
-  } while (0)
 
 #endif

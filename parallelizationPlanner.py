@@ -59,14 +59,18 @@ class SearchContext:
 
 
 class CostSim:
-    def __init__(self, profiler: GpuProfiler, netBw = 1.25E4, verbose=False, gpuProfileLoc=None):
+    def __init__(self, profiler: GpuProfiler, netBw = 1.25E4, verbose=False, gpuProfileLoc=None, gpuProfileLocSub=None):
         self.profiler = profiler
         self.layers: List[Layer] = []
         self.NET_BANDWIDTH = netBw
-        self.NET_LATENCY = 140 #40
+        self.NET_LATENCY = 240 #40
+        # self.NET_LATENCY = 400 #40
         self.verbose = verbose
         self.layerProfileCache = {}
-        if gpuProfileLoc != None and False:
+        # if gpuProfileLoc != None and False:
+        if gpuProfileLocSub != None:
+            self.loadGpuProfile(gpuProfileLocSub)
+        if gpuProfileLoc != None:
             self.loadGpuProfile(gpuProfileLoc)
         else:
             print("!!! gpuProfileLoc is not supplied for CostSim")
@@ -75,25 +79,35 @@ class CostSim:
         with open(gpuProfileLoc, "r") as f:
             for line in f:
                 items = line.strip().split()
-                if len(items) != 5 or items[0] == "#config":
+                if (len(items) != 5 and len(items) != 4) or items[0] == "#config":
                     continue
                 layerInfo = items[0]
                 avgTime = float(items[1]) * 1000
-                self.layerProfileCache[layerInfo] = {"avg": avgTime}
-                # p50Time = items[2]
-        #       printf("%100s  %.3f  %.3f  %.3f  %.3f\n", name, avgT, p50Times[name],
-        #           p90Times[name], p99Times[name]);
+                fwTime = float(items[2])
+                bwTime = float(items[3])
+                self.layerProfileCache[layerInfo] = {"avg": avgTime, "fwTime": fwTime, "bwTime": bwTime}
 
-    def queryLayerProfileCache(self, layer, config: tuple):
+    def getLayerIdentifier(self, layer, config: tuple):
         layerInfo = layer.name +\
             json.dumps(layer.params, sort_keys=True, separators=(',', ':')) +\
             "[" + str(config[0]) + "]" +\
             json.dumps(layer.inputDim, sort_keys=False, separators=(',', ':'))
-            # TODO: use config instead of inputDim to support operator splits.
+        return layerInfo
+        
+
+    def queryLayerProfileCache(self, layer, config: tuple):
+        layerInfo = self.getLayerIdentifier(layer, config)
         if layerInfo in self.layerProfileCache:
             return self.layerProfileCache[layerInfo]["avg"]
         else:
             return 0
+
+    def queryFwBwTime(self, layer, config: tuple):
+        layerInfo = self.getLayerIdentifier(layer, config)
+        if layerInfo in self.layerProfileCache:
+            return (self.layerProfileCache[layerInfo]["fwTime"], self.layerProfileCache[layerInfo]["bwTime"])
+        else:
+            return (0, 0)
 
     def generateModuleDescription(self, layerConfigs: list, globalBatch: int):
         # gpuTimeSum = 0
@@ -179,8 +193,14 @@ class CostSim:
                 layer.outputDim = int(numpy.prod(layer.inputDim))
             elif layer.name == "concat":
                 layer.outputDim = layer.inputDim
+            else:
+                inputSize = [1] + (list(layer.inputDim) if type(layer.inputDim) == tuple else [layer.inputDim])
+                fakeIn = torch.empty(inputSize)
+                outSize = list(layer.module(fakeIn).size())[1:]
+                layer.outputDim = outSize[0] if len(outSize) == 1 else tuple(outSize)
+                # print("Computed outputDim: ", layer.outputDim)
 
-            print("%3d %11s %20s %20s %s" % (i, layer.name, str(layer.inputDim), str(layer.outputDim), str(layer.params)) )
+            # print("%3d %11s %20s %20s %s" % (i, layer.name, str(layer.inputDim), str(layer.outputDim), str(layer.params)) )
     
     def calcInputXfer(self, srcLayer: Layer, destLayer: Layer, srcConfig: tuple, destConfig: tuple, noGpuOverlap = False):
         namesIn2d = ["conv2d", "maxPool2d", "avgPool2d", "adAvgPool2d", "ReLU2d", "concat"]
@@ -195,13 +215,14 @@ class CostSim:
                 destLayer.name in namesIn2d + ["flatten"]:
             actTime = self.calc2dActivationTime(srcLayer, destLayer, srcConfig, destConfig, noGpuOverlap)
             return (actTime[0] * reluMultiple, actTime[1])
-            
         elif srcLayer.name in namesIn1d + ["flatten"] and \
                 destLayer.name in namesIn1d:
             actTime = self.calcLinearActivationTime(srcLayer, destLayer, srcConfig, destConfig, noGpuOverlap)
             return (actTime[0] * reluMultiple, actTime[1])
         else:
-            print("Can't compute input transfer time from %s to %s." % (srcLayer.name, destLayer.name))
+            actTime = self.calcGeneralActivationTime(srcLayer, destLayer, srcConfig, destConfig, noGpuOverlap)
+            return (actTime[0] * reluMultiple, actTime[1])
+            # print("Can't compute input transfer time from %s to %s." % (srcLayer.name, destLayer.name))
 
     def calcSyncTime(self, layer, config, ctx):
         if layer.name in ["conv2d"]:
@@ -311,6 +332,29 @@ class CostSim:
             print("[calcLinearActivationTime] error! srcConfig dimensions is not correct.")
         destS = destConfig[0]
         destInFeatures = destConfig[1]
+
+        commonSize = bytesPerParam * min(srcS, destS) * min(srcOutFeatures, destInFeatures)
+        if noGpuOverlap:
+            commonSize = 0
+
+        # compute times
+        egressBytes = bytesPerParam * srcS * srcOutFeatures * splitFactor - commonSize
+        ingressBytes = bytesPerParam * destS * destInFeatures * splitFactor - commonSize
+        activationTime = max(egressBytes, ingressBytes) / self.NET_BANDWIDTH
+        activationTime += self.NET_LATENCY if activationTime > 0 else 0
+        # print("activationTime:%.1f, egressBytes:%d, ingressBytes:%d, splitFactor: %d, commonSize: %d" %\
+        #     (activationTime, egressBytes, ingressBytes, splitFactor, commonSize))
+        return (2 * activationTime, (egressBytes, ingressBytes, splitFactor)) # double to count both forward and backward passes.
+
+    def calcGeneralActivationTime(self, srcLayer: Layer, destLayer: Layer, srcConfig: tuple, destConfig: tuple, noGpuOverlap: bool):
+        # print("srcConfig: ", srcConfig)
+        bytesPerParam = 4
+        # Prepare variables.
+        srcS = srcConfig[0]
+        srcOutFeatures = numpy.prod(srcLayer.outputDim)
+        destS = destConfig[0]
+        destInFeatures = numpy.prod(destLayer.inputDim)
+        splitFactor = 1
 
         commonSize = bytesPerParam * min(srcS, destS) * min(srcOutFeatures, destInFeatures)
         if noGpuOverlap:
@@ -451,13 +495,44 @@ class CostSim:
         self.layers.append(layer)
         return
 
+    def Dropout(self, dropout, inplace: bool = False, custom_previous_layers: list = None):
+        module = nn.Dropout(dropout, inplace=inplace)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "dropout", {"dropout": dropout}, prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+        return module
+
+    def LayerNorm(self, dim, custom_previous_layers: list = None):
+        module = nn.LayerNorm(dim)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "layerNorm", {"dim": dim}, prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+        return module
+    
+    def GeneralLayer(self, module, name, params, custom_previous_layers: list = None, mustTrace=False):
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, name, params, prevLayers = custom_previous_layers)
+        layer.must_trace = mustTrace
+        self.layers.append(layer)
+        return
+
     def getInitialConfig(self, layer, globalBatch: int):
         if layer.name in ["conv2d"]:
             initCfg = (globalBatch, layer.inputDim[1], layer.inputDim[2], layer.inputDim[0], layer.outputDim[2]) # (batch, width, height, channel, filter)
         elif layer.name in ["linear", "ReLU1d"]:
-            initCfg = (globalBatch, layer.inputDim, layer.outputDim)
+            if type(layer.inputDim) == tuple:
+                initCfg = (globalBatch, *layer.inputDim, layer.outputDim)
+            else:
+                initCfg = (globalBatch, layer.inputDim, layer.outputDim)
         elif layer.name in ["flatten", "maxPool2d", "avgPool2d", "adAvgPool2d", "ReLU2d", "concat"]:
             initCfg = (globalBatch, layer.inputDim[1], layer.inputDim[2], layer.inputDim[0]) # (batch, width, height, channel, filter)
+        else:
+            initCfg = (globalBatch, *layer.inputDim) if type(layer.inputDim) == tuple else (globalBatch, layer.inputDim) # (batch, width, height, channel)
         return initCfg
 
     def listConfigOptions(self, layer, globalBatch: int, totalGpus: int, samplePo2=True, sampleSplit=True, spatialSplit=True, filterSplit=False, pruneHeuristics=False, dataParallelBaseline=False):
@@ -482,6 +557,9 @@ class CostSim:
             configCandidates = [(int(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3] )
                                 for bs in sampleSplitOptions \
                                     for whs in (range(totalSplits - bs + 1) if spatialSplit else [0]) ]
+        else:
+            configCandidates = [(int(initCfg[0] / 2**bs), *initCfg[1:] )
+                                for bs in sampleSplitOptions ]
 
         # if layer.name in ["conv2d"]:
         #     configCandidates = [(math.ceil(initCfg[0] / replicas), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], math.ceil(initCfg[4] / 2**fs) )
@@ -563,6 +641,8 @@ class CostSim:
         cached = self.queryLayerProfileCache(layer, config)
         if cached > 0:
             return cached
+        else:
+            return 1
 
         # This is a hack for quickly generating a plan for initial layer profiling.
         if ctx != None and ctx.doNotBench:
@@ -571,8 +651,10 @@ class CostSim:
 
         if layer.name in ["conv2d"]:
             gpuTime = self.profiler.runConv2dBench(config, layer.params, profile)
+            print(" Something bad happened!! Missed queryLayerProfileCache")
         elif layer.name in ["linear"]:
             gpuTime = self.profiler.runLinearBench(config, profile)
+            print(" Something bad happened!! Missed queryLayerProfileCache")
         else:
             gpuTime = 0
         return gpuTime
@@ -1050,6 +1132,7 @@ class CostSim:
                 
                 # Benchmark GPU time
                 gpuTime = self.benchGpuTime(layer, config)
+                # print("  GPU Time of ", config, " : ", gpuTime)
                 
                 # Computer all-reduce time
                 if layer.name in ["conv2d"]:
@@ -1381,8 +1464,6 @@ class CostSim:
             layer.noParallelTime = self.benchGpuTime(layer, initCfg, ctx=ctx) + self.calcSyncTime(layer, initCfg, ctx)
             
             configCandidates = self.listConfigOptions(layer, ctx.globalBatch, ctx.totalGpus, sampleSplit=ctx.sampleSplit, spatialSplit=ctx.spatialSplit, filterSplit=ctx.filterSplit, dataParallelBaseline=ctx.dataParallelBaseline)
-            if self.verbose and layer.id < 3:
-                print(" %2d  configCandidates: %s" % (layer.id, str(configCandidates)))
             
             for config in configCandidates:
                 # Benchmark GPU time and all-reduce time
@@ -1667,6 +1748,7 @@ class CostSim:
             bestCfg = bestLastCfg
             while True:
                 layer.bestCfg = bestCfg
+                layer.gpuTime = self.queryFwBwTime(layer, bestCfg)
                 if layer == stopAtLayer:
                     # gpuUsecSum -= layer.t[bestCfg][1] * self.calcGpusNeeded(layer, bestCfg, ctx.globalBatch) # To avoid double-counting, add startLayer in backwardBranch.
                     return gpuUsecSum, maxGpusUsed, startNoOverlapAdjustment, sideBranchOvertimeSum
@@ -1836,13 +1918,13 @@ class CostSim:
             if layer.name in ["conv2d"]:
                 print("%11s (b=%2d, w=%3d, h=%3d, c=%4d, f=%4d) => " % (layer.name, *layer.initCfg), end="")
                 print("(b=%2d, w=%3d, h=%3d, c=%4d, f=%4d) " % layer.bestCfg, end="")
-            elif layer.name in ["linear", "ReLU1d"]:
+            elif len(layer.initCfg) == 3: #layer.name in ["linear", "ReLU1d"]:
                 print("%11s (b=%2d, in=%6d, out=%6d)        => " % (layer.name, *layer.initCfg), end="")
                 print("(b=%2d, in=%6d, out=%6d)        " % layer.bestCfg, end="")
-            elif layer.name in ["flatten", "maxPool2d", "avgPool2d", "adAvgPool2d", "ReLU2d", "concat"]:
+            elif len(layer.initCfg) == 4: # layer.name in ["flatten", "maxPool2d", "avgPool2d", "adAvgPool2d", "ReLU2d", "concat"]:
                 print("%11s (b=%2d, w=%3d, h=%3d, c=%4d)         => " % (layer.name, *layer.initCfg), end="")
                 print("(b=%2d, w=%3d, h=%3d, c=%4d)         " % layer.bestCfg, end="")
-
+            
             gpusUsed = self.calcGpusNeeded(layer, layer.bestCfg, ctx.globalBatch)
             gpuTime = self.benchGpuTime(layer, layer.bestCfg, ctx=ctx)
             # gpuUsec = gpusUsed * (cumulativeTime - timeComposition[0])

@@ -606,11 +606,11 @@ class BasicConv2d(nn.Module):
 
 
 
-def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66E5, spatialSplit=False, simResultFilename=None, simOnly=False):
+def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66E5, spatialSplit=False, simResultFilename=None, simOnly=False, use_be=False):
     profiler = GpuProfiler("cuda")
     profiler.loadProfile()
     global cs
-    cs = CostSim(profiler, netBw=netBw, verbose=True, gpuProfileLoc="inceptionLayerGpuProfileA100.txt")
+    cs = CostSim(profiler, netBw=netBw, verbose=True, gpuProfileLoc="profile/A100_inception.prof") #"inceptionLayerGpuProfileA100V2.txt", gpuProfileLocSub="inceptionLayerGpuProfileA100.txt")
     model = Inception3(aux_logits=False)
     cs.printAllLayers(slient=True)
     cs.computeInputDimensions((3,299,299))
@@ -637,10 +637,15 @@ def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fal
     print("Load/Dump returned the same output? %s" % ("true" if jobInJson == job2.dumpInJSON() else "false"))
     # print(jobInJson)
     
+    if maxGpusUsed > 8:
+        print("maxGpusUsed: ", maxGpusUsed, " is bigger than 8. Can't schedule this job.")
+        return
+    
     if not spatialSplit and not simOnly:
         cc = ClusterClient()
         jobName = "InceptionV3_%d_%d_%2.1f%s" % (gpuCount, globalBatch, amplificationLimit, "_DP" if dataParallelBaseline else "")
-        cc.submitTrainingJob(jobName, jobInJson)
+        jobName += "_BE" if use_be else ""
+        cc.submitTrainingJob(jobName, jobInJson, use_be)
 
     if simResultFilename != None:
         f = open(simResultFilename, "a")
@@ -669,10 +674,10 @@ def runAllConfigs(modelName: str, clusterType: str, simOnly=True):
 
     gpuCounts = [1, 2, 4, 8]
     # gpuCounts = [1, 2, 4]
-    globalBatchSize = 64
+    globalBatchSize = 32
     # globalBatchSize = 16
     # globalBatchSize = 8
-    limitAndBaseline = [(2.0, True, False), (1.5, False, False), (2.0, False, False), (5.0, False, False), (10.0, False, False)]
+    limitAndBaseline = [(2.0, True, False), (1.5, False, False), (2.0, False, False), (2.5, False, False)]
     # limitAndBaseline = [(99, False, True)]
     # limitAndBaseline = []
     for lim, baseline, spatialSplit in limitAndBaseline:
@@ -713,7 +718,7 @@ def runStrongScalingBench():
 
     fakeInputSize = (32,3,299,299)
     fakeInput = torch.zeros(fakeInputSize)
-    traced = torch.jit.script(model, fakeInput)
+    traced = torch.jit.trace(model, fakeInput)
     torch.jit.save(traced, "modules/inception.pt")
     
     print("Model: ", "Inception3")
@@ -730,12 +735,18 @@ if __name__ == "__main__":
         globalBatchSize = int(sys.argv[2])
         simResultFilename = "%s_%s_b%d_sim.data" % ("inception", "DP", globalBatchSize)
         main(gpuCount, globalBatchSize, dataParallelBaseline=True)
-    elif len(sys.argv) == 4:
+    elif len(sys.argv) >= 4:
+        use_be = len(sys.argv) > 4 and int(sys.argv[4]) == 1
         gpuCount = int(sys.argv[1])
         globalBatchSize = int(sys.argv[2])
-        amplificationLimit = float(sys.argv[3])
-        simResultFilename = "%s_%s_b%d_lim%2.1f_sim.data" % ("inception", "MP", globalBatchSize, amplificationLimit)
-        main(gpuCount, globalBatchSize, amplificationLimit, simResultFilename = simResultFilename)#, netBw = 1.25E4)
+        if sys.argv[3] == "DP":
+            simResultFilename = "%s_%s_b%d_sim.data" % ("inception", "DP", globalBatchSize)
+            main(gpuCount, globalBatchSize, dataParallelBaseline=True, use_be=use_be, simResultFilename=simResultFilename)
+        else:
+            amplificationLimit = float(sys.argv[3])
+            simResultFilename = "%s_%s_b%d_lim%2.1f_sim.data" % ("inception", "MP", globalBatchSize, amplificationLimit)
+            main(gpuCount, globalBatchSize, amplificationLimit, use_be=use_be, simResultFilename=simResultFilename)
+            # main(gpuCount, globalBatchSize, amplificationLimit, simResultFilename = simResultFilename, use_be=use_be)
     elif len(sys.argv) == 2:
         print("Run all configs")
         runAllConfigs("inceptionV3", sys.argv[1])

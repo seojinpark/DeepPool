@@ -17,6 +17,7 @@
 #include "json.hpp"
 #include "runtime.h"
 #include "runnableModule.h"
+#include "taskManager.h"
 #include "logger.h"
 #include "utils.h"
 #include "communication.h"
@@ -27,6 +28,8 @@ using torch::autograd::AutogradContext;
 using torch::autograd::variable_list;
 
 // #define TIME_COLLECTIVES
+static uint64_t bytes_inflight = 0;
+static std::vector<torch::Tensor> pending_grads;
 
 ////////////////////////////////////////////////
 // TsrXferFunc
@@ -52,6 +55,7 @@ TsrXferFunc::forward(AutogradContext* ctx, Variable x, TsrXfer* xfer)
         x.split_with_sizes(xfer->splitSizes, xfer->splitCatDim);
     assert(splittedTsrs.size() == xfer->xferTagAndRank.size() + 1);
     size_t i;
+    xfer->commHandler->comm_start();
     for (i = 0; i < xfer->xferTagAndRank.size(); ++i) {
       Tag tag = xfer->xferTagAndRank[i].first;
       Rank dest = xfer->xferTagAndRank[i].second;
@@ -60,39 +64,42 @@ TsrXferFunc::forward(AutogradContext* ctx, Variable x, TsrXfer* xfer)
           tsrSizeToStr(tsr).c_str());
 
       xfer->commHandler->send(tsr, tag, dest, /*async*/ true);
-      // std::cout << "Send type: " << xfer->type << ", tsr shape " << tsrSizeToStr(tsr).c_str() << std::endl;
     }
     if (rtctx->profile && rtctx->profile_comms)
       ((CommunicationHandlerNCCL*)xfer->commHandler)->sync();
-    #ifdef TIME_COLLECTIVES
-    CUDA_API_CALL(cudaEventRecord(end_time, rtctx->torch_stream));
-    CUDA_API_CALL(cudaEventSynchronize(end_time));
-    CUDA_API_CALL(cudaEventElapsedTime(&elapsed_milliseconds, start_time, end_time));
-    std::cout << "Send time: " << elapsed_milliseconds << " ms" << std::endl;
-    #endif
+    xfer->commHandler->comm_end();
     return splittedTsrs[i];
   }
   else if (xfer->type == TsrXfer::Recv) {
     std::vector<int64_t> inputSizes = x.sizes().vec();
     std::vector<torch::Tensor> tsrList;
     size_t i;
+
+    // TODO: allocate single tensor buffer and direct recvs into correct portions
+    // assert(xfer->splitCatDim == 0);
+
+    for (i = 0; i < xfer->xferTagAndRank.size(); ++i) {
+      inputSizes[xfer->splitCatDim] = xfer->splitSizes[i];
+      torch::TensorOptions topts(rtctx->c10dev);
+      torch::Tensor tsr = torch::empty(inputSizes, topts);
+      tsrList.push_back(tsr);
+    }
+
+    xfer->commHandler->comm_start();
     for (i = 0; i < xfer->xferTagAndRank.size(); ++i) {
       Tag tag = xfer->xferTagAndRank[i].first;
       Rank src = xfer->xferTagAndRank[i].second;
-      inputSizes[xfer->splitCatDim] = xfer->splitSizes[i];
-      torch::Tensor tsr = torch::empty(inputSizes);
-      tsr = tsr.to(xfer->commHandler->getDev(), /*non_blocking*/ true, /*copy*/ false);
+      auto &tsr = tsrList.at(i);
       // DP_LOG(DEBUG, "Receiving tag:%d from R:%d with tensor: %s, %s, %s", tag, src,
       //     tsr.toString().c_str(), tsrSizeToStr(tsr).c_str(), tsrToStr(tsr).c_str());
       DP_LOG(DEBUG, "Receiving tag:%d from R:%d with tensor: %s", tag, src,
           tsrSizeToStr(tsr).c_str());
       xfer->commHandler->recv(tsr, tag, src, /*async*/ true);
-      tsrList.push_back(tsr);
-      // std::cout << "Recv type: " << xfer->type << ", tsr shape " << tsrSizeToStr(tsr).c_str() << std::endl;
     }
-    tsrList.push_back(x);
+    xfer->commHandler->comm_end();
     xfer->commHandler->sync();
-    DP_LOG(DEBUG, "Concating %d tensors", static_cast<int>(tsrList.size()));
+    tsrList.push_back(x);
+    DP_LOG(DEBUG, "Concating %lu tensors", tsrList.size());
     auto concated = torch::cat(tsrList, xfer->splitCatDim);
     DP_LOG(DEBUG, "Concated tensor: %s", tsrSizeToStr(concated).c_str());
 
@@ -123,6 +130,7 @@ TsrXferFunc::backward(AutogradContext* ctx, variable_list grad_output)
         x.split_with_sizes(xfer->splitSizes, xfer->splitCatDim);
     assert(splittedTsrs.size() == xfer->xferTagAndRank.size() + 1);
     size_t i;
+    xfer->commHandler->comm_start();
     for (i = 0; i < xfer->xferTagAndRankBack.size(); ++i) {
       Tag tag = xfer->xferTagAndRankBack[i].first;
       Rank dest = xfer->xferTagAndRankBack[i].second;
@@ -131,7 +139,8 @@ TsrXferFunc::backward(AutogradContext* ctx, variable_list grad_output)
           tsrSizeToStr(tsr).c_str());
       xfer->commHandler->send(tsr, tag, dest, /*async*/ true);
     }
-    
+    xfer->commHandler->comm_end();
+
     variable_list grad_inputs(2);
     grad_inputs[0] = splittedTsrs[i];
 
@@ -146,19 +155,26 @@ TsrXferFunc::backward(AutogradContext* ctx, variable_list grad_output)
     std::vector<torch::Tensor> tsrList;
     size_t i;
     for (i = 0; i < xfer->xferTagAndRankBack.size(); ++i) {
+      inputSizes[xfer->splitCatDim] = xfer->splitSizes[i];
+      torch::TensorOptions topts(rtctx->c10dev);
+      torch::Tensor tsr = torch::empty(inputSizes, topts);
+      tsrList.push_back(tsr);
+    }
+
+    xfer->commHandler->comm_start();
+    for (i = 0; i < xfer->xferTagAndRankBack.size(); ++i) {
       Tag tag = xfer->xferTagAndRankBack[i].first;
       Rank src = xfer->xferTagAndRankBack[i].second;
-      inputSizes[xfer->splitCatDim] = xfer->splitSizes[i];
-      torch::Tensor tsr = torch::empty(inputSizes);
-      tsr = tsr.to(xfer->commHandler->getDev(), /*non_blocking*/ true, /*copy*/ false);
+      auto &tsr = tsrList[i];
       DP_LOG(DEBUG, "Receiving tag:%d from R:%d with tensor: %s", tag, src,
           tsr.toString().c_str());
       xfer->commHandler->recv(tsr, tag, src, /*async*/ true);
-      tsrList.push_back(tsr);
     }
+    xfer->commHandler->comm_end();
+    xfer->commHandler->sync();
+
     tsrList.push_back(x);
     // return { torch::cat(tsrList, xfer->splitCatDim) };
-    xfer->commHandler->sync();
 
     variable_list grad_inputs(2);
     grad_inputs[0] = torch::cat(tsrList, xfer->splitCatDim);
@@ -194,11 +210,12 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
   , fpTargets()
   , fpOutput()
   , fpLoss()
+  , detachTimer("detachTimer")
 {
   DP_LOG(DEBUG, "Constructing runnable module.. rank:%d", rank);
   DP_LOG(DEBUG, "             initialBatchSize:%d", initialBatchSize);
-  DP_LOG(DEBUG, "             layersInJson's size:%d (from spec)", static_cast<int>(spec["layers"].size()));
-  DP_LOG(DEBUG, "             layersInJson's size:%d", static_cast<int>(layersInJson.size()));
+  DP_LOG(DEBUG, "             layersInJson's size:%lu (from spec)", spec["layers"].size());
+  DP_LOG(DEBUG, "             layersInJson's size:%lu", layersInJson.size());
   
   // It's important to reserve the same, so that layers won't get copied over
   // to another address.. (layer's are pointing each other with raw pointer.)
@@ -229,6 +246,9 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
 
     int layerLocalBatch = ldsc["config"][0].get<int>();
     bool layerIsActive = layerLocalBatch > 0;
+    if (!layerIsActive) {
+      hasInactiveLayer = true;
+    }
     bool detachInput = true;
     if (name == "ReLU2d" || name == "ReLU1d") {
       detachInput = false;
@@ -241,8 +261,13 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
       prevLayers.push_back(&layers[plid]);
     }
     bool detachOutput = ldsc["nextLayers"].size() > 1;
+    bool syncTwice = ldsc["gpuAssignment"].size() >= rtctx->min_layer_sync;
+    if (!syncTwice) {
+      DP_LOG(NOTICE, " %d-th layer's name: %s, syncTwice: %d", id, name.c_str(),
+          syncTwice);
+    }
     layers.emplace_back(module, specialModule, id, layerIsActive, detachInput,
-                        detachOutput, prevLayers);
+                        detachOutput, prevLayers, syncTwice);
 
     // EmptyTensorSizes.
     layers.back().emptyInSizes.push_back(0);
@@ -299,8 +324,8 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
         DP_LOG(DEBUG, "remainder: %d, sum: %d", remainder, xferSampleSum);
         xfer.splitSizes.push_back(remainder);
         layers.back().xferOuts.push_back(std::move(xfer));
-        DP_LOG(DEBUG, "xferOut registered. len(layer->xferOuts): %d",
-            static_cast<int>(layers.back().xferOuts.size()));
+        DP_LOG(DEBUG, "xferOut registered. len(layer->xferOuts): %lu",
+            layers.back().xferOuts.size());
       }
     }
 
@@ -349,56 +374,9 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
         DP_LOG(DEBUG, "remainder: %d, sum: %d", remainder, xferSampleSum);
         xfer.splitSizes.push_back(remainder);
         layers.back().xferIns.push_back(std::move(xfer));
-        DP_LOG(DEBUG, "xferIn registered. len(layer->xferIns): %d", static_cast<int>(layers.back().xferIns.size()));
+        DP_LOG(DEBUG, "xferIn registered. len(layer->xferIns): %lu", layers.back().xferIns.size());
       }
     }
-
-    // if (layerIsActive && ldsc.contains("tensorRx")) {
-    //   std::map<int, std::vector<json> > recvListDict;
-    //   for (auto& item : ldsc["tensorRx"]) {
-    //     int prevLayerId = item["prop"]["prevLayerId"].get<int>();
-    //     if (recvListDict.find(prevLayerId) == recvListDict.end()) {
-    //       recvListDict[prevLayerId] = std::vector<json>();
-    //     }
-    //     recvListDict[prevLayerId].push_back(item);
-    //   }
-    //   for (const auto& kv : recvListDict) {
-    //     const int prevLayerId = kv.first;
-    //     const std::vector<json>& recvList = kv.second;
-
-    //     TsrXfer xfer(commHandler);
-    //     xfer.type = TsrXfer::Recv;
-    //     xfer.splitCatDim = 0;
-    //     xfer.prevLayerId = prevLayerId;
-    //     xfer.nextLayerId = id;
-    //     xfer.recevingLayerForSend = &layers.back();
-    //     int xferSampleSum = 0;
-    //     for (const json& item : recvList) {
-    //       int xferSamples = item["prop"]["xferSamples"].get<int>();
-    //       xfer.splitSizes.push_back(xferSamples);
-    //       xferSampleSum += xferSamples;
-
-    //       auto xferName = item["name"].get<std::string>();
-    //       Tag tag = commHandler->getTag(xferName);
-    //       Tag tagB = commHandler->getTag(xferName + "_back");
-    //       Rank src = item["src"].get<Rank>();
-    //       xfer.xferTagAndRank.push_back(std::make_pair(tag, src));
-    //       xfer.xferTagAndRankBack.push_back(std::make_pair(tagB, src));
-    //     }
-
-    //     int remainder;
-    //     if (xfer.splitCatDim == 0) {
-    //       remainder = ldsc["config"][0].get<int>() - xferSampleSum;
-    //     } else { // Other than sample dimension, use inputDim as its dimension is ordered correctly.
-    //       remainder = ldsc["inputDim"][xfer.splitCatDim - 1].get<int>() - xferSampleSum;
-    //     }
-
-    //     DP_LOG(DEBUG, "remainder: %d, sum: %d", remainder, xferSampleSum);
-    //     xfer.splitSizes.push_back(remainder);
-    //     layers.back().xferIns.push_back(std::move(xfer));
-    //     DP_LOG(DEBUG, "xferIn registered. len(layer->xferIns): %d", static_cast<int>(layers.back().xferIns.size()));
-    //   }
-    // }
 
     if (rtctx->profile) {
       // TODO: if it's not that accurate, maybe add layer id?
@@ -406,7 +384,11 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
           "[" + std::to_string(layerLocalBatch) + "]" + ldsc["inputDim"].dump();
       DP_LOG(DEBUG, "moduleName: %s", layers.back().moduleName.c_str());
     }
-    
+    // if (ldsc.contains("gpuTime")) {
+    layers.back().fwUsec = ldsc["gpuTime"][0].get<int>();
+    layers.back().bwUsec = ldsc["gpuTime"][1].get<int>();
+    // }    
+    // DP_LOG(DEBUG, " id: %d  fwUsec: %d, bwUsec: %d", id, layers.back().fwUsec, layers.back().bwUsec);
 
     moduleList.push_back(module);
     DP_LOG(DEBUG, " layer's module is pushed back.");
@@ -415,10 +397,14 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
   }
 
   for (auto& layer : layers) {
-    DP_LOG(DEBUG, "lid: %d, xferOuts: %d, xferIns: %d", layer.id,
-        static_cast<int>(layer.xferOuts.size()), static_cast<int>(layer.xferIns.size()));
+    DP_LOG(DEBUG, "lid: %d, xferOuts: %lu, xferIns: %lu", layer.id,
+        layer.xferOuts.size(), layer.xferIns.size());
   }
 
+  for (auto& layer : layers) {
+    DP_LOG(DEBUG, "lid: %d, fwUsec: %" PRId64 ", bwUsec: %" PRId64 "",
+        layer.id, layer.fwUsec, layer.bwUsec);
+  }
 
   /* set up fake data pipelines for input + target */
   std::vector<int64_t> inputSizes;
@@ -446,6 +432,21 @@ RunnableModule::getParameters(std::vector<torch::Tensor>* parameters)
 }
 
 /**
+ * Dumps the entire model parameters into the given vector.
+ */
+void
+RunnableModule::getActiveParameters(std::vector<torch::Tensor>* parameters)
+{
+  for (auto& layer : layers) {
+    if (layer.active) {
+      for (const auto& params : layer.module.parameters()) {
+        parameters->push_back(params);
+      }
+    }
+  }
+}
+
+/**
  * Initiate an iteration.
  */
 void
@@ -457,6 +458,16 @@ RunnableModule::iterInit()
   fpTargets = target_pipeline.GetNext();
   fpOutput.reset();
   fpLoss.reset();
+  // reduceBuckets.clear();
+  // reduceBuckets.emplace_back();
+}
+
+void
+RunnableModule::resetForNewIter()
+{
+  for (auto& layer : layers) {
+    layer.status = LayerStatus::PENDING_FP;
+  }
 }
 
 /**
@@ -464,8 +475,8 @@ RunnableModule::iterInit()
  * 
  * \return Returns true if forward pass is completed.
  */
-bool
-RunnableModule::forwardAStep()
+JobStatus
+RunnableModule::forwardAStep(bool captureLayer)
 {
   DP_LOG(DEBUG, "layerQ size: %d", (int)layerQ.size());
   Layer* layer = layerQ.front();
@@ -476,14 +487,14 @@ RunnableModule::forwardAStep()
   // bool skipSinceNotReady = false;
   if (layer->status == LayerStatus::PENDING_BP) {
     DP_LOG(DEBUG, "%d-th layer is processed again.", layer->id);
-    return false;
+    return IN_PROGRESS;
   }
   DP_LOG(DEBUG, "lid:%d.", layer->id);
   for (auto& prevLayer : layer->prevLayers) {
     if (prevLayer->status == LayerStatus::PENDING_FP) {
       DP_LOG(DEBUG, "Layer %d is skipped for now, must do %d first.",
           layer->id, prevLayer->id);
-      return false;
+      return IN_PROGRESS;
     }
   }
   
@@ -505,28 +516,17 @@ RunnableModule::forwardAStep()
         }
         if (!prevOut.defined()) {
           DIE("prevOut is not defined.");
-          // DP_LOG(DEBUG, "prevOut is not defined. Using empty tensor.");
-          // // prevOut = torch::empty(layer->emptyInSizes);
-          // prevOut = torch::empty(prevLayer->emptyOutSizes);
-          // prevOut = prevOut.to(device, /*non_blocking*/ true, /*copy*/ false);
-          // DP_LOG(DEBUG, "Empty input tensor: %s", prevOut.toString().c_str());
         }
         if (layer->detachInput) {
-          DP_LOG(DEBUG, "Detaching input");
+          // detachTimer.start();
           layer->detachedInputs[prevLayer->id] = prevOut.detach();
           layer->detachedInputs[prevLayer->id].requires_grad_();
           prevOut = layer->detachedInputs[prevLayer->id];
-          DP_LOG(DEBUG, "Detached input tensor: %s", prevOut.toString().c_str());
+          // detachTimer.stop();
+          DP_LOG(DEBUG, "Detached input tensor");
         }
         inputsByPid[prevLayer->id] = prevOut;
       }
-
-      // // Recv samples before running this layer.
-      // for (TsrXfer& xfer : layer->xferIns) {
-      //   inputsByPid[xfer.prevLayerId] =
-      //       TsrXferFunc::apply(inputsByPid[xfer.prevLayerId], &xfer);
-      //   DP_LOG(DEBUG, "Received & concatenated samples.");
-      // }
       
       for (auto& plidInputPair : inputsByPid) {
         DP_LOG(DEBUG, "Adding to inputVec: %s.", tsrSizeToStr(plidInputPair.second).c_str());
@@ -543,8 +543,53 @@ RunnableModule::forwardAStep()
     } else {
       std::vector<torch::jit::IValue> ivalVec;
       ivalVec.push_back(inputVec[0]);
-      output = layer->module.forward(ivalVec).toTensor();
-      // std::cout << "Layer ID " << layer->id << ", output shape - " << tsrSizeToStr(output).c_str() <<std::endl;
+
+      if (captureLayer) { // Used layer time profiling.
+        c10::cuda::device_synchronize();
+
+        at::cuda::CUDAStreamGuard stream_guard(rtctx->torch_stream);
+        layer->moduleFwGraph.capture_begin();
+
+        // c10::cuda::setCurrentCUDAStream(rtctx->torch_stream);
+        output = layer->module.forward(ivalVec).toTensor();
+
+        layer->moduleFwGraph.capture_end();
+        c10::cuda::device_synchronize();
+        CpuTimer timer("fwTimer");
+        timer.start();
+        int repeat = 200;
+        for (int i = 0; i < repeat; ++i) {
+          layer->moduleFwGraph.replay();
+        }
+        c10::cuda::device_synchronize();
+        timer.stop();
+        layer->avgLayerTime = static_cast<double>(timer.avgMicros())
+                              / 1000.0 / repeat;
+        layer->fwUsec = timer.avgMicros() / repeat;
+
+      }
+      else{
+        // c10::cuda::setCurrentCUDAStream(rtctx->torch_stream);
+        output = layer->module.forward(ivalVec).toTensor();
+      }
+
+      
+
+      // if (captureLayer) { // Used layer time profiling.
+      //   layer->moduleFwGraph.capture_end();
+      //   c10::cuda::device_synchronize();
+      //   CpuTimer timer("fwTimer");
+      //   timer.start();
+      //   int repeat = 200;
+      //   for (int i = 0; i < repeat; ++i) {
+      //     layer->moduleFwGraph.replay();
+      //   }
+      //   c10::cuda::device_synchronize();
+      //   timer.stop();
+      //   layer->avgLayerTime = static_cast<double>(timer.avgMicros())
+      //                         / 1000.0 / repeat;
+      //   layer->fwUsec = timer.avgMicros() / repeat;
+      // }
       DP_LOG(DEBUG, "module.forward called.");
     }
 
@@ -559,7 +604,7 @@ RunnableModule::forwardAStep()
     }
 
     // Send samples after running this layer.
-    DP_LOG(DEBUG, "len(layer->xferOuts): %d", static_cast<int>(layer->xferOuts.size()));
+    DP_LOG(DEBUG, "len(layer->xferOuts): %lu", layer->xferOuts.size());
     layer->outputsAfterXfer.clear();
     if (rtctx->profile && rtctx->profile_comms && layer->xferOuts.size() > 0) {
         layer->commTimer->record();
@@ -577,17 +622,10 @@ RunnableModule::forwardAStep()
     // auto h = layer->output.register_hook([layer](torch::Tensor grad){
     //   DP_LOG(DEBUG, "lid:%d grad: %s", layer->id, tsrToStr(grad).c_str());
     // });
-
-    // fpCtx.fpTensorToReturn = output;
-    // fpCtx.runCriterionAndLoss = true;
-    // DP_LOG(DEBUG, "return values are set.");
-
+    idleCtxPtr->processLayerTime(layer->fwUsec, true);
   } else { // This rank doesn't participate for this layer.
     DP_LOG(DEBUG, "Layer %d is not active.", layer->id);
-    // output = torch::empty(0);
-    // output.to(device, /*non_blocking*/ true, /*copy*/ false);
-    // fpCtx.runCriterionAndLoss = false;
-    // fpCtx.fpTensorToReturn.reset();
+    idleCtxPtr->processLayerTime(layer->fwUsec, false);
   }
   if (rtctx->profile && rtctx->profile_comms && layer->xferIns.size() > 0 && layer->xferOuts.size() == 0) {
         layer->commTimer->record();
@@ -607,9 +645,9 @@ RunnableModule::forwardAStep()
     if (!localOut.defined()) {
       assert(!layer->active);
       DP_LOG(DEBUG, "localOut is not defined. Must be inactive? Using an empty tensor.");
-      localOut = torch::empty(layer->emptyOutSizes);
-      localOut = localOut.to(device, /*non_blocking*/ true, /*copy*/ false);
-      localOut.requires_grad_();
+      torch::TensorOptions topts(rtctx->c10dev);
+      topts = topts.requires_grad(true);
+      localOut = torch::empty(layer->emptyOutSizes, topts);
       DP_LOG(DEBUG, "Empty localOut tensor: %s", localOut.toString().c_str());
     }
     torch::Tensor remainingOutput = TsrXferFunc::apply(localOut, &xfer);
@@ -636,15 +674,13 @@ RunnableModule::forwardAStep()
   if (layerQ.empty()) {
     DP_LOG(DEBUG, "no more layers to process.");
     if (layer->output.defined()) {
-      fpOutput = layer->output; // TODO: clean up.
-      // runCriterionAndLoss = true;
+      fpOutput = layer->output;
     } else {
       fpOutput.reset();
-      // runCriterionAndLoss = false;
     }
-    return true;
+    return COMPLETED;
   }
-  return false;
+  return IN_PROGRESS;
 }
 
 /**
@@ -658,6 +694,12 @@ RunnableModule::loss()
     // DP_LOG(DEBUG, "fpLoss: %s", tsrToStr(fpLoss).c_str());
     fpLoss.backward();
     DP_LOG(DEBUG, "fpLoss.backward() done. ");
+    // idleCtxPtr->processLayerTime(1000, true);
+  } else {
+    if (idleCtxPtr->jobType == IdleTimeCtx::FG) { // Don't deduct time for BG.
+      idleCtxPtr->processLayerTime(3000, false);  // For WRN.
+      // idleCtxPtr->processLayerTime(2000, false);  // For VGG16.
+    }
   }
 }
 
@@ -666,8 +708,8 @@ RunnableModule::loss()
  * 
  * \return Returns true if backward pass is completed.
  */
-bool
-RunnableModule::backwardAStep()
+JobStatus
+RunnableModule::backwardAStep(bool captureLayer)
 {
   Layer* layer = layerQ.front();
   layerQ.pop_front();
@@ -676,14 +718,14 @@ RunnableModule::backwardAStep()
   // or probably finished.
   if (layer->status == LayerStatus::PENDING_FP) {
     DP_LOG(DEBUG, "%d-th layer is processed again.", layer->id);
-    return false;
+    return IN_PROGRESS;
   }
   DP_LOG(DEBUG, "lid:%d.", layer->id);
   for (auto& nextLayer : layer->nextLayers) {
     if (nextLayer->status == LayerStatus::PENDING_BP) {
       DP_LOG(DEBUG, "Layer %d is skipped for now, must do %d first.",
           layer->id, nextLayer->id);
-      return false;
+      return IN_PROGRESS;
     }
   }
 
@@ -716,13 +758,18 @@ RunnableModule::backwardAStep()
             grad = nextLayerPtr->detachedInputs[layer->id].grad();
           } else {
             DP_LOG(DEBUG, "nextLayerPtr->detachInput is not defined. Using empty tensor.");
-            grad = torch::empty(layer->emptyOutSizes);
-            grad = grad.to(device, /*non_blocking*/ true, /*copy*/ false);
+            torch::TensorOptions topts(rtctx->c10dev);
+            grad = torch::empty(layer->emptyOutSizes, topts);
           }
           DP_LOG(DEBUG, "nextLayerPtr(%d)->detachedInputs[%d]: %s, grad: %s",
               nextLayerPtr->id, layer->id,
               nextLayerPtr->detachedInputs[layer->id].toString().c_str(),
               tsrSizeToStr(grad).c_str());
+          
+          if (captureLayer) { // Used layer time profiling.
+            c10::cuda::device_synchronize();
+            layer->moduleBwGraph.capture_begin();
+          }
           
           if (layer->outputsAfterXfer.count(nextLayerPtr->id)) {
             DP_LOG(DEBUG, "Backward on outputsAfterXfer:%s gradIn:%s", 
@@ -737,6 +784,24 @@ RunnableModule::backwardAStep()
             DP_LOG(DEBUG, "Backward is not called since inactive layer & "
                 "no xferIn for layer %d", nextLayerPtr->id);
           }
+
+          if (captureLayer) { // Used layer time profiling.
+            layer->moduleBwGraph.capture_end();
+            c10::cuda::device_synchronize();
+
+            CpuTimer timer("bwTimer");
+            timer.start();
+            int repeat = 200;
+            for (int i = 0; i < repeat; ++i) {
+              layer->moduleBwGraph.replay();
+            }
+            c10::cuda::device_synchronize();
+            timer.stop();
+            layer->avgLayerTime += static_cast<double>(timer.avgMicros())
+                                    / 1000.0 / repeat;
+            layer->bwUsec = timer.avgMicros() / repeat;
+          }
+
         } else {
           DP_LOG(DEBUG, "  nextLayerPtr(%d)->detachInput is false!", nextLayerPtr->id);
         }
@@ -748,14 +813,44 @@ RunnableModule::backwardAStep()
       }
     }
     DP_LOG(DEBUG, "Layer %d is active.", layer->id);
+    idleCtxPtr->processLayerTime(layer->bwUsec, true);
   } else { // This rank doesn't participate for this layer.
     DP_LOG(DEBUG, "Layer %d is not active.", layer->id);
+    idleCtxPtr->processLayerTime(layer->bwUsec, false);
   }
   
   if (rtctx->profile) {
     layer->bpTimer->record();
   }
   layer->status = LayerStatus::PENDING_FP;
+
+  if (layer->syncTwice && layer->active) {
+    for (const auto& param : layer->module.parameters()) {
+      auto grad = param.mutable_grad();
+      bytes_inflight += grad.nbytes();
+      pending_grads.push_back(grad);
+      backwards_did_sync = true;
+    }
+
+    if (rtctx->sync_bucket_size > 0 && bytes_inflight >= rtctx->sync_bucket_size) {
+      commHandler->comm_start(rtctx->grad_sync_stream);
+      for (auto &p : pending_grads)
+        commHandler->all_reduce(p, c10d::ReduceOp::SUM, true);
+      commHandler->comm_end();
+      bytes_inflight = 0;
+      pending_grads.clear();
+
+      // if (param.mutable_grad().numel() > ReduceBucket::elemLimit) {
+      //   commHandler->all_reduce(param.mutable_grad(), c10d::ReduceOp::SUM, true);
+      // } else {
+      //   if (reduceBuckets.back().holdGrad(param.mutable_grad())) {
+      //     commHandler->all_reduce(reduceBuckets.back().buffer, c10d::ReduceOp::SUM, true);
+      //     reduceBuckets.emplace_back();
+      //   }
+      // }
+    }
+
+  }
   
   for (auto& prevLayerPtr : layer->prevLayers) {
     if (prevLayerPtr->status == LayerStatus::PENDING_BP) {
@@ -768,9 +863,60 @@ RunnableModule::backwardAStep()
   // Forward pass is completed.
   if (layerQ.empty()) {
     DP_LOG(DEBUG, "no more layers to process.");
-    return true;
+    return COMPLETED;
   }
-  return false;
+  return IN_PROGRESS;
+}
+
+void
+RunnableModule::gradientSync() {
+  if (bytes_inflight) {
+      commHandler->comm_start(rtctx->grad_sync_stream);
+      for (auto &p : pending_grads)
+        commHandler->all_reduce(p, c10d::ReduceOp::SUM, true);
+      commHandler->comm_end();
+      bytes_inflight = 0;
+      pending_grads.clear();
+  }
+  if (backwards_did_sync) {
+    commHandler->sync(rtctx->grad_sync_stream);
+    backwards_did_sync = false;
+  }
+
+  // if (reduceBuckets.back().grads.size() > 0) {
+  //   reduceBuckets.back().wrapUp();
+  //   commHandler->all_reduce(reduceBuckets.back().buffer, c10d::ReduceOp::SUM, true);
+  // }
+  // commHandler->sync();
+  // for (ReduceBucket& bucket : reduceBuckets) {
+  //   bucket.splitAndUpdateGrads();
+  // }
+
+  // DP_LOG(DEBUG, "reduceBuckets.size(): %d", reduceBuckets.size());
+
+  // // First sync within a host & with fast networking.
+  // for (auto& layer : layers) {
+  //   if (layer.syncTwice) {
+  //     for (const auto& param : layer.module.parameters()) {
+  //       commHandler->all_reduce(param.mutable_grad(), c10d::ReduceOp::SUM, false);
+  //     }
+  //   }
+  // }
+  
+  // // Second sync to outside of box. Let's mimic that overhead by performing
+  // // intra-host sync again. (200Gbps * 8 GPUs = 1.6Tbps ~ NVSwitch bandwidth.)
+  // // Assuming each GPU has ConnectX-6, and a box has 8 GPUs.
+  // int64_t totalGradSize = 0;
+  // for (auto& layer : layers) {
+  //   for (const auto& param : layer.module.parameters()) {
+  //     totalGradSize += param.numel(); 
+  //   }
+  // }
+  // torch::TensorOptions topts(rtctx->c10dev);
+  // torch::Tensor grad = torch::empty({1, totalGradSize}, topts);
+  // // DP_LOG(NOTICE, "2nd tensor xfer: %s", tsrSizeToStr(grad).c_str());
+  // commHandler->all_reduce(grad, c10d::ReduceOp::SUM, false);
+  // // Need another internal sync? Included in the 1st sync?
 }
 
 /**
@@ -800,6 +946,21 @@ RunnableModule::resetProfileTimers() {
       // layer.commTimer->saveAndReset();
     }
   }
+}
+
+void
+RunnableModule::printLayerInGraphTimes() {
+  if (!rtctx->profile) {
+    return;
+  }
+
+  double sum = 0;
+  for (auto& layer : layers) {
+    printf(" %110s  %6.3f  %8" PRId64 "  %8" PRId64 "\n", layer.moduleName.c_str(),
+        layer.avgLayerTime, layer.fwUsec, layer.bwUsec);
+    sum += layer.avgLayerTime;
+  }
+  printf("%100s  %.3f\n", "SUM(avg)", sum);
 }
 
 /**

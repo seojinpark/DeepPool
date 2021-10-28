@@ -25,6 +25,7 @@
 
 #include "runtime.h"
 #include "utils.h"
+#include "tracer.h"
 
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAGraph.h>
@@ -41,6 +42,7 @@ class CommunicationHandler;
 class CudaTimer;
 class CudaSelfTimer;
 struct Layer;
+struct IdleTimeCtx;
 
 typedef int Tag;
 typedef int Rank;
@@ -103,11 +105,15 @@ enum class SpecialModuleTypes {
  */
 struct Layer {
   Layer(torch::jit::Module module, SpecialModuleTypes specialModule, int id, bool active,
-      bool detachInput, bool detachOutput, std::vector<Layer*>& prevLayerVec)
+      bool detachInput, bool detachOutput, std::vector<Layer*>& prevLayerVec, bool syncTwice)
     : module(module)
+    , moduleFwGraph()
+    , moduleBwGraph()
+    , avgLayerTime(0)
     , specialModule(specialModule)
     , id(id)
     , active(active)
+    , syncTwice(syncTwice)
     , detachInput(detachInput)
     , detachOutput(detachOutput)
     , prevLayers()
@@ -126,11 +132,18 @@ struct Layer {
   }
   
   torch::jit::Module module;
+  at::cuda::CUDAGraph moduleFwGraph; // Used only for layer-wise profiling.
+  at::cuda::CUDAGraph moduleBwGraph; // Used only for layer-wise profiling.
+  double avgLayerTime;
+  int64_t fwUsec {0};
+  int64_t bwUsec {0};
   const SpecialModuleTypes specialModule; // 0: not special, use module. 1: concat.
   const int id;
   const bool active; // Inactive means no samples assigned for this runtime.
+  const bool syncTwice; // Perform gradient all-reduce within a host. (all layers do all-reduce over NIC)
   const bool detachInput; // Detach input before running this layer.
   const bool detachOutput; // Detach output when output is used multiple times.
+  bool yieldOnFp;
   std::vector<Layer*> prevLayers;
   std::vector<Layer*> nextLayers;
   torch::Tensor output;  // Used during forward pass.
@@ -155,37 +168,103 @@ public:
   TensorGeneratorPipeline(std::function<torch::Tensor()> gen) {
     for (size_t i = 0; i < 64; i++) cached_.push_back(gen());
 
+    CUDACHECK(cudaEventCreateWithFlags(&hToD_ev_, cudaEventDisableTiming));
+    CUDACHECK(cudaEventCreateWithFlags(&dToD_ev_, cudaEventDisableTiming));
+
     next_t_ = cached_[iter_idx_++ % 64];
     auto origstream = c10::cuda::getCurrentCUDAStream();
     c10::cuda::setCurrentCUDAStream(rtctx->xfer_stream);
     next_t_ = next_t_.to(rtctx->c10dev, /*non_blocking*/ true, /*copy*/ false);
-    CUDACHECK(cudaEventCreateWithFlags(&next_t_ev_, cudaEventDisableTiming));
-    CUDACHECK(cudaEventRecord(next_t_ev_, rtctx->xfer_stream));
+    CUDACHECK(cudaEventRecord(hToD_ev_, rtctx->xfer_stream));
     c10::cuda::setCurrentCUDAStream(origstream);
+
+    tensorbytes = next_t_.nbytes();
+    tensor_buf = c10::cuda::CUDACachingAllocator::raw_alloc(tensorbytes);
+    assert(!tensorbytes || tensor_buf);
   }
 
   torch::Tensor GetNext() {
-    /* make sure current stream waits for last one to be ready */
-    auto origstream = c10::cuda::getCurrentCUDAStream();
-    CUDACHECK(cudaStreamWaitEvent(origstream.stream(), next_t_ev_));
-    auto out = next_t_;
+    return next_t_;
 
-    /* generate next */
+    if (!tensorbytes)
+      return cached_[iter_idx_++ % 64].to(rtctx->c10dev, true, false);
+
+    /* send last transmitted tensor into final buf */
+    auto origstream = c10::cuda::getCurrentCUDAStream();
+    CUDACHECK(cudaStreamWaitEvent(origstream, hToD_ev_));
+    CUDACHECK(cudaMemcpyAsync(tensor_buf, next_t_.data_ptr(), next_t_.nbytes(),
+                              cudaMemcpyDeviceToDevice, origstream));
+    CUDACHECK(cudaEventRecord(dToD_ev_, origstream));
+
+    auto tensor_out =
+        torch::from_blob(tensor_buf, next_t_.sizes(), next_t_.options());
+
+    /* wait for DtoD to finish before starting next HtoD transfer */
+    CUDACHECK(cudaStreamWaitEvent(rtctx->xfer_stream, dToD_ev_));
+
+    /* run next HtoD transfer */
     next_t_ = cached_[iter_idx_++ % 64];
     c10::cuda::setCurrentCUDAStream(rtctx->xfer_stream);
     next_t_ = next_t_.to(rtctx->c10dev, /*non_blocking*/ true, /*copy*/ false);
-    CUDACHECK(cudaEventRecord(next_t_ev_, rtctx->xfer_stream.stream()));
+    CUDACHECK(cudaEventRecord(hToD_ev_, rtctx->xfer_stream));
     c10::cuda::setCurrentCUDAStream(origstream);
-    return next_t_;
+
+    return tensor_out;
   }
 
 private:
+  size_t tensorbytes;
+  void* tensor_buf;
   torch::Tensor next_t_;
-  cudaEvent_t next_t_ev_{nullptr};
+  cudaEvent_t hToD_ev_{nullptr};
+  cudaEvent_t dToD_ev_{nullptr};
   std::vector<torch::Tensor> cached_;
   uint64_t iter_idx_{0};
 };
 
+enum JobStatus {
+  IN_PROGRESS = 0,
+  COMPLETED,
+  YIELD
+};
+
+// class ReduceBucket {
+//  public:
+//   ReduceBucket() {}
+//   bool holdGrad (torch::Tensor& grad) {
+//     elems += grad.numel();
+//     grads.push_back(&grad);
+//     flattened.push_back(grad.flatten());
+//     sizes.push_back(grad.numel());
+
+//     if (elems > ReduceBucket::elemLimit) {
+//       wrapUp();
+//       return true; // Perform all reduce.
+//     }
+//     return false;
+//   }
+
+//   void wrapUp() {
+//     buffer = torch::cat(flattened);
+//   }
+
+//   void splitAndUpdateGrads() {
+//     if (!buffer.defined())
+//       return;
+//     std::vector<torch::Tensor> splittedTsrs = buffer.split_with_sizes(sizes);
+//     for (size_t i = 0; i < grads.size(); ++i) {
+//       *grads[i] = splittedTsrs[i].reshape_as(*grads[i]);
+//     }
+//   }
+
+//   torch::Tensor buffer; // Flattened & concated.
+//   static const int64_t elemLimit = 2500000; // 10 MB bucket size.
+
+//   std::vector<torch::Tensor*> grads;
+//   std::vector<torch::Tensor> flattened;
+//   std::vector<int64_t> sizes;
+//   int64_t elems {0};
+// };
 
 /**
  * A module that holds parameters (or submodules) and
@@ -198,14 +277,18 @@ class RunnableModule : public torch::nn::Module {
       CommunicationHandler* commHandler, c10::Device device);
 
   void getParameters(std::vector<torch::Tensor>* parameters);
+  void getActiveParameters(std::vector<torch::Tensor>* parameters);
   void iterInit();
-  bool forwardAStep();
-  // bool forwardAStepOld();
-  bool backwardAStep();
+  void resetForNewIter();
+  JobStatus forwardAStep(bool captureLayer);
+  JobStatus backwardAStep(bool captureLayer);
   void loss();
+  void gradientSync();
   void initProfileTimers(CudaTimer* ct_load, CudaTimer* ct_loss);
   void resetProfileTimers();
   void printProfileTimers(int warmupIters, FILE* pFile=NULL, LayerTimingStage printStage=LayerTimingStage::ALL);
+  // void printProfileTimers(int warmupIters);
+  void printLayerInGraphTimes();
 
   ////////////////////////////////////////////
   // Internal data structure.
@@ -232,7 +315,15 @@ class RunnableModule : public torch::nn::Module {
 
   TensorGeneratorPipeline input_pipeline, target_pipeline;
 
+  bool backwards_did_sync{false};
+
   at::cuda::CUDAGraph graph;
+  // Performance Stat
+  CpuTimer detachTimer;
+
+  // std::vector<ReduceBucket> reduceBuckets;
+  IdleTimeCtx* idleCtxPtr;
+  bool hasInactiveLayer {false};
 };
 
 #endif

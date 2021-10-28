@@ -351,11 +351,11 @@ def testRunOnCPU():
         thread.join()
 
 
-def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66E5, spatialSplit=False, simResultFilename=None):
+def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66E5, spatialSplit=False, simResultFilename=None, use_be=False):
     profiler = GpuProfiler("cuda")
     profiler.loadProfile()
     global cs
-    cs = CostSim(profiler, netBw=netBw, verbose=False, gpuProfileLoc="vggLayerGpuProfileA100.txt")
+    cs = CostSim(profiler, netBw=netBw, verbose=False, gpuProfileLoc="profile/A100_vgg.prof")
     model = vgg16(pretrained=False)
     
     saveWholeModel = True
@@ -373,7 +373,7 @@ def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fal
     # job = cs.searchBestSplits(4, 16, dataParallelBaseline=True)
     # job = cs.searchBestSplits(4, 16)
     # job = cs.searchBestSplits(gpuCount, globalBatch, dataParallelBaseline=True)
-    # job, iterMs, gpuMs = cs.searchBestSplits(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
+    job, iterMs, gpuMs = cs.searchBestSplits(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
     job, iterMs, gpuMs, maxGpusUsed = cs.searchBestSplitsV3(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
     print("Searching for parallelization strategy is completed.\n")
 
@@ -403,7 +403,8 @@ def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fal
     if not spatialSplit:
         cc = ClusterClient()
         jobName = "vgg16_%d_%d_%2.1f%s" % (gpuCount, globalBatch, amplificationLimit, "_DP" if dataParallelBaseline else "")
-        cc.submitTrainingJob(jobName, jobInJson)
+        jobName += "_BE" if use_be else ""
+        cc.submitTrainingJob(jobName, jobInJson, use_be)
 
     if simResultFilename != None:
         f = open(simResultFilename, "a")
@@ -540,6 +541,9 @@ def runStrongScalingBench(modelName='vgg16'):
         model = vgg11(pretrained=False)
     elif modelName == 'vgg16':
         model = vgg16(pretrained=False)
+
+    pytorch_total_params = sum(p.numel() for p in model.parameters())
+    print("Number of parameters: ", pytorch_total_params)
     
     print("Model: ", modelName)
     print("BatchSize  iterMs    fpMs    bpMs")
@@ -553,8 +557,12 @@ if __name__ == "__main__":
     print(len(sys.argv))
     if len(sys.argv) == 3:
         main(int(sys.argv[1]), int(sys.argv[2]), dataParallelBaseline=True)
-    elif len(sys.argv) == 4:
-        main(int(sys.argv[1]), int(sys.argv[2]), amplificationLimit=float(sys.argv[3]))
+    elif len(sys.argv) >= 4:
+        use_be = len(sys.argv) > 4 and int(sys.argv[4]) == 1
+        if sys.argv[3] == "DP":
+            main(int(sys.argv[1]), int(sys.argv[2]), dataParallelBaseline=True, use_be=use_be)
+        else:
+            main(int(sys.argv[1]), int(sys.argv[2]), amplificationLimit=float(sys.argv[3]), use_be=use_be)
     elif len(sys.argv) == 2:
         print("Run all configs")
         runAllConfigs("vgg16", sys.argv[1])
