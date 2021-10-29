@@ -23,6 +23,7 @@
 #include "Cycles.h"
 
 #define ENABLE_TIMERS 0
+#define ENABLE_TIMERS2 1
 
 class CpuTimer {
  public:
@@ -84,6 +85,9 @@ class CudaTimer {
     }
     recorded = false;
   }
+
+  void reset() {recorded = false;};
+
   size_t count() { return counter; }
   float getAvg(size_t skipIterCount = 0) {
 #if ENABLE_TIMERS
@@ -136,6 +140,7 @@ class CudaTimer {
   bool recorded{false};
   size_t counter{0};
   std::vector<float> elapsedTimes;
+  cudaStream_t stream;
 };
 
 
@@ -143,7 +148,7 @@ class CudaSelfTimer {
  public:
   CudaSelfTimer(size_t reservedEntries = 2500)
   {
-#if ENABLE_TIMERS
+#if ENABLE_TIMERS2
     elapsedTimes.reserve(reservedEntries);
     CUDACHECK(cudaEventCreateWithFlags(&evt, cudaEventBlockingSync));
     CUDACHECK(cudaEventCreateWithFlags(&fevt, cudaEventBlockingSync));
@@ -151,7 +156,7 @@ class CudaSelfTimer {
   }
 
   void record() {
-#if ENABLE_TIMERS
+#if ENABLE_TIMERS2
     CUDACHECK(cudaEventRecord(fevt, rtctx->torch_stream));
     
 #endif
@@ -162,7 +167,7 @@ class CudaSelfTimer {
   // other CudaTimer measuring time from this timer invokes.
   void saveAndReset() {
     if (recorded) {
-#if ENABLE_TIMERS
+#if ENABLE_TIMERS2
       CUDACHECK(cudaEventRecord(evt, rtctx->torch_stream));
       CUDACHECK(cudaEventSynchronize(evt));
       // assert(fromTimer->recorded);
@@ -174,9 +179,34 @@ class CudaSelfTimer {
     }
     recorded = false;
   };
+
+  void saveAndAdd() {
+    if (recorded) {
+#if ENABLE_TIMERS2
+      CUDACHECK(cudaEventRecord(evt, rtctx->torch_stream));
+      CUDACHECK(cudaEventSynchronize(evt));
+      // assert(fromTimer->recorded);
+      float ms;
+      CUDACHECK(cudaEventElapsedTime(&ms, fevt, evt));
+      
+      if (elapsedTimes.size() > 0){
+        // ms += elapsedTimes.back();
+        // elapsedTimes.pop_back();
+        elapsedTimes[elapsedTimes.size()-1] += ms;
+      }
+      else
+        elapsedTimes.push_back(ms);
+#endif
+      counter++;
+    }
+    recorded = false;
+  };
+
+  void reset() {recorded = false;};
+
   size_t count() { return counter; };
   float getAvg(size_t skipIterCount = 0) {
-#if ENABLE_TIMERS
+#if ENABLE_TIMERS2
     if (skipIterCount >= elapsedTimes.size()) {
       skipIterCount = 0;
     }
@@ -194,7 +224,7 @@ class CudaSelfTimer {
   }
 
   float getPercentile(float percentile, size_t skipIterCount) {
-#if ENABLE_TIMERS
+#if ENABLE_TIMERS2
     if (skipIterCount >= elapsedTimes.size()) {
       skipIterCount = 0;
     }

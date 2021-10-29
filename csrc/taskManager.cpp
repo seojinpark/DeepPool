@@ -99,7 +99,7 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn, std::string name
   , timers()
 {
   if (rtctx->use_fg_graph) {
-    iters_before_graph_capture = 50;
+    iters_before_graph_capture = 3000;
   } else {
     iters_before_graph_capture = 5000;
   }
@@ -537,6 +537,8 @@ TaskManager::printJobStatistics(JobContext* job)
 int
 TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
 {
+
+  at::cuda::CUDAStreamGuard stream_guard(rtctx->torch_stream);
   if (job->state == JobState::INIT) {
 
     if (be_bsize > 0 && job->totiters == 0) {
@@ -563,18 +565,21 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
       job->epoch++;
     }
     
-    if (job->epoch >= job->epochsToTrain || 
-        (rtctx->profile && job->totiters == job->iters_before_graph_capture)) {
+    if (job->epoch >= job->epochsToTrain ){
+        // (rtctx->profile && job->totiters == job->iters_before_graph_capture)) {
       *jobCompleted = true;
       return 0;
     }
 
+    // if (!job->model->isGraphCapturing)
     job->model->resetProfileTimers();
     for (int tpIdx = CT_NUM_OF_EVENTS - 1; tpIdx >= CT_START; --tpIdx) {
       DP_LOG(DEBUG, "timer.saveAndReset() for %d. recorded:%d", tpIdx, job->timers[tpIdx].isRecorded());
-      job->timers[tpIdx].saveAndReset();
+      if (!job->model->isGraphCapturing)
+        job->timers[tpIdx].saveAndReset();
     }
-    job->timers[CT_START].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_START].record();
     DP_LOG(DEBUG, "JobState::INIT.");
 
     job->model->iterInit();
@@ -584,6 +589,7 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
       if (job->run_with_be && be_bsize > 0) be_controller.Pause();
       c10::cuda::device_synchronize();
       DP_LOG(NOTICE, "Starting capture.");
+      job->model->isGraphCapturing = true;
       job->model->graph.capture_begin();
       job->commHandler->precapture();
     } else if (job->totiters >= rtctx->iters_per_capture + job->iters_before_graph_capture) {
@@ -593,9 +599,10 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     }
 
     job->optimizer->zero_grad();
-    job->timers[CT_ZERO].record();
-
-    job->timers[CT_LOAD].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_ZERO].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_LOAD].record();
     job->state = JobState::FORWARD;
     DP_LOG(DEBUG, "Foward pass is starting soon.");
   } else if (job->state == JobState::FORWARD) {
@@ -620,12 +627,14 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     JobStatus status = job->model->forwardAStep(capture);
 
     if (status == COMPLETED) {
-      job->timers[CT_FP].record();
+      if (!job->model->isGraphCapturing)
+        job->timers[CT_FP].record();
       // TODO: add a loss calculation here? or as another state?
       DP_LOG(DEBUG, "Foward pass is completed. Calculating loss.");
       
       // job->model->loss();
-      job->timers[CT_LOSS].record();
+      if (!job->model->isGraphCapturing)
+        job->timers[CT_LOSS].record();
       assert(job->model->layerQ.empty());
       // job->model->layerQ.push_back(&job->model->layers.back());
       // DP_LOG(DEBUG, "Moving to backward pass.");
@@ -643,7 +652,8 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     // TODO: get idle time for backward separately.
     
     // if (status == COMPLETED) {
-    job->timers[CT_BP].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_BP].record();
     job->state = JobState::SYNC;
     DP_LOG(DEBUG, "Backward pass is completed. Moving to gradient all-reduce.");
     // }
@@ -652,12 +662,14 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     DP_LOG(DEBUG, "JobState::SYNC.");
     // DP_LOG(DEBUG, "All-reduce parameter sync is not implemented yet.");
     job->model->gradientSync();
-    job->timers[CT_SYNC].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_SYNC].record();
     job->state = JobState::STEP;
   } else if (job->state == JobState::STEP) {
     DP_LOG(DEBUG, "JobState::STEP");
     job->optimizer->step();
-    job->timers[CT_OPT].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_OPT].record();
     job->state = JobState::FINISH;
   } else if (job->state == JobState::FINISH) {
     DP_LOG(DEBUG, "JobState::FINISH");
@@ -668,6 +680,7 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     if (job->totiters == rtctx->iters_per_capture - 1 + job->iters_before_graph_capture) {
       job->commHandler->postcapture();
       job->model->graph.capture_end();
+      job->model->isGraphCapturing = false;
       if (job->run_with_be && be_bsize > 0) be_controller.Resume();
       DP_LOG(NOTICE, "Ending capture.");
     }
@@ -676,7 +689,8 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     fgcounter++;
 
     job->state = JobState::INIT;
-    job->timers[CT_STOP].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_STOP].record();
     return 1;
   }
   return 0;

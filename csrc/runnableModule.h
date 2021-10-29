@@ -158,6 +158,7 @@ struct Layer {
   std::unique_ptr<CudaTimer> fpTimer, bpTimer; // Used during profile mode only.
   std::unique_ptr<CudaSelfTimer> commTimer; // Used during profile mode only.
   std::string moduleName; // Used to output profiled runtimes.
+  int64_t layerIters {0};
 };
 
 
@@ -318,6 +319,7 @@ class RunnableModule : public torch::nn::Module {
   bool backwards_did_sync{false};
 
   at::cuda::CUDAGraph graph;
+  bool isGraphCapturing {false};
   // Performance Stat
   CpuTimer detachTimer;
 

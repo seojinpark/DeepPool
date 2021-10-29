@@ -191,7 +191,7 @@ CommunicationHandlerNCCL::CommunicationHandlerNCCL(RuntimeContext* rtctx,
   , _mutex()
   , receivedData()
   , clientPool()
-  , default_comm_stream(c10::cuda::getStreamFromPool(true))
+  , default_comm_stream(c10::cuda::getStreamFromPool(true, rtctx->device))
 {
   DP_LOG(DEBUG, "Constructing CommunicationHandlerNCCL for %s", taskName.c_str());
   rtctx->commHandlerMap[taskName] = this;
@@ -206,7 +206,7 @@ CommunicationHandlerNCCL::~CommunicationHandlerNCCL()
 
 void
 CommunicationHandlerNCCL::sync(c10::optional<c10::cuda::CUDAStream> stream) {
-  sync_event.record(stream ? stream.value() : default_comm_stream);
+  sync_event.record(stream.has_value() ? stream.value() : default_comm_stream);
   sync_event.block(rtctx->torch_stream);
 }
 

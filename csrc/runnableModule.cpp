@@ -481,6 +481,7 @@ RunnableModule::forwardAStep(bool captureLayer)
   DP_LOG(DEBUG, "layerQ size: %d", (int)layerQ.size());
   Layer* layer = layerQ.front();
   layerQ.pop_front();
+  layer->layerIters++;
 
   // TODO: potentially we can make track if the cuda kernel is finished
   // or probably finished.
@@ -941,8 +942,14 @@ void
 RunnableModule::resetProfileTimers() {
   if (rtctx->profile) {
     for (auto& layer : layers) {
-      layer.fpTimer->saveAndReset();
-      layer.bpTimer->saveAndReset();
+      if (!isGraphCapturing){
+        layer.fpTimer->saveAndReset();
+        layer.bpTimer->saveAndReset();
+      }
+      else{
+        layer.fpTimer->reset();
+        layer.bpTimer->reset();
+      }
       // layer.commTimer->saveAndReset();
     }
   }
