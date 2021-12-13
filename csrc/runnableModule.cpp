@@ -22,6 +22,7 @@
 #include "utils.h"
 #include "communication.h"
 #include "tracer.h"
+#include <string>
 
 using torch::autograd::Variable;
 using torch::autograd::AutogradContext;
@@ -202,6 +203,7 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
   , initialBatchSize(layersInJson[0]["config"][0])
   , commHandler(commHandler)
   , device(device)
+  , lossfn((LossFunctions)spec["lossfn"].get<int>())
   // , leavesForBackward()
   // , fpCtx(layersInJson)
   , layers()
@@ -241,7 +243,12 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
     }
 
     module.to(device);
-    module.train();
+    // if (name != "input") {
+      // module.detach();
+    // }
+    // else{
+    //   module.train();
+    // }
     DP_LOG(DEBUG, " layer's module is moved to device and set for train mode.");
 
     int layerLocalBatch = ldsc["config"][0].get<int>();
@@ -410,11 +417,12 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
   std::vector<int64_t> inputSizes;
   inputSizes.push_back(initialBatchSize);
   for (int size : layersInJson[0]["inputDim"]) inputSizes.push_back(size);
-  auto inputFn = [=] { return torch::randn(inputSizes); };
+  auto inputsOpts = torch::TensorOptions().dtype(torch::kInt32);
+  auto inputFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, inputsOpts).detach(); };
   input_pipeline = TensorGeneratorPipeline(inputFn);
   int targetCount = layersInJson.back()["config"][0];
-  auto targetOpts = torch::TensorOptions().dtype(torch::kInt64);
-  auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1000, {targetCount}, targetOpts); };
+  auto targetOpts = torch::TensorOptions().dtype(torch::kInt32);
+  auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, targetOpts); };
   target_pipeline = TensorGeneratorPipeline(targetFn);
 }
 
@@ -521,7 +529,9 @@ RunnableModule::forwardAStep(bool captureLayer)
         if (layer->detachInput) {
           // detachTimer.start();
           layer->detachedInputs[prevLayer->id] = prevOut.detach();
-          layer->detachedInputs[prevLayer->id].requires_grad_();
+          if (prevLayer->moduleName.find("input") == std::string::npos) {
+            layer->detachedInputs[prevLayer->id].requires_grad_();
+          }
           prevOut = layer->detachedInputs[prevLayer->id];
           // detachTimer.stop();
           DP_LOG(DEBUG, "Detached input tensor");
@@ -530,6 +540,7 @@ RunnableModule::forwardAStep(bool captureLayer)
       }
       
       for (auto& plidInputPair : inputsByPid) {
+        // std::cout << "Adding to inputVec: " << tsrSizeToStr(plidInputPair.second).c_str() << std::endl;
         DP_LOG(DEBUG, "Adding to inputVec: %s.", tsrSizeToStr(plidInputPair.second).c_str());
         inputVec.push_back(plidInputPair.second);
       }
@@ -544,6 +555,9 @@ RunnableModule::forwardAStep(bool captureLayer)
     } else {
       std::vector<torch::jit::IValue> ivalVec;
       ivalVec.push_back(inputVec[0]);
+      // std::cout << layer->moduleName << std::endl;
+      if (layer->moduleName.find("add{") != std::string::npos) 
+        ivalVec.push_back(inputVec[1]);
 
       if (captureLayer) { // Used layer time profiling.
         c10::cuda::device_synchronize();
@@ -595,13 +609,17 @@ RunnableModule::forwardAStep(bool captureLayer)
     }
 
     if (rtctx->profile) {
+      // std::cout << "profile fpTimer->record()" << std::endl;
       layer->fpTimer->record();
     }
 
     if (layer->detachOutput) {
+      // std::cout << layer->moduleName.c_str() << std::endl;
       layer->outputBeforeDetach = output;
       output = output.detach();
-      output.requires_grad_();
+      if (layer->moduleName.find("input") == std::string::npos) {
+        output.requires_grad_();
+      }
     }
 
     // Send samples after running this layer.
@@ -690,9 +708,19 @@ RunnableModule::forwardAStep(bool captureLayer)
 void
 RunnableModule::loss()
 {
-  if (fpOutput.defined()) {    
-    fpLoss = torch::nll_loss(fpOutput, fpTargets);
-    // DP_LOG(DEBUG, "fpLoss: %s", tsrToStr(fpLoss).c_str());
+  if (fpOutput.defined()) { 
+    at::Tensor fpLoss;
+    if(lossfn == LossFunctions::CrossEntropyLoss){
+      auto batch_size = globalBatchSize;
+      auto shift_logits = fpOutput.index({torch::indexing::Ellipsis, torch::indexing::Slice(torch::indexing::None, -1), torch::indexing::Slice()}).contiguous();
+      auto shift_labels = fpTargets.index({torch::indexing::Ellipsis, torch::indexing::Slice(1,torch::indexing::None)}).contiguous();
+      auto loss_fct = torch::nn::CrossEntropyLoss();
+      fpLoss = loss_fct(shift_logits.view({-1, shift_logits.size(-1)}), shift_labels.view({-1}).to(torch::kLong));
+    }
+    else{
+      fpLoss = torch::nll_loss(fpOutput, fpTargets);
+      // DP_LOG(DEBUG, "fpLoss: %s", tsrToStr(fpLoss).c_str());
+    }
     fpLoss.backward();
     DP_LOG(DEBUG, "fpLoss.backward() done. ");
     // idleCtxPtr->processLayerTime(1000, true);
@@ -718,6 +746,10 @@ RunnableModule::backwardAStep(bool captureLayer)
   // TODO: potentially we can make track if the cuda kernel is finished
   // or probably finished.
   if (layer->status == LayerStatus::PENDING_FP) {
+    if (layerQ.empty()) {
+      DP_LOG(DEBUG, "no more layers to process.");
+      return COMPLETED;
+    }
     DP_LOG(DEBUG, "%d-th layer is processed again.", layer->id);
     return IN_PROGRESS;
   }
@@ -777,7 +809,7 @@ RunnableModule::backwardAStep(bool captureLayer)
                 tsrSizeToStr(layer->outputsAfterXfer[nextLayerPtr->id]).c_str(),
                 tsrSizeToStr(grad).c_str());
             layer->outputsAfterXfer[nextLayerPtr->id].backward(grad, retainGraph);
-          } else if (layer->active) {
+          } else if (layer->active && layer->moduleName.find("input") == std::string::npos) {
             DP_LOG(DEBUG, "Backward on output:%s gradIn:%s", 
                 tsrSizeToStr(layer->output).c_str(), tsrSizeToStr(grad).c_str());
             layer->output.backward(grad, retainGraph);
@@ -808,7 +840,7 @@ RunnableModule::backwardAStep(bool captureLayer)
         }
       }
 
-      if (layer->active && layer->detachOutput) {
+      if (layer->active && layer->detachOutput && layer->moduleName.find("input") == std::string::npos) {
         DP_LOG(DEBUG, "  output was detached previously. Invoking backward on outputBeforeDetach.");
         layer->outputBeforeDetach.backward(layer->output.grad());
       }
@@ -1087,6 +1119,10 @@ RunnableModule::printProfileTimers(int warmupIters, FILE* pFile, LayerTimingStag
   std::unordered_map<const char*, float> p90TimesFP = getName2LayerTime(90, LayerTimingStage::FP);
   std::unordered_map<const char*, float> p99TimesFP = getName2LayerTime(99, LayerTimingStage::FP);
   
+  std::unordered_map<const char*, float> p50TimesBP = getName2LayerTime(50, LayerTimingStage::BP);
+  std::unordered_map<const char*, float> p90TimesBP = getName2LayerTime(90, LayerTimingStage::BP);
+  std::unordered_map<const char*, float> p99TimesBP = getName2LayerTime(99, LayerTimingStage::BP);
+  
   std::unordered_map<const char*, float> p50TimesCOMM = getName2LayerTime(50, LayerTimingStage::COMMS);
   std::unordered_map<const char*, float> p90TimesCOMM = getName2LayerTime(90, LayerTimingStage::COMMS);
   std::unordered_map<const char*, float> p99TimesCOMM = getName2LayerTime(99, LayerTimingStage::COMMS);
@@ -1111,7 +1147,7 @@ RunnableModule::printProfileTimers(int warmupIters, FILE* pFile, LayerTimingStag
   if (pFile != NULL){
     float sum = 0;
     if (!rtctx->profile_comms && printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::FP){
-      fprintf (pFile, "%100s LAYER avg(ms)    p50     p90     p99\n", "#config");
+      fprintf (pFile, "%100s LAYER FP  avg(ms)    p50     p90     p99\n", "#config");
       for (auto& timeName : fpTimes) {
         const char* name = timeName.second;
         float avgT = nameToTimeFP[name];
@@ -1126,6 +1162,22 @@ RunnableModule::printProfileTimers(int warmupIters, FILE* pFile, LayerTimingStag
     else if(printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::FP)
       fprintf (pFile, "Must skip layer timings when measuing comms\n");
 
+    sum = 0;
+    if (!rtctx->profile_comms && printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::BP){
+      fprintf (pFile, "%100s LAYER BP  avg(ms)    p50     p90     p99\n", "#config");
+      for (auto& timeName : bpTimes) {
+        const char* name = timeName.second;
+        float avgT = nameToTimeBP[name];
+        sum += avgT;
+        fprintf(pFile, "%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50TimesBP[name],
+              p90TimesBP[name], p99TimesBP[name]);
+      }
+      fprintf(pFile, "%100s  %.3f\n", "SUM(avg)", sum);
+      fprintf(pFile, "\n\n\n\n");
+      // fclose (pFile);
+    }
+    else if(printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::BP)
+      fprintf (pFile, "Must skip layer timings when measuing comms\n");
 
     if (printStage == LayerTimingStage::COMMS){
       fprintf (pFile, "%100s COMMS avg(ms)    p50     p90     p99\n", "#config");

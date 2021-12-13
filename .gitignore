@@ -150,4 +150,6 @@ data_collection/*
 csrc/CMakeFiles/*
 csrc/_deps/*
 runtime_pb2*
-
+transformers/*
+*.png
+*.csv

@@ -54,6 +54,11 @@ enum class LayerTimingStage {
   ALL
 };
 
+enum class LossFunctions {
+  NLLLoss = 0, 
+  CrossEntropyLoss
+};
+
 struct TsrXfer {
   TsrXfer(CommunicationHandler* comm) : commHandler(comm), type(None),
       splitSizes(), splitCatDim(0), xferTagAndRank(), xferTagAndRankBack() 
@@ -303,6 +308,7 @@ class RunnableModule : public torch::nn::Module {
   CommunicationHandler* commHandler;
   c10::Device device;
   std::vector<Layer> layers; // Topologically sorted list of layers.
+  LossFunctions lossfn;
 
   ////////////////////////////////////////////
   // Context for tracking particial progress.

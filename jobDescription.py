@@ -67,7 +67,7 @@ class Layer:
             if exists(saveLocation): # Skip if module file is already there.
                 prop["moduleSavedLocation"] = saveLocation
             else:
-                if self.name == "concat":
+                if self.name == "concat" or self.name == "add":
                     fakeInputs = []
                     for prevLayer in self.prevLayers:
                         inputSize = [1] + list(prevLayer.outputDim)
@@ -77,7 +77,10 @@ class Layer:
                 else:
                     inputSize = [1] + (list(self.inputDim) if type(self.inputDim) == tuple else [self.inputDim])
                     # print("id: ", self.id, " non-concat inputSize: ", inputSize)
-                    fakeInput = torch.zeros(tuple(inputSize))
+                    if 'embedding' in self.name or 'wte' in self.name or 'wpe' in self.name:
+                        fakeInput = torch.zeros(tuple(inputSize), dtype=torch.int32)
+                    else:
+                        fakeInput = torch.zeros(tuple(inputSize), dtype=torch.float32)
                     if self.must_trace:
                         print("jit tracing...", self.name)
                         traced = torch.jit.trace(self.module, fakeInput)
@@ -100,11 +103,12 @@ class Layer:
 
 
 class TrainingJob:
-    def __init__(self, name: str, layers: List[Layer], layerConfigs: List[tuple], globalBatchSize: int, maxGpusUsed: int, datasetDir: str):
+    def __init__(self, name: str, layers: List[Layer], layerConfigs: List[tuple], globalBatchSize: int, lossfn: int, maxGpusUsed: int, datasetDir: str):
         self.name = name
         self.layers = layers
         self.layerConfigs = layerConfigs
         self.globalBatchSize = globalBatchSize
+        self.lossfn = lossfn
         self.maxGpusUsed = maxGpusUsed
         self.datasetDir = datasetDir
         self.bytesPerParam = 4
@@ -114,6 +118,7 @@ class TrainingJob:
     def loadJSON(self, jobInJson: str):
         job = json.loads(jobInJson)
         self.globalBatchSize = job["globalBatchSize"]
+        self.lossfn = job["lossfn"]
         self.maxGpusUsed = job["maxGpusUsed"]
         self.layers = []
         self.layerConfigs = []
@@ -156,7 +161,7 @@ class TrainingJob:
             prop = l.dumpForJSON()
             prop["config"] = config
             allProps.append(prop)
-        fullDesc = {"globalBatchSize": self.globalBatchSize, "maxGpusUsed": self.maxGpusUsed, "layers": allProps}
+        fullDesc = {"globalBatchSize": self.globalBatchSize, "lossfn": self.lossfn, "maxGpusUsed": self.maxGpusUsed, "layers": allProps}
         # return json.dumps(fullDesc, indent=1, sort_keys=False)
         return json.dumps(fullDesc, sort_keys=False)
 
@@ -288,6 +293,7 @@ class TrainingJob:
         fullDesc = {"rank": targetRank,
                     "maxGpusUsed": self.maxGpusUsed,
                     "globalBatchSize": self.globalBatchSize,
+                    "lossfn": self.lossfn,
                     "dataLoaderOffset": dataLoaderOffset,
                     "layers": allProps}
         # dumpedStr = json.dumps(fullDesc, indent=1, sort_keys=False)
@@ -463,6 +469,7 @@ class TrainingJob:
         fullDesc = {"rank": targetRank,
                     "maxGpusUsed": maxGpusUsed,
                     "globalBatchSize": self.globalBatchSize,
+                    "lossfn": self.lossfn,
                     "dataLoaderOffset": dataLoaderOffset,
                     "layers": allProps}
         # dumpedStr = json.dumps(fullDesc, indent=1, sort_keys=False)
@@ -481,7 +488,10 @@ class TrainingJob:
         elif layer.name in ["flatten", "maxPool2d", "avgPool2d", "adAvgPool2d", "ReLU2d", "concat"]:
             initCfg = (globalBatch, layer.inputDim[1], layer.inputDim[2], layer.inputDim[0]) # (batch, width, height, channel, filter)
         else:
-            initCfg = (globalBatch, *layer.inputDim) # (batch, width, height, channel)
+            if isinstance(layer.inputDim, int):
+                initCfg = (globalBatch, layer.inputDim)
+            else:
+                initCfg = (globalBatch, *layer.inputDim) # (batch, width, height, channel)
         return initCfg
 
     def calcGpusNeeded(self, layer: Layer, config: tuple, globalBatch: int):

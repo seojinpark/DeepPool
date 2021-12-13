@@ -94,7 +94,7 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn, std::string name
   , device(device)
   , epoch(0)
   , iter(0)
-  , itersToTrain(1900) // = len(dataLoader) if dataLoader != None else None #TODO: this is a temporary hack..
+  , itersToTrain(2000) // = len(dataLoader) if dataLoader != None else None #TODO: this is a temporary hack..
   , state(JobState::INIT)
   , timers()
 {
@@ -460,8 +460,8 @@ TaskManager::printJobStatistics(JobContext* job)
   job->model->printLayerInGraphTimes();
 
   if (!rtctx->profile_comms){
-    FILE * pFile = fopen(format("/DeepPool/%s_rank_%d_FP_timings.txt", job->name.c_str(), rtctx->rank).c_str(),"w");
-    job->model->printProfileTimers(warmupIters, pFile, LayerTimingStage::FP);
+    FILE * pFile = fopen(format("/DeepPool/%s_rank_%d_ALL_timings.txt", job->name.c_str(), rtctx->rank).c_str(),"w");
+    job->model->printProfileTimers(warmupIters, pFile, LayerTimingStage::ALL);
     size_t totiters = job->totiters - warmupIters;
     using msec = std::chrono::duration<double, std::milli>;
     double elapsed_ms = std::chrono::duration_cast<msec>(job->end - job->start).count();
@@ -632,12 +632,12 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
       // TODO: add a loss calculation here? or as another state?
       DP_LOG(DEBUG, "Foward pass is completed. Calculating loss.");
       
-      // job->model->loss();
+      job->model->loss();
       if (!job->model->isGraphCapturing)
         job->timers[CT_LOSS].record();
       assert(job->model->layerQ.empty());
-      // job->model->layerQ.push_back(&job->model->layers.back());
-      // DP_LOG(DEBUG, "Moving to backward pass.");
+      job->model->layerQ.push_back(&job->model->layers.back());
+      DP_LOG(DEBUG, "Moving to backward pass.");
       job->state = JobState::BACKWARD;
     }
   } else if (job->state == JobState::BACKWARD) {
@@ -645,18 +645,18 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     
     bool capture = rtctx->profile && job->totiters == job->iters_before_graph_capture - 5;
 
-    for (auto & l : job->model->layers) {
-      l.status = LayerStatus::PENDING_FP;
-    }
-    // JobStatus status = job->model->backwardAStep(capture);
+    // for (auto & l : job->model->layers) {
+    //   l.status = LayerStatus::PENDING_FP;
+    // }
+    JobStatus status = job->model->backwardAStep(capture);
     // TODO: get idle time for backward separately.
     
-    // if (status == COMPLETED) {
-    if (!job->model->isGraphCapturing)
-      job->timers[CT_BP].record();
-    job->state = JobState::SYNC;
-    DP_LOG(DEBUG, "Backward pass is completed. Moving to gradient all-reduce.");
-    // }
+    if (status == COMPLETED) {
+      if (!job->model->isGraphCapturing)
+        job->timers[CT_BP].record();
+      job->state = JobState::SYNC;
+      DP_LOG(DEBUG, "Backward pass is completed. Moving to gradient all-reduce.");
+    }
 
   } else if (job->state == JobState::SYNC) {
     DP_LOG(DEBUG, "JobState::SYNC.");

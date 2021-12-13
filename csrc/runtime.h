@@ -46,7 +46,7 @@ namespace torch {
 struct RuntimeContext_params {
   RuntimeContext_params() : coordinatorAddr(0), myAddr(0), device(0), c10dBackend(0),
       c10dMasterPort(0), rank(), worldSize(), logdir(), be_batch_size(0),
-      profile(true), profile_comms(true), debug(false), verify(false)
+      profile(true), profile_comms(false), debug(false), verify(false)
       {
       }
 

@@ -177,8 +177,8 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         self.myAddr = addrToBind
         self.myPort = portToBind
         self.locations = locations
+        self.worldSize = 8
         self.workDir = workDir
-        self.worldSize = 4
         self.processes = []  # from subprocess calls used for launching runtime.
         self.nextTagStartOffset = 1
         self.be_batch_size = be_batch_size
@@ -205,7 +205,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         return 'Returned from poke at %s' % self.myAddr
 
     def export_scheduleTraining(self, jobName: str, trainingJobInJSON: str, runbe):
-        job = TrainingJob("test", None, None, 0, 0, "")
+        job = TrainingJob("test", None, None, 0, 0, 0, "")
         job.loadJSON(trainingJobInJSON)
         print("received job")
         
@@ -236,7 +236,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         for thread in threadList:
             thread.join()
 
-        self.ongoingJobs[jobName] = {"iterTime": 0, "gpuMsec": 0, "gpusUsed": gpusUsed, "gpusFinished": 0, "globalBatchSize": job.globalBatchSize}
+        self.ongoingJobs[jobName] = {"iterTime": 0, "gpuMsec": 0, "gpusUsed": gpusUsed, "gpusFinished": 0, "globalBatchSize": job.globalBatchSize, "lossfn": job.lossfn}
         self.ongoingJobs[jobName].update({"beImagesPerIter": 0.0, "idleMsPerIter": 0.0})
 
         # for rank in range(gpusUsed):
