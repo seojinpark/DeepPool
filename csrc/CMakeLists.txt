@@ -68,6 +68,7 @@ target_link_libraries(dp_grpc_proto
   ${_GRPC_GRPCPP}
   ${_PROTOBUF_LIBPROTOBUF})
 
+  # Linking info for runtime.
 add_executable(runtime
   "runtime.cpp" "runnableModule.cpp" "taskManager.cpp" "logger.cpp" 
   "communication.cpp" "rpcService.cpp"

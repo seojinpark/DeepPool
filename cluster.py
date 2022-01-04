@@ -59,13 +59,6 @@ class CppRuntimeProxy:
         # print("received: " + response.message)
         print("initCommBackend() not implemented")
 
-    # def initCommNCCL(self, message, msgType, groupId, groupsDict):
-    #     groupSize = len(groupsDict["world"])
-    #     response = self.stub.InitCommNCCL(runtime_pb2.InitCommNCCLMsg(
-    #         message=message, msg_type=msgType, group_id=groupId, group_size=groupSize))
-    #     print("received: " + response.message)
-    #     return response.group_id;
-
     def initCommNCCL(self, message, msgType, groupId, groupsDict):
         groupSize = len(groupsDict["world"])
         response = self.stub.InitCommNCCL(runtime_pb2.InitCommNCCLMsg(
@@ -153,7 +146,7 @@ class Location:
     
     def rshAsync(self, command, **kwargs):
         print("Sending cmd: /DeepPool/csrc/build/runtime %s" % command)
-        if self.localhost:
+        if self.sshKeyPath is None:
             sh_command = ['/DeepPool/csrc/build/runtime']+('%s' % command).split(' ')
         else:
             sh_command = ['ssh', '-i', self.sshKeyPath, '%s@%s' % (self.userId, self.address),
