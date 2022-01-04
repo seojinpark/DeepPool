@@ -145,6 +145,7 @@ data_collection/*
 *.data
 *.txt
 *.json
+.vscode/*
 *.pdf
 *.gv
 csrc/CMakeFiles/*
@@ -152,3 +153,6 @@ csrc/_deps/*
 runtime_pb2*
 *.png
 *.csv
+*.tfevents.*
+*.ipynb
+*.patch
