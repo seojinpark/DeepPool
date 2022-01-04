@@ -68,14 +68,6 @@ target_link_libraries(dp_grpc_proto
   ${_GRPC_GRPCPP}
   ${_PROTOBUF_LIBPROTOBUF})
 
-# Linking info for runtime.
-# add_executable(test_runtime
-#   "test.cpp")
-
-# target_link_libraries(test_runtime
-#   ${_PROTOBUF_LIBPROTOBUF}
-#   ${TORCH_LIBRARIES})
-include_directories("/DeepPool/csrc")
 add_executable(runtime
   "runtime.cpp" "runnableModule.cpp" "taskManager.cpp" "logger.cpp" 
   "communication.cpp" "rpcService.cpp"

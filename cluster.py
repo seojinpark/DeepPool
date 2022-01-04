@@ -28,6 +28,7 @@ from jobDescription import TrainingJob
 import grpc
 import runtime_pb2
 import runtime_pb2_grpc
+import os
 
 # import examples.vgg as vgg  # TODO: this is used for debugging. Remove this later.
 
@@ -152,10 +153,11 @@ class Location:
     
     def rshAsync(self, command, **kwargs):
         print("Sending cmd: /DeepPool/csrc/build/runtime %s" % command)
-        # sh_command = ['ssh', '-i', self.sshKeyPath, '%s@%s' % (self.userId, self.address),
-        #             '%s' % command]
-        
-        sh_command = ['/DeepPool/csrc/build/runtime']+('%s' % command).split(' ')
+        if self.localhost:
+            sh_command = ['/DeepPool/csrc/build/runtime']+('%s' % command).split(' ')
+        else:
+            sh_command = ['ssh', '-i', self.sshKeyPath, '%s@%s' % (self.userId, self.address),
+                        '%s' % command]
         print(sh_command)
         p = subprocess.Popen(sh_command, **kwargs)
         return p
@@ -172,12 +174,13 @@ class Location:
 class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
     """ GPU cluster coordinator. It accepts training jobs from clients and schedule them to runtimes. """
 
-    def __init__(self, addrToBind: str, portToBind: int, locations: List[Location], workDir: str, be_batch_size: int):
+    def __init__(self, addrToBind: str, portToBind: int, locations: List[Location], workDir: str, be_batch_size: int, localhost:bool):
         super(ClusterCoordinator, self).__init__((addrToBind, portToBind))
         self.myAddr = addrToBind
         self.myPort = portToBind
         self.locations = locations
         self.worldSize = 8
+        self.localhost = localhost
         self.workDir = workDir
         self.processes = []  # from subprocess calls used for launching runtime.
         self.nextTagStartOffset = 1
@@ -332,8 +335,6 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
             elif cppRuntime:
                 self.processes.append(location.rshAsync(
                     # "LD_LIBRARY_PATH=/home/friedj/cuda/lib64:/home/friedj/nfsnccl/lib  CUDA_VISIBLE_DEVICES=" + str(location.device) + " " + self.workDir + "csrc/build/runtime" + \
-                    # "CUDA_VISIBLE_DEVICES=" + str(location.device) + " " + self.workDir + "csrc/build/runtime" + \
-                    # "CUDA_VISIBLE_DEVICES=" + str(location.device) + " " + \
                     " --coordinatorAddr %s:%d --myAddr %s:%d --device %d --c10dBackend %s --rank %d --worldSize %d --logdir %s --be_batch_size %d --min_layer_sync %d %s %s" % \
                         (self.myAddr, self.myPort, location.address, location.port, location.device, c10dBackend, i, len(self.locations), logdir, self.be_batch_size, len(self.locations), "--profile" if profile else "", " ".join(extra_args)) #+ \
                     , stdout=stdoutFp, stderr=stderrFp))
@@ -473,6 +474,10 @@ def parse_args():
                         help="To launch CPP version runtimes.")
     parser.add_argument('--manualLaunch', default=False, action='store_true',
                         help="Do not runtimes automatically. Primarily for using gdb on runtime processes.")
+    parser.add_argument("--localhost", type=str, default=True,
+                        help="Run cluster on local host only")
+    parser.add_argument("--logdir", type=str, default=os.getcwd(),
+                        help="Run cluster on local host only")
     # For installing nsys.. (with other cuda toolkit..)
     # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/cuda-ubuntu1804.pin
     # sudo mv cuda-ubuntu1804.pin /etc/apt/preferences.d/cuda-repository-pin-600
@@ -496,14 +501,17 @@ def main():
         for deviceConfig in serverConfig["deviceList"]:
             rankToIpMap[str(len(locations))] = serverConfig["addr"] + ":" + str(deviceConfig["port"])
             commGrpRanksWorld.append(len(locations))
-            locations.append(Location(serverConfig["addr"], deviceConfig["port"], deviceConfig["device"], serverConfig["userId"], None, args.cpp))
+            if args.localhost:
+                locations.append(Location(serverConfig["addr"], deviceConfig["port"], deviceConfig["device"], serverConfig["userId"], None, args.cpp))
+            else:
+                locations.append(Location(serverConfig["addr"], deviceConfig["port"], deviceConfig["device"], serverConfig["userId"], None, args.cpp))
     addrToBindCombo = re.split('[-:]', args.addrToBind)
     addrToBind = addrToBindCombo[0]
     portToBind = int(addrToBindCombo[1])
     commGrpRanksDict["world"] = commGrpRanksWorld
     print(commGrpRanksDict)
 
-    coordinator = ClusterCoordinator(addrToBind, portToBind, locations, clusterConfig["workDir"], args.be_batch_size)
+    coordinator = ClusterCoordinator(addrToBind, portToBind, locations, clusterConfig["workDir"], args.be_batch_size, args.localhost)
     if args.install:
         coordinator.installPackages()
     
