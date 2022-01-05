@@ -22,7 +22,7 @@
 #include "runtime.h"
 #include "Cycles.h"
 
-#define ENABLE_TIMERS 1
+#define ENABLE_TIMERS 0
 #define ENABLE_TIMERS2 1
 
 class CpuTimer {

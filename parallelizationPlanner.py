@@ -1092,7 +1092,7 @@ class CostSim:
             (branch, idx, config, endTime) = schedule[i]
             print("%sLayer(%d, %2d) config: %15s done at %d" % (" "*55*branch, branch, idx, config, endTime))
             
-    def searchBestSplits(self, totalGpus: int, globalBatch: int = 16, amplificationLimit: float = 2.0, dataParallelBaseline = False, spatialSplit=False):
+    def searchBestSplits(self, totalGpus: int, globalBatch: int = 16, amplificationLimit: float = 2.0, dataParallelBaseline = False, spatialSplit=False, lossfn=0):
         t = [[] for i in range(len(self.layers))] # [layer] = list of (config, cumulativeTime, prevConfigIndex)
 
         initialConfigs = []
@@ -1312,7 +1312,7 @@ class CostSim:
                     gpuUsecSum
                     ))
         # print ()
-        moduleDesc = self.generateModuleDescription([t[i][bestConfigChain[i]][0] for i in range(len(bestConfigChain))], globalBatch)
+        moduleDesc = self.generateModuleDescription([t[i][bestConfigChain[i]][0] for i in range(len(bestConfigChain))], globalBatch, lossfn)
         return (moduleDesc, finalTime / 1000., gpuUsecSum / 1000.)
 
     def searchBestSplitsV2(self, totalGpus: int, globalBatch: int = 16, useZhihaoAlgo = False):

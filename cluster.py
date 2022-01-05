@@ -172,7 +172,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         self.myAddr = addrToBind
         self.myPort = portToBind
         self.locations = locations
-        self.worldSize = 8
+        self.worldSize = len(locations)
         self.localhost = localhost
         self.workDir = workDir
         self.processes = []  # from subprocess calls used for launching runtime.
