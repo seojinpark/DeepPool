@@ -15,8 +15,6 @@
 #ifndef LOGGER_H
 #define LOGGER_H
 
-#define DEBUGGING
-
 #include <condition_variable>
 #include <thread>
 #include <memory>
@@ -60,7 +58,6 @@ class Logger {
    */
   bool isLogging(LogLevel level) {
       return (level <= LogLevel::NOTICE);
-    // return true;
   }
 
  private:

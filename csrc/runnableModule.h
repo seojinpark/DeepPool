@@ -61,19 +61,13 @@ enum class LossFunctions {
 
 struct TsrXfer {
   TsrXfer(CommunicationHandler* comm) : commHandler(comm), type(None),
-      splitSizes(), splitCatDim(0), xferTagAndRank(), xferTagAndRankBack() 
-    {
-      // CUDA_API_CALL(cudaEventCreateWithFlags(&start_time, cudaEventBlockingSync));
-      // CUDA_API_CALL(cudaEventCreateWithFlags(&end_time, cudaEventBlockingSync));
-    }
+      splitSizes(), splitCatDim(0), xferTagAndRank(), xferTagAndRankBack() {}
   
   CommunicationHandler* commHandler;
   enum Type {
     None, Send, Recv
   };
 
-  // float elapsed_milliseconds;
-  // cudaEvent_t start_time, end_time;
   Type type;
   std::vector<int64_t> splitSizes; // used only for send's forward or recv's backward.
   int splitCatDim;
@@ -293,7 +287,6 @@ class RunnableModule : public torch::nn::Module {
   void initProfileTimers(CudaTimer* ct_load, CudaTimer* ct_loss);
   void resetProfileTimers();
   void printProfileTimers(int warmupIters, FILE* pFile=NULL, LayerTimingStage printStage=LayerTimingStage::ALL);
-  // void printProfileTimers(int warmupIters);
   void printLayerInGraphTimes();
 
   ////////////////////////////////////////////

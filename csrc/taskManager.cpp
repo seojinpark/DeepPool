@@ -94,12 +94,12 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn, std::string name
   , device(device)
   , epoch(0)
   , iter(0)
-  , itersToTrain(2000) // = len(dataLoader) if dataLoader != None else None #TODO: this is a temporary hack..
+  , itersToTrain(1900) // = len(dataLoader) if dataLoader != None else None #TODO: this is a temporary hack..
   , state(JobState::INIT)
   , timers()
 {
   if (rtctx->use_fg_graph) {
-    iters_before_graph_capture = 3000;
+    iters_before_graph_capture = 50;
   } else {
     iters_before_graph_capture = 5000;
   }

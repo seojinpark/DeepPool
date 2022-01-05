@@ -417,13 +417,28 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
   std::vector<int64_t> inputSizes;
   inputSizes.push_back(initialBatchSize);
   for (int size : layersInJson[0]["inputDim"]) inputSizes.push_back(size);
-  auto inputsOpts = torch::TensorOptions().dtype(torch::kInt32);
-  auto inputFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, inputsOpts).detach(); };
-  input_pipeline = TensorGeneratorPipeline(inputFn);
-  int targetCount = layersInJson.back()["config"][0];
-  auto targetOpts = torch::TensorOptions().dtype(torch::kInt32);
-  auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, targetOpts); };
-  target_pipeline = TensorGeneratorPipeline(targetFn);
+  if (lossfn == LossFunctions::CrossEntropyLoss){
+    auto inputsOpts = torch::TensorOptions().dtype(torch::kInt32);
+    auto inputFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, inputsOpts).detach(); };
+    input_pipeline = TensorGeneratorPipeline(inputFn);
+  }
+  else{
+    auto inputFn = [=] { return torch::randn(inputSizes); };
+    input_pipeline = TensorGeneratorPipeline(inputFn);
+  }
+
+  if (lossfn == LossFunctions::CrossEntropyLoss){
+    int targetCount = layersInJson.back()["config"][0];
+    auto targetOpts = torch::TensorOptions().dtype(torch::kInt32);
+    auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, targetOpts); };
+    target_pipeline = TensorGeneratorPipeline(targetFn);
+  }
+  else{
+    int targetCount = layersInJson.back()["config"][0];
+    auto targetOpts = torch::TensorOptions().dtype(torch::kInt64);
+    auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1000, {targetCount}, targetOpts); };
+    target_pipeline = TensorGeneratorPipeline(targetFn);
+  }
 }
 
 /**
@@ -587,24 +602,6 @@ RunnableModule::forwardAStep(bool captureLayer)
         // c10::cuda::setCurrentCUDAStream(rtctx->torch_stream);
         output = layer->module.forward(ivalVec).toTensor();
       }
-
-      
-
-      // if (captureLayer) { // Used layer time profiling.
-      //   layer->moduleFwGraph.capture_end();
-      //   c10::cuda::device_synchronize();
-      //   CpuTimer timer("fwTimer");
-      //   timer.start();
-      //   int repeat = 200;
-      //   for (int i = 0; i < repeat; ++i) {
-      //     layer->moduleFwGraph.replay();
-      //   }
-      //   c10::cuda::device_synchronize();
-      //   timer.stop();
-      //   layer->avgLayerTime = static_cast<double>(timer.avgMicros())
-      //                         / 1000.0 / repeat;
-      //   layer->fwUsec = timer.avgMicros() / repeat;
-      // }
       DP_LOG(DEBUG, "module.forward called.");
     }
 
