@@ -14,11 +14,14 @@ if (($# == 2)); then
 elif (($# == 1)); then
     cmake -DCMAKE_BUILD_TYPE=$1 ..
 else
+    # cmake -DCMAKE_BUILD_TYPE=Release -DPYTHON_LIBRARY=/root/miniconda3/envs/pt-test/lib/python3.9 ..
     cmake -DCMAKE_BUILD_TYPE=Release ..
 fi
 
 # cmake -DCMAKE_BUILD_TYPE=Debug -O0 -DCMAKE_PREFIX_PATH=/libtorch ..
 # cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/libtorch ..
+
+# cmake Debug -DCMAKE_PREFIX_PATH=/libtorch ..
 
 make -j
 popd

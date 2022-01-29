@@ -21,8 +21,10 @@
 #include <deque>
 #include <torch/torch.h>
 #include <torch/script.h>
+#include <torch/types.h>
 #include "json.hpp"
 
+#include "streamingDataset.h"
 #include "runtime.h"
 #include "utils.h"
 #include "tracer.h"
@@ -307,6 +309,7 @@ class RunnableModule : public torch::nn::Module {
   // Context for tracking particial progress.
   ////////////////////////////////////////////
   std::deque<Layer*> layerQ;
+  batchData fpBatch;
   torch::Tensor fpInput;
   torch::Tensor fpTargets;
   torch::Tensor fpOutput;
@@ -314,6 +317,13 @@ class RunnableModule : public torch::nn::Module {
   // bool runCriterionAndLoss;
 
   TensorGeneratorPipeline input_pipeline, target_pipeline;
+  // batchData batch_input_pipeline, batch_target_pipeline;
+
+  StreamingDataset batch_dataset;
+  // std::unique_ptr<torch::data::StatefulDataLoader<
+  //     torch::data::datasets::SharedBatchDataset<StreamingDataset>
+  // >> batch_data_loader;
+  // torch::data::Iterator<batchData> batch_data_loader_iter;// = batch_data_loader->begin();
 
   bool backwards_did_sync{false};
 

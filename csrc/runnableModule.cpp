@@ -23,6 +23,11 @@
 #include "communication.h"
 #include "tracer.h"
 #include <string>
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <Python.h>
+#include "streamingDataset.h"
 
 using torch::autograd::Variable;
 using torch::autograd::AutogradContext;
@@ -213,11 +218,23 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
   , fpOutput()
   , fpLoss()
   , detachTimer("detachTimer")
+  , batch_dataset(StreamingDataset(rtctx->rank, rtctx->worldSize))
+  // , batch_data_loader(torch::data::make_data_loader(
+  //     batch_dataset,
+  //     torch::data::DataLoaderOptions().workers(2)
+  //   ))
+  // , batch_data_loader_iter(batch_data_loader->begin())
 {
   DP_LOG(DEBUG, "Constructing runnable module.. rank:%d", rank);
   DP_LOG(DEBUG, "             initialBatchSize:%d", initialBatchSize);
   DP_LOG(DEBUG, "             layersInJson's size:%lu (from spec)", spec["layers"].size());
   DP_LOG(DEBUG, "             layersInJson's size:%lu", layersInJson.size());
+
+  // batch_data_loader = torch::data::make_data_loader(
+  //     torch::data::datasets::make_shared_dataset<StreamingDataset>(rank, rtctx->worldSize),
+  //     torch::data::DataLoaderOptions().workers(1)
+  // );
+  // batch_data_loader_iter = batch_data_loader->begin();
   
   // It's important to reserve the same, so that layers won't get copied over
   // to another address.. (layer's are pointing each other with raw pointer.)
@@ -417,10 +434,11 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
   std::vector<int64_t> inputSizes;
   inputSizes.push_back(initialBatchSize);
   for (int size : layersInJson[0]["inputDim"]) inputSizes.push_back(size);
+
   if (lossfn == LossFunctions::CrossEntropyLoss){
-    auto inputsOpts = torch::TensorOptions().dtype(torch::kInt32);
-    auto inputFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, inputsOpts).detach(); };
-    input_pipeline = TensorGeneratorPipeline(inputFn);
+    // auto inputsOpts = torch::TensorOptions().dtype(torch::kInt32);
+    // auto inputFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, inputsOpts).detach(); };
+    // input_pipeline = TensorGeneratorPipeline(inputFn);
   }
   else{
     auto inputFn = [=] { return torch::randn(inputSizes); };
@@ -428,10 +446,10 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
   }
 
   if (lossfn == LossFunctions::CrossEntropyLoss){
-    int targetCount = layersInJson.back()["config"][0];
-    auto targetOpts = torch::TensorOptions().dtype(torch::kInt32);
-    auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, targetOpts); };
-    target_pipeline = TensorGeneratorPipeline(targetFn);
+    // int targetCount = layersInJson.back()["config"][0];
+    // auto targetOpts = torch::TensorOptions().dtype(torch::kInt32);
+    // auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, targetOpts); };
+    // target_pipeline = TensorGeneratorPipeline(targetFn);
   }
   else{
     int targetCount = layersInJson.back()["config"][0];
@@ -477,8 +495,23 @@ RunnableModule::iterInit()
 {
   layerQ.clear();
   layerQ.push_back(&layers[0]);
-  fpInput = input_pipeline.GetNext();
-  fpTargets = target_pipeline.GetNext();
+
+  auto t1 = std::chrono::high_resolution_clock::now();
+  // fpBatch = std::move(*batch_data_loader_iter);
+  // fpBatch.images = fpBatch.images.to(torch::device({torch::kCUDA, this->device.index()}));//torch::device(torch::kCUDA));
+  // batch_data_loader_iter = std::next(batch_data_loader_iter);
+  torch::optional<batchData> b = batch_dataset.read_batch();
+  fpBatch = b.value();
+  // fpBatch.images = fpBatch.images.to(torch::device({torch::kCUDA, this->device.index()}));
+  // memcpy(&fpBatch, b.value(), sizeof(batchData));
+  auto t2 = std::chrono::high_resolution_clock::now();
+  if(fpBatch.index % 50 == 0){
+      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
+      std::cout << fpBatch.index << " iterInit "  << " : " << duration.count() << " microseconds/batch" << std::endl;
+  }
+  // batch_data_loader = batch_data_loader.operator++();
+  // fpInput = input_pipeline.GetNext();
+  // fpTargets = target_pipeline.GetNext();
   fpOutput.reset();
   fpLoss.reset();
   // reduceBuckets.clear();
@@ -527,8 +560,10 @@ RunnableModule::forwardAStep(bool captureLayer)
 
     std::vector<torch::Tensor> inputVec;
     if (layer->prevLayers.size() == 0) {
-      DP_LOG(DEBUG, "Adding to inputVec: %s.", tsrSizeToStr(fpInput).c_str());
-      inputVec.push_back(fpInput);
+      // DP_LOG(DEBUG, "Adding to inputVec: %s.", tsrSizeToStr(fpInput).c_str());
+      // printf("Adding to inputVec: %s.\n", tsrSizeToStr(fpBatch.images).c_str());
+      inputVec.push_back(fpBatch.images);
+      // inputVec.push_back(fpInput);
     } else if (layer->prevLayers.size() >= 1) {
       std::map<int, torch::Tensor> inputsByPid;
       for (auto& prevLayer : layer->prevLayers) {
@@ -570,7 +605,7 @@ RunnableModule::forwardAStep(bool captureLayer)
     } else {
       std::vector<torch::jit::IValue> ivalVec;
       ivalVec.push_back(inputVec[0]);
-      // std::cout << layer->moduleName << std::endl;
+      // std::cout << layer->moduleName << " input size: " << tsrSizeToStr(inputVec[0]).c_str() << std::endl;
       if (layer->moduleName.find("add{") != std::string::npos) 
         ivalVec.push_back(inputVec[1]);
 
@@ -604,6 +639,8 @@ RunnableModule::forwardAStep(bool captureLayer)
       }
       DP_LOG(DEBUG, "module.forward called.");
     }
+
+    // std::cout << layer->moduleName << " output size: " << tsrSizeToStr(output).c_str() << std::endl;
 
     if (rtctx->profile) {
       // std::cout << "profile fpTimer->record()" << std::endl;
@@ -708,11 +745,37 @@ RunnableModule::loss()
   if (fpOutput.defined()) { 
     at::Tensor fpLoss;
     if(lossfn == LossFunctions::CrossEntropyLoss){
-      auto batch_size = globalBatchSize;
-      auto shift_logits = fpOutput.index({torch::indexing::Ellipsis, torch::indexing::Slice(torch::indexing::None, -1), torch::indexing::Slice()}).contiguous();
-      auto shift_labels = fpTargets.index({torch::indexing::Ellipsis, torch::indexing::Slice(1,torch::indexing::None)}).contiguous();
+      // auto batch_size = globalBatchSize;
+      // auto shift_logits = fpOutput.index({torch::indexing::Ellipsis, torch::indexing::Slice(torch::indexing::None, -1), torch::indexing::Slice()}).contiguous();
+      // auto shift_labels = fpTargets.index({torch::indexing::Ellipsis, torch::indexing::Slice(1,torch::indexing::None)}).contiguous();
+      // auto loss_fct = torch::nn::CrossEntropyLoss();
+      // fpLoss = loss_fct(shift_logits.view({-1, shift_logits.size(-1)}), shift_labels.view({-1}).to(torch::kLong));
+
+      // std::cout << "fpBatch.weights " << tsrSizeToStr(fpBatch.weights).c_str() << std::endl;
+      // std::cout << "fpBatch.labels " << tsrSizeToStr(fpBatch.labels).c_str() << std::endl;
+      // std::cout << "fpBatch.weights " << fpBatch.weights.requires_grad() << std::endl;
+      // std::cout << "fpBatch.labels " << fpBatch.labels.requires_grad() << std::endl;
+      // std::cout << "fpBatch.weights " << fpBatch.weights.options() << std::endl;
+      // loss_fct->weight = fpBatch.weights;
+      // fpOutput = fpOutput*fpBatch.weights;
+      // std::cout << "fpOutput " << tsrSizeToStr(fpOutput).c_str() << std::endl;
+      // std::cout << "fpOutput " << fpOutput.requires_grad() << std::endl;
+      // std::cout << "fpLoss " << fpLoss.requires_grad() << std::endl;
+      // std::cout << "fpLoss " << tsrSizeToStr(fpLoss).c_str() << std::endl;
+      // fpLoss.retain_grad();
+      // std::cout << "fpLoss " << fpLoss.requires_grad() << std::endl;
+      // fpLoss = at::_cast_Long(fpLoss);
+      // std::cout << "fpLoss " << fpLoss.requires_grad() << std::endl;
+      // std::cout << "fpLoss " << tsrSizeToStr(fpLoss).c_str() << std::endl;
+
       auto loss_fct = torch::nn::CrossEntropyLoss();
-      fpLoss = loss_fct(shift_logits.view({-1, shift_logits.size(-1)}), shift_labels.view({-1}).to(torch::kLong));
+      // fpBatch.weights = fpBatch.weights.to(torch::device({torch::kCUDA, this->device.index()})).set_requires_grad(true);
+      // fpBatch.labels = fpBatch.labels.to(torch::device({torch::kCUDA, this->device.index()}));
+
+      fpLoss = loss_fct(fpOutput, fpBatch.labels);
+      
+      fpLoss = fpLoss*fpBatch.weights;
+      fpLoss = fpLoss.sum();
     }
     else{
       fpLoss = torch::nll_loss(fpOutput, fpTargets);

@@ -461,6 +461,44 @@ class CostSim:
 
         return module
 
+    # num_features, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True, device=None, dtype=None
+    def BatchNorm2d(self, num_features: int, eps: float = 1e-05, momentum: float = 0.1,
+            affine: bool = False, track_running_stats: bool = True,
+            custom_previous_layers: list = None):
+        module = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum, affine=affine, 
+                    track_running_stats=track_running_stats)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "batchNorm2d",
+                            {"num_features": num_features, "eps": eps, "momentum": momentum},
+                            prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+
+        return module
+
+    # torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=1, padding=0, output_padding=0, groups=1, 
+    # bias=True, dilation=1, padding_mode='zeros', device=None, dtype=None)
+    def ConvTranspose2d(self, in_channels: int, out_channels: int, kernel_size: int,
+            stride: int = 1, padding: int = 0, output_padding: int = 0, groups: int = 1,
+            bias: bool = True, dilation: int = 1, padding_mode='zeros',
+            custom_previous_layers: list = None):
+        print(bias, stride, padding, dilation, groups)
+        # print(self.bias, self.stride, 1, self.dilation, self.groups))
+        module = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride,
+                    padding=padding, output_padding=output_padding, groups=groups, bias=bias,
+                    dilation=dilation, padding_mode=padding_mode)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "convTranspose2d",
+                            {"in_channels": in_channels, "out_channels": out_channels, "kernel_size": kernel_size,
+                             "stride": stride, "bias": bias},
+                            prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+
+        return module
+
     def Linear(self, in_features: int, out_features: int, bias: bool = True, custom_previous_layers: list = None):
         module = nn.Linear(in_features, out_features, bias)
 

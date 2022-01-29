@@ -9,10 +9,9 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -std=c++14 -Wall -Wextra")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -std=c++17 -lstdc++fs -Wall -Wextra")
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
-
 
 # cloning gRPC at configure time.
 message(STATUS "Using gRPC via add_subdirectory (FetchContent).")
@@ -54,6 +53,22 @@ add_custom_command(
         "${dp_proto}"
       DEPENDS "${dp_proto}")
 
+message(STATUS "PYTHON_LIBRARY = ${PYTHON_LIBRARY}")
+
+# dependencies
+set(Python_ADDITIONAL_VERSIONS 3.9)
+find_package(PythonInterp 3.9 REQUIRED)
+find_package(PythonLibs 3.9 REQUIRED)
+
+
+find_package(Python COMPONENTS Interpreter Development)
+message("Python_FOUND:${Python_FOUND}")
+message("Python_VERSION:${Python_VERSION}")
+message("Python_Development_FOUND:${Python_Development_FOUND}")
+message("Python_LIBRARIES:${Python_LIBRARIES}")
+
+include_directories(${PYTHON_INCLUDE_DIRS})
+
 # Include generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
@@ -63,21 +78,32 @@ add_library(dp_grpc_proto
   ${dp_grpc_hdrs}
   ${dp_proto_srcs}
   ${dp_proto_hdrs})
+
 target_link_libraries(dp_grpc_proto
   ${_REFLECTION}
   ${_GRPC_GRPCPP}
   ${_PROTOBUF_LIBPROTOBUF})
 
+
+# find_package(HDF5 REQUIRED)
+# include_directories(${HDF5_INCLUDE_DIRS})
+find_package(HDF5 COMPONENTS C CXX HL REQUIRED)
+link_directories( ${HDF5_LIBRARY_DIRS} )
+include_directories( ${HDF5_INCLUDE_DIRS} )
+
   # Linking info for runtime.
 add_executable(runtime
   "runtime.cpp" "runnableModule.cpp" "taskManager.cpp" "logger.cpp" 
-  "communication.cpp" "rpcService.cpp"
+  "communication.cpp" "rpcService.cpp" "streamingDataset.cpp"
   "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" )
+
 target_link_libraries(runtime
   dp_grpc_proto
+  ${TORCH_LIBRARIES}
+  ${PYTHON_LIBRARIES}
+  ${HDF5_CXX_LIBRARIES}
   ${_REFLECTION}
   ${_GRPC_GRPCPP}
-  ${_PROTOBUF_LIBPROTOBUF}
-  ${TORCH_LIBRARIES})
+  ${_PROTOBUF_LIBPROTOBUF})
 
-set_property(TARGET runtime PROPERTY CXX_STANDARD 14)
+set_property(TARGET runtime PROPERTY CXX_STANDARD 17)

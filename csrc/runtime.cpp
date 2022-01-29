@@ -28,6 +28,9 @@
 #include "rpcService.h"
 #include "json.hpp"
 #include "communication.h"
+#include "streamingDataset.h"
+
+#include <Python.h>
 
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/grpcpp.h>
@@ -224,6 +227,27 @@ void parse_args(RuntimeContext_params* ctx, int argc, char** argv) {
 RuntimeContext *rtctx; /* global rtctx variable */
 
 int main(int argc, char** argv) {
+  // StreamingDataset ds;
+  // ds.test();
+
+  // auto data_loader = torch::data::make_data_loader(
+  //     torch::data::datasets::make_shared_dataset<StreamingDataset>(),
+  //     torch::data::DataLoaderOptions().workers(2) //.max_jobs(1).batch_size(1)
+  // );
+
+  // uint64_t count = 0;
+  // auto start = std::chrono::high_resolution_clock::now();
+  // for (batchData batch : *data_loader) {
+  //   count++;
+  //   if(count%100 == 0){
+  //     auto stop = std::chrono::high_resolution_clock::now();
+  //     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+  //     std::cout << "iteration " << count << ", " << duration.count()/count << " microseconds/batch" << std::endl;
+  //   }
+  // }
+
+  // std::exit(0);
+
   RuntimeContext_params ctx_params;
   parse_args(&ctx_params, argc, argv);
   RuntimeContext ctx(ctx_params);

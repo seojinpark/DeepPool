@@ -154,7 +154,8 @@ struct RuntimeContext {
   std::vector<int> ranks;
   std::atomic<bool> ncclCommReady{false};
   torch::cuda::nccl::ncclComm_t ncclCommObj;
-  c10::cuda::CUDAStream torch_stream, xfer_stream;
+  c10::cuda::CUDAStream xfer_stream;
+  c10::cuda::CUDAStream torch_stream;
   c10::cuda::CUDAStream grad_sync_stream;
 
 };

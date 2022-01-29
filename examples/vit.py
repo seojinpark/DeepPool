@@ -146,7 +146,7 @@ class TransformerBlock(nn.Module):
 
         self.blockB = TransformerBlockB(dim, dim_linear_block=dim_linear_block, dropout=dropout)
         paramsB = {"dim": dim, "dim_linear_block": dim_linear_block}
-        cs.GeneralLayer(self.blockA, "TransBlockB", paramsB, mustTrace=True)
+        cs.GeneralLayer(self.blockB, "TransBlockB", paramsB, mustTrace=True)
 
     def forward(self, x, mask=None):
         y = self.blockA(x)

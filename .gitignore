@@ -162,3 +162,5 @@ misc/*
 !resnetLayerGpuProfileA100V2.txt
 !vitLayerGpuProfileA100.txt
 !wrnLayerGpuProfileA100V2.txt
+data/rareplanes/*
+data/xview/*
