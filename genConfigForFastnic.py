@@ -31,16 +31,16 @@ import sys
 # 172.31.112.36	g1lmd6.fleet.perspectalabs.com g1lmd6
 
 # ipAddresses = ["172.31.112.32", "172.31.112.33"] # g1lmd2 and g1lmd3
-ipAddresses = ["172.31.112.33"] # g1lmd3
-# ipAddresses = ["172.31.112.34"] # g1lmd4
-pkeyPath = '~/.ssh/fastnic.pem'
-userId = "seojin"
+# ipAddresses = ["172.31.112.33"] # g1lmd3
+ipAddresses = ["127.0.0.1"] #172.31.112.34"] # g1lmd4
+pkeyPath = '~/.ssh/id_ed25519'
+userId = "friedj"
 workDir = "~/DeepPoolRuntime/"
-gpuIdxOffset = 1
+gpuIdxOffset = 0
 # gpuCount = 1
-gpuCount = 2
-portPrefix = 11240 # prefix + Device# is used for port.
-coordinatorPort = 12345
+gpuCount = 8
+portPrefix = 11250 # prefix + Device# is used for port.
+coordinatorPort = 12347
 
 # with open(PUBLIC_ADDR_FILENAME, "r") as f:
 #     publicIps = []
@@ -75,7 +75,7 @@ def uploadCode():
             #     '-rh', "--exclude=*__pycache__", "--exclude=results", localPath, "%s@%s:%s" % (userId, host, remotePath)],
             #     stderr=subprocess.STDOUT)
             subprocess.check_call(['rsync', '--progress', '-e', 'ssh -i %s -o StrictHostKeyChecking=no' % pkeyPath,
-                '-rh', "--exclude=*__pycache__", "--exclude=csrc/build/_deps", "--exclude=be_training", "--exclude=be_training/pytorch", "--exclude=be_training/build", "--exclude=results", localPath, "%s@%s:%s" % (userId, host, remotePath)],
+                '-rh', "--exclude=*__pycache__", "--exclude=.git", "--exclude=csrc/build/_deps", "--exclude=be_training", "--exclude=be_training/pytorch", "--exclude=be_training/build", "--exclude=results", localPath, "%s@%s:%s" % (userId, host, remotePath)],
                 stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as e:
             output = e.output

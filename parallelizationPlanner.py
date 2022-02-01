@@ -37,7 +37,8 @@ from jobDescription import Layer
 
 import torch.cuda.profiler as profiler
 import torch.cuda.nvtx as nvtx
-import pyprof
+
+import random
 
 import matplotlib
 matplotlib.use("Agg")
@@ -64,7 +65,7 @@ class CostSim:
         self.profiler = profiler
         self.layers: List[Layer] = []
         self.NET_BANDWIDTH = netBw
-        self.NET_LATENCY = 40 #40
+        self.NET_LATENCY = 40
         # self.NET_LATENCY = 400 #40
         self.verbose = verbose
         self.layerProfileCache = {}
@@ -148,31 +149,53 @@ class CostSim:
     def computeInputDimensions(self, inputDim):
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            if i == 0 or (layer.prevLayers is not None and len(layer.prevLayers) == 0):
-                layer.inputDim = (inputDim)
+
+            if "ext_iput" in layer.params:
+                layer.inputDim = tuple(layer.params["ext_iput"])
             else:
-                prevLayer = layer.prevLayers[0]
-                if len(layer.prevLayers) == 1:
-                    layer.inputDim = prevLayer.outputDim
+
+                if i == 0:
+                    layer.inputDim = inputDim
                 else:
-                    if layer.name == "concat":
-                        totalChannels = 0
-                        for pl in layer.prevLayers:
-                            totalChannels += pl.outputDim[0]
-                            if prevLayer.outputDim[1] != pl.outputDim[1] or prevLayer.outputDim[2] != pl.outputDim[2]: # width and height must match.
-                                print("prevLayer.outputDim: %15s, non-matching other input: %15s" % (prevLayer.outputDim, pl.outputDim))
-                        layer.inputDim = (totalChannels, prevLayer.outputDim[1], prevLayer.outputDim[2])
-                    elif layer.name == "ReLU2d":
-                        for pl in layer.prevLayers:
-                            if prevLayer.outputDim != pl.outputDim: # this is only correct for additions in Resnet.
-                                print("prevLayer.outputDim: %15s, non-matching other input: %15s" % (prevLayer.outputDim, pl.outputDim))
+                    prevLayer = layer.prevLayers[0]
+                    if len(layer.prevLayers) == 1:
                         layer.inputDim = prevLayer.outputDim
                     else:
-                        for pl in layer.prevLayers:
-                            layer.inputDim = pl.outputDim
-                            break
+                        if layer.name == "concat":
+                            totalChannels = 0
+                            for pl in layer.prevLayers:
+                                totalChannels += pl.outputDim[0]
+                                if prevLayer.outputDim[1] != pl.outputDim[1] or prevLayer.outputDim[2] != pl.outputDim[2]: # width and height must match.
+                                    print("prevLayer.outputDim: %15s, non-matching other input: %15s" % (prevLayer.outputDim, pl.outputDim))
+                            layer.inputDim = (totalChannels, prevLayer.outputDim[1], prevLayer.outputDim[2])
+                        elif layer.name == "ReLU2d":
+                            for pl in layer.prevLayers:
+                                if prevLayer.outputDim != pl.outputDim: # this is only correct for additions in Resnet.
+                                    print("prevLayer.outputDim: %15s, non-matching other input: %15s" % (prevLayer.outputDim, pl.outputDim))
+                            layer.inputDim = prevLayer.outputDim
+                        else:
+                            oDims = set(pl.outputDim for pl in layer.prevLayers)
+                            assert(len(oDims) == 1)
+                            layer.inputDim = oDims.pop()
 
-            if layer.name in ["conv2d", "maxPool2d", "avgPool2d"]:
+                if layer.name == "linear":
+                    layer.outputDim = layer.params["out_features"]
+                    layer.inputDim = layer.params["in_features"]
+
+            if False and layer.module:
+                if layer.prevLayers:
+                    args = [torch.empty(sz.outputDim if type(sz.outputDim) == tuple else [sz.outputDim]).unsqueeze(0) for sz in layer.prevLayers]
+                else:
+                    args = [torch.empty(list(layer.inputDim)).unsqueeze(0)]
+                try:
+                    outSize = list(layer.module(*args).size())[1:]
+                except:
+                    outSize = list(layer.module(args).size())[1:]
+                layer.outputDim = outSize[0] if len(outSize) == 1 else tuple(outSize)
+                if type(layer.inputDim) in [tuple, list] and len(layer.inputDim) == 1:
+                    layer.inputDim = layer.inputDim[0]
+
+            elif layer.name in ["conv2d", "maxPool2d", "avgPool2d"]:
                 paddingW = layer.params["padding"][0] if type(layer.params["padding"]) is tuple else layer.params["padding"]
                 paddingH = layer.params["padding"][1] if type(layer.params["padding"]) is tuple else layer.params["padding"]
                 strideW = layer.params["stride"][0] if type(layer.params["stride"]) is tuple else layer.params["stride"]
@@ -207,9 +230,7 @@ class CostSim:
                             fakeIns.append(torch.zeros(inputSize,dtype=torch.int32))
                         else:
                             fakeIns.append(torch.empty(inputSize,dtype=torch.float32))
-                        
                     outSize = list(layer.module(*fakeIns).size())[1:]
-                    print(layer.name, [fIns.size() for fIns in fakeIns], outSize)
                 else:
                     inputSize = [1] + (list(layer.inputDim) if type(layer.inputDim) == tuple else [layer.inputDim])
                     if 'Embedding' in str(layer.module):
@@ -217,7 +238,7 @@ class CostSim:
                     else:
                         fakeIn = torch.empty(inputSize,dtype=torch.float32)
                     outSize = list(layer.module(fakeIn).size())[1:]
-                    print(layer.name, fakeIn.size(), outSize)
+                    # print(layer.name, fakeIn.size(), outSize)
                 layer.outputDim = outSize[0] if len(outSize) == 1 else tuple(outSize)
                 # print("Computed outputDim: ", layer.outputDim)
 
@@ -578,7 +599,7 @@ class CostSim:
         layer = Layer(module, name, params, prevLayers = custom_previous_layers)
         layer.must_trace = mustTrace
         self.layers.append(layer)
-        return
+        return layer
 
     def getInitialConfig(self, layer, globalBatch: int):
         if layer.name in ["conv2d"]:
@@ -1354,6 +1375,8 @@ class CostSim:
         return (moduleDesc, finalTime / 1000., gpuUsecSum / 1000.)
 
     def searchBestSplitsV2(self, totalGpus: int, globalBatch: int = 16, useZhihaoAlgo = False):
+        assert False
+        """
         t = [[] for i in range(len(self.layers))] # [layer] = list of (config, cumulativeTime, prevConfigIndex)
 
         initialConfigs = []
@@ -1514,6 +1537,7 @@ class CostSim:
                     sum(initialTimes) / sum(t[i][bestConfigChain[i]][3][2] for i in range(len(bestConfigChain)))
                     ))
 
+        """
 
     def searchLinear(self, preStartLayer, preStartConfig, startLayer, ctx: SearchContext):
         layer = startLayer
@@ -1533,7 +1557,7 @@ class CostSim:
                 
                 if layer == startLayer or len(layer.prevLayers) == 0:
                     if preStartLayer != None:
-                        cumulativeTime, prevLayerTime, prevConfigOfPrev, timeComposition, prevMpIdleTime = preStartLayer.t[preStartConfig]
+                        cumulativeTime, prevLayerTime, prevConfigOfPrev, _, prevMpIdleTime = preStartLayer.t[preStartConfig]
                         activationTime, activationSizeMatrix = self.calcInputXfer(preStartLayer, layer, preStartConfig, config)
                     else:
                         cumulativeTime = 0
@@ -1606,6 +1630,7 @@ class CostSim:
                 if len(layer.prevLayers) > 1: # Joining layer.
                     return layer
             else:
+                assert False
                 print("Error!")
         return
     
@@ -1697,10 +1722,10 @@ class CostSim:
 
         return joiningLayer
 
-    def to_dot(self, name, globalBatch):
+    def to_dot(self, name, globalBatch, justdag = False):
         dot = graphviz.Digraph(name = name)
         for layer in self.layers:
-            gpusUsed = self.calcGpusNeeded(layer, layer.bestCfg, globalBatch)
+            gpusUsed = self.calcGpusNeeded(layer, layer.bestCfg, globalBatch) if not justdag else 0
             comment = ""
             # comment = "\n" + str(layer.bestCfg)
             # if hasattr(layer, 'gpuLocalAssignmentDict'):
@@ -1708,8 +1733,13 @@ class CostSim:
             if hasattr(layer, 'startNoOverlapAdjustment'):
                 comment = "\n+%.2f ms" % (layer.startNoOverlapAdjustment / 1000)
 
-            node_desc = "%d) %s\nt= %.2f ms (+%.2f)\nGPU=%s%s" % ( #]\nidle=%.1fms" % (
-                layer.id, layer.name, layer.t[layer.bestCfg][0] / 1000, layer.t[layer.bestCfg][1] / 1000, layer.gpuAssignment, comment) #, layer.t[layer.bestCfg][4] / 1000) #, str(layer.bestCfg))
+            if not justdag:
+                node_desc = "%d) %s\nt= %.2f ms (+%.2f)\nGPU=%s%s" % ( #]\nidle=%.1fms" % (
+                    layer.id, layer.name, layer.t[layer.bestCfg][0] / 1000, layer.t[layer.bestCfg][1] / 1000, layer.gpuAssignment, comment) #, layer.t[layer.bestCfg][4] / 1000) #, str(layer.bestCfg))
+            else:
+              node_desc = "%d) %s\n" % (
+                    layer.id, layer.name)
+
             # if node.stage_id is not None:
             #     color = self._colors[node.stage_id % len(self._colors)]
             #     dot.node(node.node_id, node_desc,
@@ -1778,7 +1808,71 @@ class CostSim:
         plt.subplots_adjust(wspace=0, hspace=0)
         plt.savefig("gpuTimeline.pdf")
 
-    def searchBestSplitsV3(self, totalGpus: int, globalBatch: int = 16, lossfn: int = 0, amplificationLimit: float = 2.0, dataParallelBaseline = False, sampleSplit=True, spatialSplit=False, filterSplit=False):
+    """ Generate a simple DP only plan, or use randomMode to randomly distribute layers """
+    def JustDoDP(self, totalGpus: int, globalBatch: int, per_layer_rand_prob: float = 0.0):
+        randomMode = per_layer_rand_prob > 0.0
+        if randomMode: random.seed(0)
+        lastCfg = 0
+        lastAssign = []
+        for ln, layer in enumerate(self.layers):
+            layer.t = {}
+            layer.initCfg = self.getInitialConfig(layer, globalBatch)
+            doDp = not randomMode
+            configCandidates = self.listConfigOptions(layer, globalBatch, totalGpus, spatialSplit=False, dataParallelBaseline=doDp)
+            if randomMode and random.random() < per_layer_rand_prob:
+                rn = random.randint(0, len(configCandidates) - 1)
+                while rn == lastCfg and len(configCandidates) > 1:
+                    rn = random.randint(0, len(configCandidates) - 1)
+                lastCfg = rn
+            else:
+                rn = lastCfg
+
+            config = configCandidates[rn]
+            gpuTime = 1
+            syncTime = 1
+            cumulativeTime = 0
+            activationTime = 0
+            activationSizeMatrix = (0)
+            timeComposition = (cumulativeTime, activationTime, gpuTime, syncTime, activationSizeMatrix)
+            layerTime = activationTime + gpuTime + syncTime
+            newTime = cumulativeTime + layerTime #activationTime + gpuTime + syncTime
+            layer.t[config] = (newTime, layerTime, None, timeComposition, 0)
+
+            nrGpus = globalBatch // config[0]
+            if len(lastAssign) == nrGpus:
+                layer.gpuAssignment = lastAssign
+            else:
+                activeGPUs = set()
+                while len(activeGPUs) < nrGpus:
+                    activeGPUs.add(random.randint(0, totalGpus - 1))
+                layer.gpuAssignment = list(activeGPUs)
+                lastAssign = layer.gpuAssignment
+            layer.bestCfg = config
+            layer.gpuTime = (1,1)
+        finalTime = 0
+        dpTime = 0
+        for layer in self.layers:
+            cumulativeTime, layerTime, prevConfigIndexOfPrev, timeComposition, mpIdleTime = layer.t[layer.bestCfg]
+            dpTime += layerTime
+            nextLayerIds = []
+            for l in layer.nextLayers:
+                nextLayerIds.append(l.id)
+
+            # print(" %3d  %25s  " % (layer.id, str(nextLayerIds)), end="")
+            if not hasattr(layer, "bestCfg"):
+                # print("no bestCfg")
+                continue
+            if not hasattr(layer, "initCfg"):
+                # print("no initCfg", end="")
+                layer.initCfg = self.getInitialConfig(layer, ctx.globalBatch)
+                # continue
+            gpusUsed = totalGpus
+            gpuTime = 1
+            finalTime = max(cumulativeTime, finalTime)
+        moduleDesc = TrainingJob("test", self.layers, [layer.bestCfg for layer in self.layers], globalBatch, totalGpus, "na")
+        return (moduleDesc, dpTime / 1000., 0 / 1000., totalGpus)
+
+    def searchBestSplitsV3(self, totalGpus: int, globalBatch: int = 16, amplificationLimit: float = 2.0, dataParallelBaseline = False, sampleSplit=True, spatialSplit=False, filterSplit=False):
         """ Parallelization strategy findiing for DeepPool. """
         ctx = SearchContext(totalGpus, globalBatch, lossfn, amplificationLimit, dataParallelBaseline, sampleSplit=sampleSplit, spatialSplit=spatialSplit, filterSplit=filterSplit)
         ctx.doNotBench = totalGpus == 1
