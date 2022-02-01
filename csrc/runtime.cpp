@@ -50,7 +50,11 @@ ABSL_FLAG(int, worldSize, 1, "");
 ABSL_FLAG(std::string, logdir, "", "");
 ABSL_FLAG(long, be_batch_size, 0, "");
 ABSL_FLAG(size_t, sample_per_kernel, 32, "");
-ABSL_FLAG(bool, profile, false, "");
+ABSL_FLAG(bool, profile_stage_time, false, "");
+ABSL_FLAG(bool, profile_layer_times_graph, false, "");
+ABSL_FLAG(bool, profile_layer_times_timers, false, "");
+ABSL_FLAG(bool, cuda_profile, false, "use cuda profiler API to mark an iteration for profiling");
+
 ABSL_FLAG(bool, debug, false, "");
 ABSL_FLAG(std::string, be_jit_file,
           "/home/seojin/DeepPoolRuntime/beModules/resnet.jit", "");
@@ -164,13 +168,6 @@ int RuntimeContext::poll() {
       BePause();
   }
 
-  /* empty allocator caches for profiling */
-  if (rtctx->profile) {
-    c10::cuda::device_synchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
-    c10::cuda::device_synchronize();
-  }
-
   if (mainJob->ShouldRunTest()) mainJob->Test();
   for (size_t i = 0; i < mainJob->GetEpochsToTrain(); i++) {
     mainJob->TrainOneEpoch();
@@ -181,6 +178,7 @@ int RuntimeContext::poll() {
   mainJob->printJobStatistics();
   jobList.erase(jobList.begin());
   DP_LOG(NOTICE, "Removed the completed job. Remaining: %lu", jobList.size());
+  c10::cuda::CUDACachingAllocator::emptyCache();
   return 1;
 }
 
@@ -199,7 +197,10 @@ void parse_args(RuntimeContext& ctx, int argc, char** argv) {
   PARSEFLAG(use_fg_graph);
   PARSEFLAG(rank);
   PARSEFLAG(worldSize);
-  PARSEFLAG(profile);
+  PARSEFLAG(profile_stage_time);
+  PARSEFLAG(profile_layer_times_graph);
+  PARSEFLAG(profile_layer_times_timers);
+  PARSEFLAG(cuda_profile);
   PARSEFLAG(debug);
   PARSEFLAG(logdir);
 #undef PARSEFLAG

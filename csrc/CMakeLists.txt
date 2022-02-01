@@ -15,20 +15,15 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
 
 enable_language(CUDA)
-set(CUDA_ATTACH_VS_BUILD_RULE_TO_CUDA_FILE ON)
+#set(CUDA_ATTACH_VS_BUILD_RULE_TO_CUDA_FILE ON)
 set(BUILD_SHARED_LIBS ON)
 set(CUDA_SEPARABLE_COMPILATION ON)
-# set(CMAKE_CUDA_ARCHITECTURES "80")
-# set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} -gencode arch=compute_80,code=sm_80)
 set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} -std=c++17)
 
 cuda_add_library("cudasleep"
   CUDASleep.cu
-  # OPTIONS -arch compute_80
+  SHARED
 )
-# set_property(TARGET "cudasleep" PROPERTY CXX_STANDARD 17)
-
-# TARGET_LINK_LIBRARIES("cudasleep" ${CUDA_LIBRARIES})
 
 find_package(Git QUIET)
 if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
@@ -122,7 +117,7 @@ include_directories( ${HDF5_INCLUDE_DIRS} )
 add_executable(runtime
   "runtime.cpp" "runnableModule.cpp" "JobContext.cpp" "logger.cpp"
   "communication.cpp" "rpcService.cpp" "GraphPieces.cpp" "BeTask.cpp" "streamingDataset.cpp"
-  "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" "cifar10.cpp" "dataset.cpp" "GradSync.cpp")
+  "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" "cifar10.cpp" "dataset.cpp" "GradSync.cpp" "CUDAGraph.cpp")
 target_link_libraries(runtime
   dp_grpc_proto
   cudasleep

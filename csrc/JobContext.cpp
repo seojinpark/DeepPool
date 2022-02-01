@@ -14,6 +14,7 @@
 
 #include "JobContext.h"
 
+#include <ATen/autocast_mode.h>
 #include <cuda_profiler_api.h>
 #include <torch/torch.h>
 
@@ -51,6 +52,13 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
   } else if (name.find("gpt2") != std::string::npos) {
     dset = "gpt2";
     runTestRoutine_ = false;
+  } else if (name.find("Inception") != std::string::npos) {
+    dset = "inception";
+  }
+
+  if (job_params.contains("autocast") && job_params["autocast"].get<bool>()) {
+    DP_LOG(DEBUG, "Using autocast");
+    autocast_ = true;
   }
 
   if (job_params.contains("run_test_routine"))
@@ -115,12 +123,14 @@ void JobContext::printJobStatistics() {
  *
  * \return    returns non-zero if iteration is finished.
  */
-void JobContext::StepOne(bool *iter_done, bool *job_done) {
+void JobContext::StepOne(bool *iter_done) {
+  if (job_done_) return;
   bool graphCapture = totiters == iters_before_graph_capture;
-  bool profile = rtctx->profile && totiters == iters_before_graph_capture - 5;
+  bool profile = rtctx->profile_layer_times_graph && totiters == 3;
 
   if (!iter_in_progress) {
-    if (totiters == profile_iter_start) CUDA_API_CALL(cudaProfilerStart());
+    if (rtctx->cuda_profile && totiters == profile_iter_start)
+      CUDA_API_CALL(cudaProfilerStart());
     if ((graphCapture || profile) && IsBeEnabled()) BePause();
     if (totiters == warmupIters) {
       rtctx->torch_stream.synchronize();
@@ -129,17 +139,23 @@ void JobContext::StepOne(bool *iter_done, bool *job_done) {
     }
   }
 
+  at::autocast::set_enabled(autocast_);
   iter_in_progress = !model->AdvanceTraining(graphCapture, profile);
+  at::autocast::set_enabled(false);
 
   if (iter_done) *iter_done = !iter_in_progress;
 
   if (!iter_in_progress) {
+    if (autocast_) at::autocast::clear_cache();
     if ((graphCapture || profile) && IsBeEnabled() && run_with_be_) BeResume();
-    if (totiters == profile_iter_start + niter_to_profile - 1)
+    if (rtctx->cuda_profile &&
+        totiters == profile_iter_start + niter_to_profile - 1) {
       CUDA_API_CALL(cudaProfilerStop());
+      exit(0);
+    }
     rtctx->fgcounter++;
     if (profile) {
-      if (job_done) *job_done = true;
+      job_done_ = true;
       return;
     }
     ++totiters;
@@ -206,7 +222,7 @@ void JobContext::TrainOneEpoch() {
   size_t i = 0;
   if (iters_before_graph_capture < totiters && rtctx->use_fg_graph)
     iters_before_graph_capture = totiters + 5;
-  while (!dataset_pipeline_->IsDone()) {
+  while (!dataset_pipeline_->IsDone() && !job_done_) {
     auto batch = dataset_pipeline_->getNextThisRank();
     Train(batch.data, batch.target);
     DP_LOG(DEBUG, "Training iteration %lu/%lu\n", ++i,
@@ -228,8 +244,8 @@ void JobContext::TrainOneEpoch() {
  * \return    returns non-zero if iteration is finished.
  */
 void JobContext::FinishIteration() {
-  bool iter_done = false, job_done = false;
+  bool iter_done = false;
   do {
-    StepOne(&iter_done, &job_done);
-  } while (!iter_done && !job_done);
+    StepOne(&iter_done);
+  } while (!iter_done && !job_done_);
 }

@@ -10,7 +10,7 @@ from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
 
 
-from torchsummary import summary
+#from torchsummary import summary
 import torch
 from torch import nn, Tensor
 import numpy as np
@@ -27,7 +27,6 @@ sys.path.append(parentdir)
 sys.path.append(os.path.abspath('../../transformers'))
 
 from parallelizationPlanner import CostSim
-from gpuProfiler import GpuProfiler
 from clusterClient import ClusterClient
 from jobDescription import TrainingJob
 # from transformers import GPT2Model
@@ -35,7 +34,7 @@ from jobDescription import TrainingJob
 # from Project1.file1 import something
 
 from transformers.models.gpt2 import GPT2Tokenizer, GPT2LMHeadModel, GPT2Config, GPT2Model
-from datasets import load_dataset
+#from datasets import load_dataset
 
 def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66E5, spatialSplit=False, simResultFilename=None, simOnly=False):
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
@@ -43,11 +42,9 @@ def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fal
     encoded_input = tokenizer(text, return_tensors='pt')
     config = GPT2Config()
 
-    profiler = GpuProfiler("cuda")
-    profiler.loadProfile()
     global cs
     # cs = CostSim(profiler, netBw=netBw, verbose=True)
-    cs = CostSim(profiler, netBw=netBw, verbose=True, gpuProfileLoc="gpt2LayerGpuProfileA100V2.txt")
+    cs = CostSim(None, netBw=netBw, verbose=True, gpuProfileLoc="gpt2LayerGpuProfileA100V2.txt")
     # model = ViT(img_dim=256, in_channels=3, patch_dim=16, num_classes=1000, dim=512, blocks=12, dim_linear_block=3072)
     # model = ViT(img_dim=256, in_channels=3, patch_dim=32, num_classes=1000, dim=1024, blocks=24, heads=16, dim_linear_block=4092)
     # model = GPT2Model.from_pretrained('gpt2')
@@ -67,7 +64,8 @@ def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fal
     # model(**batch)
 
     cs.printAllLayers(slient=False)
-    cs.computeInputDimensions((1024))
+    cs.computeInputDimensions((1024,), dtype=torch.int32)
+    cs.setLossFunction("CrossEntropyLoss")
     # job, iterMs, gpuMs = cs.searchBestSplits(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
 
     # if dataParallelBaseline:
@@ -76,7 +74,6 @@ def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fal
 
     job, iterMs, gpuMs, maxGpusUsed = cs.searchBestSplitsV3(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
     print("  %2d    %2d   %4.1f  %4.1f\n" % (globalBatch, maxGpusUsed, iterMs, gpuMs))
-    profiler.saveProfile()
     cs.to_dot(simResultFilename, globalBatch)
     # cs.to_gpuTimeline("Inception v3, Burst Parallel", maxGpusUsed, dataParallelBaseline)
     jobInJson = job.dumpInJSON()
@@ -107,10 +104,9 @@ def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fal
         cc.submitTrainingJob(jobName, jobInJson)
 
 def runStrongScalingBench():
-    profiler = GpuProfiler("cuda")
     global cs
     netBw = 2.66E5
-    cs = CostSim(profiler, netBw=netBw, verbose=False)
+    cs = CostSim(None, netBw=netBw, verbose=False)
     inputSize = (1024)
     # model = ViT(img_dim=256, in_channels=3, patch_dim=16, num_classes=1000, dim=512)
     config = GPT2Config()
@@ -128,7 +124,7 @@ def runStrongScalingBench():
     batch = next(iter(dataloader))
     model = model.to('cuda')
     # model()
-    summary(model, [tuple(batch['input_ids'].size()), tuple(batch['attention_mask'].size())])
+    #summary(model, [tuple(batch['input_ids'].size()), tuple(batch['attention_mask'].size())])
 
     traced = torch.jit.trace(model, (batch['input_ids'].to('cuda'), batch['attention_mask'].to('cuda')))
 
@@ -140,9 +136,10 @@ def runStrongScalingBench():
     print("Model: ", "GPT2(256, 3, 16, 1000, 512")
     print("BatchSize  iterMs    fpMs    bpMs")
     for batchSize in [2 ** exp for exp in range(1, 5)]:
-        iterTime, fpTime, bpTime = profiler.benchModelNLP(model, inputSize, batchSize, profile=True)
-        print(" %8d  %6.1f  %6.1f  %6.1f" %
-            (batchSize, iterTime / 1000, fpTime / 10000, bpTime / 1000))
+        assert False
+        # iterTime, fpTime, bpTime = profiler.benchModelNLP(model, inputSize, batchSize, profile=True)
+        # print(" %8d  %6.1f  %6.1f  %6.1f" %
+            # (batchSize, iterTime / 1000, fpTime / 10000, bpTime / 1000))
 
 
 if __name__ == "__main__":

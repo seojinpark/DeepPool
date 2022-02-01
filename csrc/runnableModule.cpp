@@ -14,6 +14,7 @@
 
 #include "runnableModule.h"
 
+#include <ATen/autocast_mode.h>
 #include <torch/script.h>
 #include <torch/torch.h>
 
@@ -51,7 +52,7 @@ class GraphTimer {
   }
 
  private:
-  at::cuda::CUDAGraph graph;
+  DeepPool::CUDAGraph graph;
 };
 
 /**
@@ -169,7 +170,7 @@ RunnableModule::RunnableModule(
       }
     }
 
-    if (rtctx->profile) {
+    if (rtctx->profile_layer_times_graph) {
       // TODO: if it's not that accurate, maybe add layer id?
       layer->moduleName = name + ldsc["params"].dump() + "[" +
                           std::to_string(layerLocalBatch) + "]" +
@@ -341,9 +342,6 @@ torch::Tensor Layer::DoForward(bool captureLayer) {
   std::vector<torch::Tensor> vec;
   for (auto& p : tensors_in) vec.push_back(p.second);
 
-  GraphTimer fwdtimer;
-  if (captureLayer) fwdtimer.StartCapture();
-
   std::vector<c10::IValue> iVec;
   if (specialModule == SpecialModuleTypes::CONCAT &&
       module.get_method("forward").function().getSchema().arguments().size() <=
@@ -354,7 +352,14 @@ torch::Tensor Layer::DoForward(bool captureLayer) {
     for (auto& v : vec) iVec.emplace_back(v);
   }
 
+  GraphTimer fwdtimer;
+  if (captureLayer) fwdtimer.StartCapture();
+
   output = module.forward(iVec).toTensor();
+  /* verify output shape is as expected per job description */
+  for (size_t i = 1; i < emptyOutSizes.size(); i++)
+    assert(emptyOutSizes[i] == output.sizes().vec()[i]);
+  assert(emptyOutSizes.size() == output.sizes().vec().size());
 
   if (captureLayer) fwUsec = fwdtimer.EndCaptureAndTime();
 
@@ -365,7 +370,7 @@ torch::Tensor Layer::DoForward(bool captureLayer) {
   return output;
 }
 
-void Layer::DoBackward(bool captureLayer) {
+void Layer::DoBackward(bool captureLayer, torch::Tensor& fpOutput) {
   if (!active) {
     DP_LOG(DEBUG, "Layer %d is not active.", id);
     return;
@@ -381,12 +386,19 @@ void Layer::DoBackward(bool captureLayer) {
   GraphTimer bwdtimer;
   if (captureLayer) bwdtimer.StartCapture();
 
+  /* last layer */
+  if (nextLayers.size() == 0 && fpOutput.defined()) {
+    DP_LOG(DEBUG, "Backward on fpLoss:%s", tsrSizeToStr(fpOutput).c_str());
+    fpOutput.backward();
+    fpOutput.reset();
+  }
+
   for (size_t nli = 0; nli < nextLayers.size(); nli++) {
     auto& nl = nextLayers[nli];
     auto& grad = nl->tensors_in[id];
     DP_LOG(DEBUG, "Backward on output:%s grad(%d):%s",
            tsrSizeToStr(output).c_str(), nl->id, tsrSizeToStr(grad).c_str());
-    output.backward(nl->tensors_in[id], nli < nextLayers.size() - 1);
+    output.backward(grad, nli < nextLayers.size() - 1);
     nl->tensors_in[id].reset();
   }
 
@@ -417,11 +429,15 @@ static torch::Tensor getSampleSlice(torch::Tensor& in, ssize_t offset,
 void RunnableModule::ExecuteXfers(Layer* layer, bool backward) {
   if (!layer->xfers.size() && !layer->xfers_local.size()) return;
 
+  DP_LOG(DEBUG, "Executing xfers for layer %d", layer->id);
+
   std::map<size_t, torch::Tensor> inbound_tensors;
   std::map<size_t, torch::Tensor> outbound_tensors;
 
   torch::TensorOptions topts(rtctx->c10dev);
   topts = topts.requires_grad(!backward);
+  if (at::autocast::is_enabled())
+    topts = topts.dtype(at::autocast::get_autocast_gpu_dtype());
 
   auto& outbound_lids = backward ? layer->rx_lids : layer->tx_lids;
   auto& inbound_lids = backward ? layer->tx_lids : layer->rx_lids;
@@ -449,10 +465,12 @@ void RunnableModule::ExecuteXfers(Layer* layer, bool backward) {
     const std::pair<size_t, size_t>& src = backward ? ixfer.dst : ixfer.src;
     const std::pair<size_t, size_t>& dst = backward ? ixfer.src : ixfer.dst;
 
-    DP_LOG(DEBUG,
-           "Transferring samples from rank %lu layer %lu pos %lu to rank %lu "
-           "layer %d pos %lu",
-           src.first, lid, src.second, dst.first, layer->id, dst.second);
+    DP_LOG(
+        DEBUG,
+        "Transferring %lu samples from rank %lu layer %lu pos %lu to rank %lu "
+        "layer %d pos %lu",
+        ixfer.nr_samples, src.first, lid, src.second, dst.first, layer->id,
+        dst.second);
 
     if (src.first == static_cast<size_t>(rtctx->rank)) {
       auto tsr = getSampleSlice(outbound_tensors.at(lid), src.second,
@@ -475,9 +493,9 @@ void RunnableModule::ExecuteXfers(Layer* layer, bool backward) {
     const std::pair<size_t, size_t>& dst = backward ? ixfer.src : ixfer.dst;
 
     DP_LOG(DEBUG,
-           "Copying samples from layer %lu pos %lu to "
+           "Copying %lu samples from layer %lu pos %lu to "
            "layer %d pos %lu",
-           lid, src.second, layer->id, dst.second);
+           ixfer.nr_samples, lid, src.second, layer->id, dst.second);
 
     auto srcTsr =
         getSampleSlice(outbound_tensors.at(lid), src.second, ixfer.nr_samples);
@@ -521,6 +539,8 @@ JobStatus RunnableModule::forwardAStep(bool captureLayer) {
     layer->tensors_in.clear();
     layer->output.reset();
   }
+
+  TimerRecordLayer(layer->timerkey, false);
 
   // Forward pass is completed.
   if (layerQ.empty()) {
@@ -584,30 +604,13 @@ JobStatus RunnableModule::forwardAStep(bool captureLayer) {
 void RunnableModule::loss() {
   if (!fpOutput.defined()) return;
 
-  torch::Tensor fpLoss;
-
   if (lossfn_ == LossFunctions::CrossEntropyLoss) {
-    auto shift_logits =
-        fpOutput
-            .index({torch::indexing::Ellipsis,
-                    torch::indexing::Slice(torch::indexing::None, -1),
-                    torch::indexing::Slice()})
-            .contiguous();
-    auto shift_labels =
-        fpTargets
-            .index({torch::indexing::Ellipsis,
-                    torch::indexing::Slice(1, torch::indexing::None)})
-            .contiguous();
     auto loss_fct = torch::nn::CrossEntropyLoss();
-    fpLoss = loss_fct(shift_logits.view({-1, shift_logits.size(-1)}),
-                      shift_labels.view({-1}).to(torch::kLong));
+    fpOutput = loss_fct(fpOutput, fpTargets.view({-1}));
   } else {
     assert(lossfn_ == LossFunctions::NLLLoss);
-    fpLoss = torch::nll_loss(fpOutput.log_softmax(1), fpTargets);
+    fpOutput = torch::nll_loss(fpOutput.log_softmax(1), fpTargets);
   }
-
-  fpLoss.backward();
-  fpOutput.reset();
 }
 
 /**
@@ -625,7 +628,7 @@ JobStatus RunnableModule::backwardAStep(bool captureLayer) {
 
   DP_LOG(DEBUG, "lid:%d.", layer->id);
 
-  layer->DoBackward(captureLayer);
+  layer->DoBackward(captureLayer, fpOutput);
   ExecuteXfers(layer, true);
   layer->status = LayerStatus::PENDING_FP;
   layer->nr_current_depedencies = layer->prevLayers.size();
@@ -641,6 +644,9 @@ JobStatus RunnableModule::backwardAStep(bool captureLayer) {
     assert(pl->nr_current_depedencies > 0);
     if (--pl->nr_current_depedencies == 0) layerQ.push_back(pl.get());
   }
+
+  assert(!layer->timerkey.empty());
+  TimerRecordLayer(layer->timerkey, true);
 
   // Backward pass is completed.
   if (layerQ.empty()) {
@@ -668,7 +674,7 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     DP_LOG(DEBUG, "JobState::INIT.");
 
     p.Lap();
-    TimerRecord("start");
+    TimerRecordStage("start");
 
     layerQ.clear();
     layerQ.push_back(layers[0].get());
@@ -676,14 +682,14 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     if (layers[0]->active && !layers[0]->tensors_in[0].defined())
       assert("MISSING INPUT TO FIRST LAYER!" && false);
 
-    TimerRecord("load");
+    TimerRecordStage("load");
 
     /* start graph capture */
     if (doGraphCapture) {
       DP_LOG(NOTICE, "Starting capture.");
       graph_recording = true;
       c10::cuda::device_synchronize();
-      graph_mempool = at::cuda::graph_pool_handle();
+      graph_mempool = DeepPool::graph_pool_handle();
       maingraph.capture_begin(graph_mempool);
       commHandler->precapture();
     } else if (has_graph) {
@@ -693,8 +699,10 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     }
 
     fpOutput.reset();
-    optimizer->zero_grad();
-    TimerRecord("zero");
+    for (auto& group : optimizer->param_groups())
+      for (auto& param : group.params()) param.mutable_grad() = torch::Tensor();
+    TimerRecordStage("zero");
+    TimerRecordLayer("start", false);
     state = JobState::FORWARD;
     DP_LOG(DEBUG, "Foward pass is starting soon.");
   } else if (state == JobState::FORWARD) {
@@ -710,7 +718,7 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     JobStatus status = forwardAStep(layerProfile);
 
     if (status == COMPLETED) {
-      TimerRecord("forward");
+      TimerRecordStage("forward");
       if (!isTrain_) {
         for (auto& layer : layers) {
           layer->status = LayerStatus::PENDING_FP;
@@ -726,7 +734,8 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
   } else if (state == JobState::LOSS) {
     DP_LOG(DEBUG, "JobState::LOSS.");
     loss();
-    TimerRecord("loss");
+    TimerRecordStage("loss");
+    TimerRecordLayer("start", true);
     assert(layerQ.empty());
     layerQ.push_back(layers.back().get());
     DP_LOG(DEBUG, "Moving to backward pass.");
@@ -736,7 +745,7 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
 
     JobStatus status = backwardAStep(layerProfile);
     if (status == COMPLETED) {
-      TimerRecord("backward");
+      TimerRecordStage("backward");
       state = JobState::SYNC;
       DP_LOG(DEBUG,
              "Backward pass is completed. Moving to gradient all-reduce.");
@@ -759,12 +768,12 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
       stepgraph.capture_begin(graph_mempool);
     }
 
-    TimerRecord("sync");
+    TimerRecordStage("sync");
     state = JobState::STEP;
   } else if (state == JobState::STEP) {
     DP_LOG(DEBUG, "JobState::STEP");
     optimizer->step();
-    TimerRecord("step");
+    TimerRecordStage("step");
     state = JobState::FINISH;
   } else if (state == JobState::FINISH) {
     DP_LOG(DEBUG, "JobState::FINISH");
@@ -797,7 +806,7 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     }
 
     state = JobState::INIT;
-    TimerRecord("stop");
+    TimerRecordStage("stop");
     resetTimers();
     return 1;
   }
@@ -808,21 +817,39 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
  * Reset timers for profiling each layer. Happens every iteration.
  */
 void RunnableModule::resetTimers() {
-  if (rtctx->profile && !has_graph && !graph_recording) timers.SaveAndReset();
+  if (has_graph || graph_recording) return;
+
+  if (rtctx->profile_stage_time) timers.SaveAndReset();
+
+  if (rtctx->profile_layer_times_timers) {
+    layerts_fwd.SaveAndReset();
+    layerts_bwd.SaveAndReset();
+  }
 }
 
 void RunnableModule::printLayerInGraphTimes() {
-  if (!rtctx->profile) {
-    return;
+  if (rtctx->profile_layer_times_graph) {
+    double sum = 0;
+    for (auto& layer : layers) {
+      double layerms =
+          static_cast<double>(layer->fwUsec + layer->bwUsec) / 1000.0;
+      printf(" %110s  %6.3f  %8" PRId64 "  %8" PRId64 "\n",
+             layer->moduleName.c_str(), layerms, layer->fwUsec, layer->bwUsec);
+      sum += layerms;
+    }
+    printf("%100s  %.3f\n", "SUM(avg)", sum);
   }
 
-  double sum = 0;
-  for (auto& layer : layers) {
-    double layerms =
-        static_cast<double>(layer->fwUsec + layer->bwUsec) / 1000.0;
-    printf(" %110s  %6.3f  %8" PRId64 "  %8" PRId64 "\n",
-           layer->moduleName.c_str(), layerms, layer->fwUsec, layer->bwUsec);
-    sum += layerms;
+  if (rtctx->profile_layer_times_timers) {
+    printf("layer fwd bwd\n");
+    double total_fwd = 0, total_bwd = 0;
+    for (auto& layer : layers) {
+      auto fwdtm = layerts_fwd.GetP50(layer->timerkey, 200) * 1000.0;
+      auto bwdtm = layerts_bwd.GetP50(layer->timerkey, 200) * 1000.0;
+      total_fwd += fwdtm;
+      total_bwd += bwdtm;
+      printf("%s %.2f %.2f\n", layer->timerkey.c_str(), fwdtm, bwdtm);
+    }
+    printf("Total %.2f %2.f\n", total_fwd, total_bwd);
   }
-  printf("%100s  %.3f\n", "SUM(avg)", sum);
 }

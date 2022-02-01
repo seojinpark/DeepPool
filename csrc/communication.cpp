@@ -177,6 +177,7 @@ void CommunicationHandlerNCCL::sync(
 void CommunicationHandlerNCCL::send(const torch::Tensor& tensor, int tag,
                                     int dest) {
   UNUSED(tag);
+  DP_LOG(DEBUG, "NCCL send %lu bytes to %d.", tensor.nbytes(), dest);
 
   assert(in_group_call);
   tensor.record_stream(group_call_stream.value());
@@ -186,7 +187,7 @@ void CommunicationHandlerNCCL::send(const torch::Tensor& tensor, int tag,
 
 void CommunicationHandlerNCCL::recv(torch::Tensor& tensor, int tag, int src) {
   UNUSED(tag);
-  DP_LOG(DEBUG, "NCCL recv.");
+  DP_LOG(DEBUG, "NCCL recv %lu bytes from %d.", tensor.nbytes(), src);
 
   assert(in_group_call);
   tensor.record_stream(group_call_stream.value());
@@ -228,6 +229,8 @@ void CommunicationHandlerNCCL::all_reduce(torch::Tensor& tensor,
   };
 
   assert(in_group_call);
+  DP_LOG(DEBUG, "NCCL all reduce.");
+
   tensor.record_stream(group_call_stream.value());
   NCCL_API_CALL(
       ncclAllReduce(tensor.data_ptr(), tensor.data_ptr(), tensor.numel(),

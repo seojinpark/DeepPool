@@ -55,7 +55,7 @@ class JobContext {
   void Test();
 
   /* Advance one step through the the model */
-  void StepOne(bool *iter_done, bool *job_done);
+  void StepOne(bool *iter_done);
 
   /* Advance to the end of an iteration*/
   void FinishIteration();
@@ -79,8 +79,11 @@ class JobContext {
   size_t epochsToTrain{1};
   size_t itersToTrain{5000};
   size_t warmupIters{200};
-  size_t profile_iter_start{ULLONG_MAX};
+  size_t profile_iter_start{3};
   size_t niter_to_profile{5};
+  bool autocast_{false};
+
+  bool job_done_{false};
 
   std::shared_ptr<Dataset> train_dataset_;
   std::shared_ptr<Dataset> eval_dataset_;
@@ -88,7 +91,7 @@ class JobContext {
 
   bool iter_in_progress{false};
   size_t totiters{0};                     // total iters executed
-  size_t iters_before_graph_capture{5};  // set high to disable graph capture
+  size_t iters_before_graph_capture{10};  // set high to disable graph capture
 };
 
 #endif  // TASK_MANAGER_H
