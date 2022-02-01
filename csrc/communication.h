@@ -92,8 +92,6 @@ class CommunicationHandlerNCCL : public CommunicationHandler {
   void testRingP2P();
   void testAllReduce();
 
-  c10::optional<c10::cuda::CUDAStream> getCommStream(void) {return group_call_stream;};
-
  private:
   at::cuda::CUDAEvent sync_event;
   c10::cuda::CUDAStream default_comm_stream;

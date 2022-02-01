@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.11 FATAL_ERROR)
 project(DeepPool)
 
+list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/nfsnccl")
 list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/libtorch")
 list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/cuda")
 find_package(Torch REQUIRED)
@@ -13,17 +14,38 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -std=c++17 -lstdc++fs
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
 
-# cloning gRPC at configure time.
-message(STATUS "Using gRPC via add_subdirectory (FetchContent).")
-include(FetchContent)
-FetchContent_Declare(
-  grpc
-  GIT_REPOSITORY https://github.com/grpc/grpc.git
-  GIT_TAG        v1.38.1)
-FetchContent_MakeAvailable(grpc)
+enable_language(CUDA)
+set(CUDA_ATTACH_VS_BUILD_RULE_TO_CUDA_FILE ON)
+set(BUILD_SHARED_LIBS ON)
+set(CUDA_SEPARABLE_COMPILATION ON)
+# set(CMAKE_CUDA_ARCHITECTURES "80")
+# set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} -gencode arch=compute_80,code=sm_80)
+set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} -std=c++17)
 
-# Since FetchContent uses add_subdirectory under the hood, we can use
-# the grpc targets directly from this build.
+cuda_add_library("cudasleep"
+  CUDASleep.cu
+  # OPTIONS -arch compute_80
+)
+# set_property(TARGET "cudasleep" PROPERTY CXX_STANDARD 17)
+
+# TARGET_LINK_LIBRARIES("cudasleep" ${CUDA_LIBRARIES})
+
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
+# Update submodules as needed
+    option(GIT_SUBMODULE "Check submodules during build" ON)
+    if(GIT_SUBMODULE)
+        message(STATUS "Submodule update")
+        execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                        RESULT_VARIABLE GIT_SUBMOD_RESULT)
+        if(NOT GIT_SUBMOD_RESULT EQUAL "0")
+            message(FATAL_ERROR "git submodule update --init --recursive failed with ${GIT_SUBMOD_RESULT}, please checkout submodules")
+        endif()
+    endif()
+endif()
+
+add_subdirectory(grpc)
 set(_PROTOBUF_LIBPROTOBUF libprotobuf)
 set(_REFLECTION grpc++_reflection)
 set(_PROTOBUF_PROTOC $<TARGET_FILE:protoc>)
@@ -55,22 +77,27 @@ add_custom_command(
 
 message(STATUS "PYTHON_LIBRARY = ${PYTHON_LIBRARY}")
 
-# dependencies
-set(Python_ADDITIONAL_VERSIONS 3.9)
-find_package(PythonInterp 3.9 REQUIRED)
-find_package(PythonLibs 3.9 REQUIRED)
+# # dependencies
+# set(Python_ADDITIONAL_VERSIONS 3.9)
+# find_package(PythonInterp 3.9 REQUIRED)
+# find_package(PythonLibs 3.9 REQUIRED)
 
+# find_package(Python COMPONENTS Interpreter Development)
+# message("Python_FOUND:${Python_FOUND}")
+# message("Python_VERSION:${Python_VERSION}")
+# message("Python_Development_FOUND:${Python_Development_FOUND}")
+# message("Python_LIBRARIES:${Python_LIBRARIES}")
 
-find_package(Python COMPONENTS Interpreter Development)
-message("Python_FOUND:${Python_FOUND}")
-message("Python_VERSION:${Python_VERSION}")
-message("Python_Development_FOUND:${Python_Development_FOUND}")
-message("Python_LIBRARIES:${Python_LIBRARIES}")
-
-include_directories(${PYTHON_INCLUDE_DIRS})
+# include_directories(${PYTHON_INCLUDE_DIRS})
 
 # Include generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
+
+include_directories("$ENV{HOME}/nfsnccl/include")
+link_directories("$ENV{HOME}/nfsnccl/lib")
+
+include_directories("$ENV{HOME}/nfsnccl/include")
+link_directories("$ENV{HOME}/nfsnccl/lib")
 
 # dp_grpc_proto
 add_library(dp_grpc_proto
@@ -91,19 +118,19 @@ find_package(HDF5 COMPONENTS C CXX HL REQUIRED)
 link_directories( ${HDF5_LIBRARY_DIRS} )
 include_directories( ${HDF5_INCLUDE_DIRS} )
 
-  # Linking info for runtime.
+# Linking info for runtime.
 add_executable(runtime
-  "runtime.cpp" "runnableModule.cpp" "taskManager.cpp" "logger.cpp" 
-  "communication.cpp" "rpcService.cpp" "streamingDataset.cpp"
-  "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" )
-
+  "runtime.cpp" "runnableModule.cpp" "JobContext.cpp" "logger.cpp"
+  "communication.cpp" "rpcService.cpp" "GraphPieces.cpp" "BeTask.cpp" "streamingDataset.cpp"
+  "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" "cifar10.cpp" "dataset.cpp" "GradSync.cpp")
 target_link_libraries(runtime
   dp_grpc_proto
-  ${TORCH_LIBRARIES}
-  ${PYTHON_LIBRARIES}
-  ${HDF5_CXX_LIBRARIES}
+  cudasleep
+  absl::flags absl::flags_parse
   ${_REFLECTION}
   ${_GRPC_GRPCPP}
-  ${_PROTOBUF_LIBPROTOBUF})
+  ${_PROTOBUF_LIBPROTOBUF}
+  ${TORCH_LIBRARIES}
+  ${HDF5_CXX_LIBRARIES})
 
 set_property(TARGET runtime PROPERTY CXX_STANDARD 17)

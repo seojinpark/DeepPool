@@ -239,9 +239,7 @@ int main(int argc, char** argv) {
 
   // std::exit(0);
 
-  RuntimeContext_params ctx_params;
-  parse_args(&ctx_params, argc, argv);
-  RuntimeContext ctx(ctx_params);
+  RuntimeContext ctx;
   rtctx = &ctx;
   ctx.shutdownRequested = false;
   parse_args(ctx, argc, argv);
