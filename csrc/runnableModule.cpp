@@ -22,11 +22,13 @@
 #include "utils.h"
 #include "communication.h"
 #include "tracer.h"
+#include <string>
 
 using torch::autograd::Variable;
 using torch::autograd::AutogradContext;
 using torch::autograd::variable_list;
 
+// #define TIME_COLLECTIVES
 static uint64_t bytes_inflight = 0;
 static std::vector<torch::Tensor> pending_grads;
 
@@ -38,6 +40,16 @@ TsrXferFunc::forward(AutogradContext* ctx, Variable x, TsrXfer* xfer)
 {
   ctx->saved_data["xfer"] = reinterpret_cast<int64_t>(xfer);
   DP_LOG(DEBUG, "TsrXferFunc::forward entered.. type: %d", xfer->type);
+
+  #ifdef TIME_COLLECTIVES
+  CUDA_API_CALL(cudaSetDevice(rtctx->device));
+
+  async = false;
+  xfer->elapsed_milliseconds = 0;
+
+  CUDA_API_CALL(cudaEventRecord(xfer->start_time, ((CommunicationHandlerNCCL*)xfer->commHandler)->getCommStream()));
+  CUDA_API_CALL(cudaEventSynchronize(xfer->start_time));
+  #endif
 
   if (xfer->type == TsrXfer::Send) {
     std::vector<torch::Tensor> splittedTsrs =
@@ -54,6 +66,8 @@ TsrXferFunc::forward(AutogradContext* ctx, Variable x, TsrXfer* xfer)
 
       xfer->commHandler->send(tsr, tag, dest, /*async*/ true);
     }
+    if (rtctx->profile && rtctx->profile_comms)
+      ((CommunicationHandlerNCCL*)xfer->commHandler)->sync();
     xfer->commHandler->comm_end();
     return splittedTsrs[i];
   }
@@ -89,6 +103,15 @@ TsrXferFunc::forward(AutogradContext* ctx, Variable x, TsrXfer* xfer)
     DP_LOG(DEBUG, "Concating %lu tensors", tsrList.size());
     auto concated = torch::cat(tsrList, xfer->splitCatDim);
     DP_LOG(DEBUG, "Concated tensor: %s", tsrSizeToStr(concated).c_str());
+
+    #ifdef TIME_COLLECTIVES
+    // ((CommunicationHandlerNCCL*)xfer->commHandler)->sync();
+    CUDA_API_CALL(cudaEventRecord(end_time, ((CommunicationHandlerNCCL*)xfer->commHandler)->getCommStream()));
+    CUDA_API_CALL(cudaEventSynchronize(end_time));
+    CUDA_API_CALL(cudaEventElapsedTime(&elapsed_milliseconds, start_time, end_time));
+    std::cout << "Recv time: " << elapsed_milliseconds << " ms" << std::endl;
+    #endif
+
     return concated;
   } else {
     DP_LOG(ERROR, "xfer type is %d, which is not supported.", xfer->type);
@@ -180,6 +203,7 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
   , initialBatchSize(layersInJson[0]["config"][0])
   , commHandler(commHandler)
   , device(device)
+  , lossfn((LossFunctions)spec["lossfn"].get<int>())
   // , leavesForBackward()
   // , fpCtx(layersInJson)
   , layers()
@@ -210,8 +234,7 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
     if (name == "concat") {
       specialModule = SpecialModuleTypes::CONCAT;
     }
-    torch::jit::Module module = torch::jit::load(std::string(rtctx->homedir) +
-        "/DeepPoolRuntime/" + moduleLoc);
+    torch::jit::Module module = torch::jit::load("/DeepPool/" + moduleLoc);
     DP_LOG(DEBUG, " layer's module is loaded.");
     if (name == "concat") {
       DP_LOG(DEBUG, " layer is concat.");
@@ -220,7 +243,12 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
     }
 
     module.to(device);
-    module.train();
+    // if (name != "input") {
+      // module.detach();
+    // }
+    // else{
+    //   module.train();
+    // }
     DP_LOG(DEBUG, " layer's module is moved to device and set for train mode.");
 
     int layerLocalBatch = ldsc["config"][0].get<int>();
@@ -389,12 +417,28 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
   std::vector<int64_t> inputSizes;
   inputSizes.push_back(initialBatchSize);
   for (int size : layersInJson[0]["inputDim"]) inputSizes.push_back(size);
-  auto inputFn = [=] { return torch::randn(inputSizes); };
-  input_pipeline = TensorGeneratorPipeline(inputFn);
-  int targetCount = layersInJson.back()["config"][0];
-  auto targetOpts = torch::TensorOptions().dtype(torch::kInt64);
-  auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1000, {targetCount}, targetOpts); };
-  target_pipeline = TensorGeneratorPipeline(targetFn);
+  if (lossfn == LossFunctions::CrossEntropyLoss){
+    auto inputsOpts = torch::TensorOptions().dtype(torch::kInt32);
+    auto inputFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, inputsOpts).detach(); };
+    input_pipeline = TensorGeneratorPipeline(inputFn);
+  }
+  else{
+    auto inputFn = [=] { return torch::randn(inputSizes); };
+    input_pipeline = TensorGeneratorPipeline(inputFn);
+  }
+
+  if (lossfn == LossFunctions::CrossEntropyLoss){
+    int targetCount = layersInJson.back()["config"][0];
+    auto targetOpts = torch::TensorOptions().dtype(torch::kInt32);
+    auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, targetOpts); };
+    target_pipeline = TensorGeneratorPipeline(targetFn);
+  }
+  else{
+    int targetCount = layersInJson.back()["config"][0];
+    auto targetOpts = torch::TensorOptions().dtype(torch::kInt64);
+    auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1000, {targetCount}, targetOpts); };
+    target_pipeline = TensorGeneratorPipeline(targetFn);
+  }
 }
 
 /**
@@ -460,6 +504,7 @@ RunnableModule::forwardAStep(bool captureLayer)
   DP_LOG(DEBUG, "layerQ size: %d", (int)layerQ.size());
   Layer* layer = layerQ.front();
   layerQ.pop_front();
+  layer->layerIters++;
 
   // TODO: potentially we can make track if the cuda kernel is finished
   // or probably finished.
@@ -499,7 +544,9 @@ RunnableModule::forwardAStep(bool captureLayer)
         if (layer->detachInput) {
           // detachTimer.start();
           layer->detachedInputs[prevLayer->id] = prevOut.detach();
-          layer->detachedInputs[prevLayer->id].requires_grad_();
+          if (prevLayer->moduleName.find("input") == std::string::npos) {
+            layer->detachedInputs[prevLayer->id].requires_grad_();
+          }
           prevOut = layer->detachedInputs[prevLayer->id];
           // detachTimer.stop();
           DP_LOG(DEBUG, "Detached input tensor");
@@ -508,6 +555,7 @@ RunnableModule::forwardAStep(bool captureLayer)
       }
       
       for (auto& plidInputPair : inputsByPid) {
+        // std::cout << "Adding to inputVec: " << tsrSizeToStr(plidInputPair.second).c_str() << std::endl;
         DP_LOG(DEBUG, "Adding to inputVec: %s.", tsrSizeToStr(plidInputPair.second).c_str());
         inputVec.push_back(plidInputPair.second);
       }
@@ -522,15 +570,19 @@ RunnableModule::forwardAStep(bool captureLayer)
     } else {
       std::vector<torch::jit::IValue> ivalVec;
       ivalVec.push_back(inputVec[0]);
+      // std::cout << layer->moduleName << std::endl;
+      if (layer->moduleName.find("add{") != std::string::npos) 
+        ivalVec.push_back(inputVec[1]);
 
       if (captureLayer) { // Used layer time profiling.
         c10::cuda::device_synchronize();
+
+        at::cuda::CUDAStreamGuard stream_guard(rtctx->torch_stream);
         layer->moduleFwGraph.capture_begin();
-      }
 
-      output = layer->module.forward(ivalVec).toTensor();
+        // c10::cuda::setCurrentCUDAStream(rtctx->torch_stream);
+        output = layer->module.forward(ivalVec).toTensor();
 
-      if (captureLayer) { // Used layer time profiling.
         layer->moduleFwGraph.capture_end();
         c10::cuda::device_synchronize();
         CpuTimer timer("fwTimer");
@@ -544,27 +596,42 @@ RunnableModule::forwardAStep(bool captureLayer)
         layer->avgLayerTime = static_cast<double>(timer.avgMicros())
                               / 1000.0 / repeat;
         layer->fwUsec = timer.avgMicros() / repeat;
+
+      }
+      else{
+        // c10::cuda::setCurrentCUDAStream(rtctx->torch_stream);
+        output = layer->module.forward(ivalVec).toTensor();
       }
       DP_LOG(DEBUG, "module.forward called.");
     }
 
     if (rtctx->profile) {
+      // std::cout << "profile fpTimer->record()" << std::endl;
       layer->fpTimer->record();
     }
 
     if (layer->detachOutput) {
+      // std::cout << layer->moduleName.c_str() << std::endl;
       layer->outputBeforeDetach = output;
       output = output.detach();
-      output.requires_grad_();
+      if (layer->moduleName.find("input") == std::string::npos) {
+        output.requires_grad_();
+      }
     }
 
     // Send samples after running this layer.
     DP_LOG(DEBUG, "len(layer->xferOuts): %lu", layer->xferOuts.size());
     layer->outputsAfterXfer.clear();
+    if (rtctx->profile && rtctx->profile_comms && layer->xferOuts.size() > 0) {
+        layer->commTimer->record();
+    }
     for (TsrXfer& xfer : layer->xferOuts) {
       torch::Tensor remainingOutput = TsrXferFunc::apply(output, &xfer);
       layer->outputsAfterXfer[xfer.nextLayerId] = remainingOutput;
       DP_LOG(DEBUG, "Split & sent samples.");
+    }
+    if (rtctx->profile && rtctx->profile_comms && layer->xferOuts.size() > 0 && layer->xferIns.size() == 0) {
+      layer->commTimer->saveAndReset();
     }
     layer->output = output;
 
@@ -576,7 +643,9 @@ RunnableModule::forwardAStep(bool captureLayer)
     DP_LOG(DEBUG, "Layer %d is not active.", layer->id);
     idleCtxPtr->processLayerTime(layer->fwUsec, false);
   }
-
+  if (rtctx->profile && rtctx->profile_comms && layer->xferIns.size() > 0 && layer->xferOuts.size() == 0) {
+        layer->commTimer->record();
+  }
   // Recv parts of output processed by another GPU.
   for (TsrXfer& xfer : layer->xferIns) {
     //TODO: assert that next layer is active.
@@ -602,7 +671,9 @@ RunnableModule::forwardAStep(bool captureLayer)
     DP_LOG(DEBUG, "Received (nextLayer: %d) & concatenated samples. %s",
         xfer.nextLayerId, tsrSizeToStr(remainingOutput).c_str());
   }
-  
+  if (rtctx->profile && rtctx->profile_comms && layer->xferIns.size() > 0) {
+    layer->commTimer->saveAndReset();
+  }
   layer->status = LayerStatus::PENDING_BP;
   DP_LOG(DEBUG, " ** Layer %d is processed.", layer->id);
   
@@ -634,9 +705,19 @@ RunnableModule::forwardAStep(bool captureLayer)
 void
 RunnableModule::loss()
 {
-  if (fpOutput.defined()) {    
-    fpLoss = torch::nll_loss(fpOutput, fpTargets);
-    // DP_LOG(DEBUG, "fpLoss: %s", tsrToStr(fpLoss).c_str());
+  if (fpOutput.defined()) { 
+    at::Tensor fpLoss;
+    if(lossfn == LossFunctions::CrossEntropyLoss){
+      auto batch_size = globalBatchSize;
+      auto shift_logits = fpOutput.index({torch::indexing::Ellipsis, torch::indexing::Slice(torch::indexing::None, -1), torch::indexing::Slice()}).contiguous();
+      auto shift_labels = fpTargets.index({torch::indexing::Ellipsis, torch::indexing::Slice(1,torch::indexing::None)}).contiguous();
+      auto loss_fct = torch::nn::CrossEntropyLoss();
+      fpLoss = loss_fct(shift_logits.view({-1, shift_logits.size(-1)}), shift_labels.view({-1}).to(torch::kLong));
+    }
+    else{
+      fpLoss = torch::nll_loss(fpOutput, fpTargets);
+      // DP_LOG(DEBUG, "fpLoss: %s", tsrToStr(fpLoss).c_str());
+    }
     fpLoss.backward();
     DP_LOG(DEBUG, "fpLoss.backward() done. ");
     // idleCtxPtr->processLayerTime(1000, true);
@@ -662,6 +743,10 @@ RunnableModule::backwardAStep(bool captureLayer)
   // TODO: potentially we can make track if the cuda kernel is finished
   // or probably finished.
   if (layer->status == LayerStatus::PENDING_FP) {
+    if (layerQ.empty()) {
+      DP_LOG(DEBUG, "no more layers to process.");
+      return COMPLETED;
+    }
     DP_LOG(DEBUG, "%d-th layer is processed again.", layer->id);
     return IN_PROGRESS;
   }
@@ -721,7 +806,7 @@ RunnableModule::backwardAStep(bool captureLayer)
                 tsrSizeToStr(layer->outputsAfterXfer[nextLayerPtr->id]).c_str(),
                 tsrSizeToStr(grad).c_str());
             layer->outputsAfterXfer[nextLayerPtr->id].backward(grad, retainGraph);
-          } else if (layer->active) {
+          } else if (layer->active && layer->moduleName.find("input") == std::string::npos) {
             DP_LOG(DEBUG, "Backward on output:%s gradIn:%s", 
                 tsrSizeToStr(layer->output).c_str(), tsrSizeToStr(grad).c_str());
             layer->output.backward(grad, retainGraph);
@@ -752,7 +837,7 @@ RunnableModule::backwardAStep(bool captureLayer)
         }
       }
 
-      if (layer->active && layer->detachOutput) {
+      if (layer->active && layer->detachOutput && layer->moduleName.find("input") == std::string::npos) {
         DP_LOG(DEBUG, "  output was detached previously. Invoking backward on outputBeforeDetach.");
         layer->outputBeforeDetach.backward(layer->output.grad());
       }
@@ -874,6 +959,7 @@ RunnableModule::initProfileTimers(CudaTimer* ct_load, CudaTimer* ct_loss) {
     for (auto& layer : layers) {
       layer.fpTimer = std::make_unique<CudaTimer>(ct_load);
       layer.bpTimer = std::make_unique<CudaTimer>(ct_loss);
+      layer.commTimer = std::make_unique<CudaSelfTimer>();
     }
   }
 }
@@ -885,8 +971,15 @@ void
 RunnableModule::resetProfileTimers() {
   if (rtctx->profile) {
     for (auto& layer : layers) {
-      layer.fpTimer->saveAndReset();
-      layer.bpTimer->saveAndReset();
+      if (!isGraphCapturing){
+        layer.fpTimer->saveAndReset();
+        layer.bpTimer->saveAndReset();
+      }
+      else{
+        layer.fpTimer->reset();
+        layer.bpTimer->reset();
+      }
+      // layer.commTimer->saveAndReset();
     }
   }
 }
@@ -910,40 +1003,64 @@ RunnableModule::printLayerInGraphTimes() {
  * Reset timers for profiling each layer. Happens every iteration.
  */
 void
-RunnableModule::printProfileTimers(int warmupIters) {
+RunnableModule::printProfileTimers(int warmupIters, FILE* pFile, LayerTimingStage printStage) {
   if (!rtctx->profile) {
     return;
   }
 
-  auto getName2LayerTime = [&] (float percentile) {
+  auto getName2LayerTime = [&] (float percentile, LayerTimingStage stage) {
     std::vector<std::pair<float, const char*> > fpTimes;
     std::vector<std::pair<float, const char*> > bpTimes;
+    std::vector<std::pair<float, const char*> > commTimes;
     for (auto& layer : layers) {
       if (!layer.detachInput) {
         continue;
       }
-      fpTimes.push_back(std::make_pair<float, const char*>(
-          layer.fpTimer->getPercentile(percentile, warmupIters),
-          layer.moduleName.c_str()));
-      bpTimes.push_back(std::make_pair<float, const char*>(
-          layer.bpTimer->getPercentile(percentile, warmupIters),
-          layer.moduleName.c_str()));
+      if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::FP)
+        fpTimes.push_back(std::make_pair<float, const char*>(
+            layer.fpTimer->getPercentile(percentile, warmupIters),
+            layer.moduleName.c_str()));
+      if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::BP)
+        bpTimes.push_back(std::make_pair<float, const char*>(
+            layer.bpTimer->getPercentile(percentile, warmupIters),
+            layer.moduleName.c_str()));
+      if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::COMMS)
+        commTimes.push_back(std::make_pair<float, const char*>(
+            layer.commTimer->getPercentile(percentile, warmupIters),
+            layer.moduleName.c_str()));
     }
-    std::sort(fpTimes.begin(), fpTimes.end());
-    std::sort(bpTimes.begin(), bpTimes.end());
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::FP)
+      std::sort(fpTimes.begin(), fpTimes.end());
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::BP)
+      std::sort(bpTimes.begin(), bpTimes.end());
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::COMMS)
+      std::sort(commTimes.begin(), commTimes.end());
 
     float lastTime = 0;
     std::unordered_map<const char*, float> nameToTime;
-    for (auto& timeName : fpTimes) {
-      float layerTime = timeName.first - lastTime;
-      nameToTime[timeName.second] = layerTime;
-      lastTime = timeName.first;
+
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::FP){
+      for (auto& timeName : fpTimes) {
+        float layerTime = timeName.first - lastTime;
+        nameToTime[timeName.second] = layerTime;
+        lastTime = timeName.first;
+      }
     }
-    lastTime = 0;
-    for (auto& timeName : bpTimes) {
-      float layerTime = timeName.first - lastTime;
-      nameToTime[timeName.second] += layerTime;
-      lastTime = timeName.first;
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::BP){
+      lastTime = 0;
+      for (auto& timeName : bpTimes) {
+        float layerTime = timeName.first - lastTime;
+        nameToTime[timeName.second] += layerTime;
+        lastTime = timeName.first;
+      }
+    }
+    if (stage == LayerTimingStage::ALL || stage == LayerTimingStage::COMMS){
+      lastTime = 0;
+      for (auto& timeName : commTimes) {
+        float layerTime = timeName.first - lastTime;
+        nameToTime[timeName.second] += layerTime;
+        lastTime = timeName.first;
+      }
     }
     return nameToTime;
   };
@@ -951,6 +1068,7 @@ RunnableModule::printProfileTimers(int warmupIters) {
   // Get average.
   std::vector<std::pair<float, const char*> > fpTimes;
   std::vector<std::pair<float, const char*> > bpTimes;
+  std::vector<std::pair<float, const char*> > commTimes;
   for (auto& layer : layers) {
     if (!layer.detachInput) {
       continue;
@@ -959,16 +1077,21 @@ RunnableModule::printProfileTimers(int warmupIters) {
         layer.fpTimer->getAvg(warmupIters), layer.moduleName.c_str()));
     bpTimes.push_back(std::make_pair<float, const char*>(
         layer.bpTimer->getAvg(warmupIters), layer.moduleName.c_str()));
+    commTimes.push_back(std::make_pair<float, const char*>(
+        layer.commTimer->getAvg(warmupIters), layer.moduleName.c_str()));
   }
   std::sort(fpTimes.begin(), fpTimes.end());
   std::sort(bpTimes.begin(), bpTimes.end());
+  std::sort(commTimes.begin(), commTimes.end());
   // printf("## Forward time\n");
   float lastTime = 0;
-  std::unordered_map<const char*, float> nameToTime;
+  std::unordered_map<const char*, float> nameToTimeFP;
+  std::unordered_map<const char*, float> nameToTimeBP;
+  std::unordered_map<const char*, float> nameToTimeComms;
   for (auto& timeName : fpTimes) {
     float layerTime = timeName.first - lastTime;
     // printf("%110s  %.3f\n", timeName.second, layerTime);
-    nameToTime[timeName.second] = layerTime;
+    nameToTimeFP[timeName.second] = layerTime;
     lastTime = timeName.first;
   }
   // printf("## Backward time\n");
@@ -976,24 +1099,97 @@ RunnableModule::printProfileTimers(int warmupIters) {
   for (auto& timeName : bpTimes) {
     float layerTime = timeName.first - lastTime;
     // printf("%110s  %.3f\n", timeName.second, layerTime);
-    nameToTime[timeName.second] += layerTime;
+    nameToTimeBP[timeName.second] += layerTime;
+    lastTime = timeName.first;
+  }
+
+  lastTime = 0;
+  for (auto& timeName : commTimes) {
+    float layerTime = timeName.first - lastTime;
+    // printf("%110s  %.3f\n", timeName.second, layerTime);
+    nameToTimeComms[timeName.second] += layerTime;
     lastTime = timeName.first;
   }
 
   
-  std::unordered_map<const char*, float> p50Times = getName2LayerTime(50);
-  std::unordered_map<const char*, float> p90Times = getName2LayerTime(90);
-  std::unordered_map<const char*, float> p99Times = getName2LayerTime(99);
+  std::unordered_map<const char*, float> p50TimesFP = getName2LayerTime(50, LayerTimingStage::FP);
+  std::unordered_map<const char*, float> p90TimesFP = getName2LayerTime(90, LayerTimingStage::FP);
+  std::unordered_map<const char*, float> p99TimesFP = getName2LayerTime(99, LayerTimingStage::FP);
   
-  // printf("## Sum\n");
-  printf("%110s  avg(ms)    p50     p90     p99\n", "#config");
-  float sum = 0;
-  for (auto& timeName : fpTimes) {
-    const char* name = timeName.second;
-    float avgT = nameToTime[name];
-    sum += avgT;
-    printf("%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50Times[name],
-           p90Times[name], p99Times[name]);
+  std::unordered_map<const char*, float> p50TimesBP = getName2LayerTime(50, LayerTimingStage::BP);
+  std::unordered_map<const char*, float> p90TimesBP = getName2LayerTime(90, LayerTimingStage::BP);
+  std::unordered_map<const char*, float> p99TimesBP = getName2LayerTime(99, LayerTimingStage::BP);
+  
+  std::unordered_map<const char*, float> p50TimesCOMM = getName2LayerTime(50, LayerTimingStage::COMMS);
+  std::unordered_map<const char*, float> p90TimesCOMM = getName2LayerTime(90, LayerTimingStage::COMMS);
+  std::unordered_map<const char*, float> p99TimesCOMM = getName2LayerTime(99, LayerTimingStage::COMMS);
+  
+  if (printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::FP){
+    // printf("## Sum\n");
+    printf("%110s  avg(ms)    p50     p90     p99\n", "#config");
+    float sum = 0;
+    for (auto& timeName : fpTimes) {
+      const char* name = timeName.second;
+      float avgT = nameToTimeFP[name];
+      sum += avgT;
+      printf("%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50TimesFP[name],
+            p90TimesFP[name], p99TimesFP[name]);
+    }
+    printf("%100s  %.3f\n", "SUM(avg)", sum);
+    printf("\n\n\n\n");
   }
-  printf("%100s  %.3f\n", "SUM(avg)", sum);
+
+  // FILE * pFile;
+  // pFile = fopen(format("%s_timings.txt", mainJob->name.c_str()).c_str(),"w");
+  if (pFile != NULL){
+    float sum = 0;
+    if (!rtctx->profile_comms && printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::FP){
+      fprintf (pFile, "%100s LAYER FP  avg(ms)    p50     p90     p99\n", "#config");
+      for (auto& timeName : fpTimes) {
+        const char* name = timeName.second;
+        float avgT = nameToTimeFP[name];
+        sum += avgT;
+        fprintf(pFile, "%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50TimesFP[name],
+              p90TimesFP[name], p99TimesFP[name]);
+      }
+      fprintf(pFile, "%100s  %.3f\n", "SUM(avg)", sum);
+      fprintf(pFile, "\n\n\n\n");
+      // fclose (pFile);
+    }
+    else if(printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::FP)
+      fprintf (pFile, "Must skip layer timings when measuing comms\n");
+
+    sum = 0;
+    if (!rtctx->profile_comms && printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::BP){
+      fprintf (pFile, "%100s LAYER BP  avg(ms)    p50     p90     p99\n", "#config");
+      for (auto& timeName : bpTimes) {
+        const char* name = timeName.second;
+        float avgT = nameToTimeBP[name];
+        sum += avgT;
+        fprintf(pFile, "%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50TimesBP[name],
+              p90TimesBP[name], p99TimesBP[name]);
+      }
+      fprintf(pFile, "%100s  %.3f\n", "SUM(avg)", sum);
+      fprintf(pFile, "\n\n\n\n");
+      // fclose (pFile);
+    }
+    else if(printStage == LayerTimingStage::ALL || printStage == LayerTimingStage::BP)
+      fprintf (pFile, "Must skip layer timings when measuing comms\n");
+
+    if (printStage == LayerTimingStage::COMMS){
+      fprintf (pFile, "%100s COMMS avg(ms)    p50     p90     p99\n", "#config");
+      sum = 0;
+      for (auto& timeName : commTimes) {
+        const char* name = timeName.second;
+        float avgT = nameToTimeComms[name];
+        sum += avgT;
+        fprintf(pFile, "%110s  %6.3f  %6.3f  %6.3f  %6.3f\n", name, avgT, p50TimesCOMM[name],
+              p90TimesCOMM[name], p99TimesCOMM[name]);
+      }
+      fprintf(pFile, "%100s  %.3f\n", "SUM(avg)", sum);
+      fprintf(pFile, "\n\n\n\n");
+      // fclose (pFile);
+    }
+  }
+    
 }

@@ -69,6 +69,8 @@ RuntimeServiceImpl::InitCommNCCL(ServerContext* context,
   int msg_type = request->msg_type();
   int group_size = request->group_size();
 
+  CUDA_API_CALL(cudaSetDevice(rtctx->device));
+
   if (msg_type == 0) { // Generate comm group ID
     if (rtctx->rank == 0) { // Only rank 0 generates ID
       rtctx->ncclGroupSize = group_size;

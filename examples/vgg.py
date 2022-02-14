@@ -562,7 +562,8 @@ if __name__ == "__main__":
         if sys.argv[3] == "DP":
             main(int(sys.argv[1]), int(sys.argv[2]), dataParallelBaseline=True, use_be=use_be)
         else:
-            main(int(sys.argv[1]), int(sys.argv[2]), amplificationLimit=float(sys.argv[3]), use_be=use_be)
+            simResultFilename = "%s_%s_b%d_lim%2.1f_sim.data" % ("inception", "MP", int(sys.argv[2]), float(sys.argv[3]))
+            main(int(sys.argv[1]), int(sys.argv[2]), amplificationLimit=float(sys.argv[3]), use_be=use_be, simResultFilename=simResultFilename)
     elif len(sys.argv) == 2:
         print("Run all configs")
         runAllConfigs("vgg16", sys.argv[1])

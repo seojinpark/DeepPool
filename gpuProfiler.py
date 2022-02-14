@@ -123,7 +123,7 @@ class GpuProfiler:
         iter_to_capture_end = 53
         with torch.autograd.profiler.emit_nvtx():
             iterationCount = 0
-            for batch_idx, (data, target) in enumerate(train_loader):        
+            for batch_idx, (data, target) in enumerate(train_loader):  
                 start_time = time.time()
             
                 ev_zero = torch.cuda.Event(enable_timing=True)
@@ -262,6 +262,7 @@ class GpuProfiler:
         def __init__(self, input_size, length, num_classes=1000):
             self.tensor = Variable(torch.rand(input_size)).type(torch.FloatTensor)
             self.target = torch.Tensor(1).random_(0, num_classes)[0].type(torch.LongTensor)
+            self.target = torch.rand(64, 15, 15).type(torch.LongTensor)
             self.length = length
         def __getitem__(self, index):
             return self.tensor, self.target

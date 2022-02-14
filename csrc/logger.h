@@ -57,7 +57,7 @@ class Logger {
    * the given level.
    */
   bool isLogging(LogLevel level) {
-      return (level <= logLevel);
+      return (level <= LogLevel::NOTICE);
   }
 
  private:

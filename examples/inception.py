@@ -716,7 +716,7 @@ def runStrongScalingBench():
     inputSize = (3,299,299)
     model = Inception3(aux_logits=False)
 
-    fakeInputSize = (16,3,299,299)
+    fakeInputSize = (32,3,299,299)
     fakeInput = torch.zeros(fakeInputSize)
     traced = torch.jit.trace(model, fakeInput)
     torch.jit.save(traced, "modules/inception.pt")
@@ -739,12 +739,13 @@ if __name__ == "__main__":
         use_be = len(sys.argv) > 4 and int(sys.argv[4]) == 1
         gpuCount = int(sys.argv[1])
         globalBatchSize = int(sys.argv[2])
-        # simResultFilename = "%s_%s_b%d_lim%2.1f_sim.data" % ("inception", "MP", globalBatchSize, amplificationLimit)
         if sys.argv[3] == "DP":
-            main(gpuCount, globalBatchSize, dataParallelBaseline=True, use_be=use_be)
+            simResultFilename = "%s_%s_b%d_sim.data" % ("inception", "DP", globalBatchSize)
+            main(gpuCount, globalBatchSize, dataParallelBaseline=True, use_be=use_be, simResultFilename=simResultFilename)
         else:
             amplificationLimit = float(sys.argv[3])
-            main(gpuCount, globalBatchSize, amplificationLimit, use_be=use_be)
+            simResultFilename = "%s_%s_b%d_lim%2.1f_sim.data" % ("inception", "MP", globalBatchSize, amplificationLimit)
+            main(gpuCount, globalBatchSize, amplificationLimit, use_be=use_be, simResultFilename=simResultFilename)
             # main(gpuCount, globalBatchSize, amplificationLimit, simResultFilename = simResultFilename, use_be=use_be)
     elif len(sys.argv) == 2:
         print("Run all configs")

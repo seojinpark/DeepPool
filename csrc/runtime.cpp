@@ -110,7 +110,7 @@ void ncclCommTest(RuntimeContext* rtctx) {
   commHandler->testAllReduce();
 }
 
-void parse_args(RuntimeContext* ctx, int argc, char** argv) {
+void parse_args(RuntimeContext_params* ctx, int argc, char** argv) {
   // parser.add_argument("--coordinatorAddr", type=str, default="localhost:12340",
   //                     help="IP:port to the cluster coordinator")
   // parser.add_argument("--myAddr", type=str, default="localhost:1234",
@@ -180,7 +180,7 @@ void parse_args(RuntimeContext* ctx, int argc, char** argv) {
         break;
       case 'd':
         ctx->device = atoi(optarg);
-        ctx->c10dev = c10::Device(c10::DeviceType::CUDA, ctx->device);
+        // ctx->c10dev = c10::Device(c10::DeviceType::CUDA, ctx->device);
         break;
       case 'b':
         ctx->c10dBackend = optarg;
@@ -224,10 +224,11 @@ void parse_args(RuntimeContext* ctx, int argc, char** argv) {
 RuntimeContext *rtctx; /* global rtctx variable */
 
 int main(int argc, char** argv) {
-  RuntimeContext ctx;
+  RuntimeContext_params ctx_params;
+  parse_args(&ctx_params, argc, argv);
+  RuntimeContext ctx(ctx_params);
   rtctx = &ctx;
   ctx.shutdownRequested = false;
-  parse_args(&ctx, argc, argv);
   
   std::string logFilePath = format("%scpprt%d.out", ctx.logdir, ctx.rank);
   Logger::get().setLogFile(logFilePath.c_str(), true);
@@ -264,7 +265,7 @@ int main(int argc, char** argv) {
     DP_LOG(DEBUG, "NCCL commBackend is used. Waiting for InitCommNCCL.");
     while (!ctx.ncclCommReady.load(std::memory_order_relaxed)) {}
     DP_LOG(DEBUG, "InitCommNCCL done. Running test now.");
-    ncclCommTest(&ctx);
+    // ncclCommTest(&ctx);
   }
 
   taskMngr.addBgJob();

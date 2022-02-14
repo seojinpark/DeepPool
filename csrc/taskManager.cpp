@@ -458,29 +458,71 @@ TaskManager::printJobStatistics(JobContext* job)
   size_t warmupIters = 200;
   // mainJob->model->printProfileTimers(warmupIters);
   job->model->printLayerInGraphTimes();
-  size_t totiters = job->totiters - warmupIters;
-  using msec = std::chrono::duration<double, std::milli>;
-  double elapsed_ms = std::chrono::duration_cast<msec>(job->end - job->start).count();
-  double total_iter_ms = elapsed_ms / (double)totiters;
-  double total_iter_ps = 1e3 / total_iter_ms;
-  double be_img_ps = job->be_img_end - job->be_img_start;
-  be_img_ps = 1e3 * be_img_ps / elapsed_ms;
-  DP_LOG(NOTICE, "A training job %s is completed (%lu iters, %.2f ms/iter, %.2f iter/s, %.2f be img/s)."
-      " AverageTiming (ms) => zero: %.1f, load:%.1f, fp:%.1f, loss:%.1f, bp:%.1f, opt: %.1f, iter:%.1f"
-      " P50 (ms) => fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f",
-      job->name.c_str(), totiters, total_iter_ms, total_iter_ps, be_img_ps,
-      job->timers[CT_ZERO].getAvg(warmupIters),
-      job->timers[CT_LOAD].getAvg(warmupIters),
-      job->timers[CT_FP].getAvg(warmupIters),
-      job->timers[CT_LOSS].getAvg(warmupIters),
-      job->timers[CT_BP].getAvg(warmupIters),
-      job->timers[CT_OPT].getAvg(warmupIters),
-      job->timers[CT_STOP].getAvg(warmupIters),
-      job->timers[CT_FP].getP50(warmupIters),
-      job->timers[CT_LOSS].getP50(warmupIters),
-      job->timers[CT_BP].getP50(warmupIters),
-      job->timers[CT_STOP].getP50(warmupIters));
-  // DP_LOG(NOTICE, " -- detachTime: %" PRIu64" us", job->model->detachTimer.avgMicros());
+
+  if (!rtctx->profile_comms){
+    FILE * pFile = fopen(format("/DeepPool/%s_rank_%d_ALL_timings.txt", job->name.c_str(), rtctx->rank).c_str(),"w");
+    job->model->printProfileTimers(warmupIters, pFile, LayerTimingStage::ALL);
+    size_t totiters = job->totiters - warmupIters;
+    using msec = std::chrono::duration<double, std::milli>;
+    double elapsed_ms = std::chrono::duration_cast<msec>(job->end - job->start).count();
+    double total_iter_ms = elapsed_ms / (double)totiters;
+    double total_iter_ps = 1e3 / total_iter_ms;
+    double be_img_ps = job->be_img_end - job->be_img_start;
+    be_img_ps = 1e3 * be_img_ps / elapsed_ms;
+    DP_LOG(NOTICE, "A training job %s is completed (%lu iters, %.2f ms/iter, %.2f iter/s, %.2f be img/s)."
+        " AverageTiming (ms) => load:%.1f, fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f"
+        " P50 (ms) => fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f",
+        job->name.c_str(), totiters, total_iter_ms, total_iter_ps, be_img_ps,
+        job->timers[CT_LOAD].getAvg(warmupIters),
+        job->timers[CT_FP].getAvg(warmupIters),
+        job->timers[CT_LOSS].getAvg(warmupIters),
+        job->timers[CT_BP].getAvg(warmupIters),
+        job->timers[CT_STOP].getAvg(warmupIters),
+        job->timers[CT_FP].getP50(warmupIters),
+        job->timers[CT_LOSS].getP50(warmupIters),
+        job->timers[CT_BP].getP50(warmupIters),
+        job->timers[CT_STOP].getP50(warmupIters));
+
+    fprintf (pFile, "A training job %s is completed (%lu iters, %.2f ms/iter, %.2f iter/s, %.2f be img/s)."
+        " AverageTiming (ms) => load:%.1f, fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f"
+        " P50 (ms) => fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f",
+        job->name.c_str(), totiters, total_iter_ms, total_iter_ps, be_img_ps,
+        job->timers[CT_LOAD].getAvg(warmupIters),
+        job->timers[CT_FP].getAvg(warmupIters),
+        job->timers[CT_LOSS].getAvg(warmupIters),
+        job->timers[CT_BP].getAvg(warmupIters),
+        job->timers[CT_STOP].getAvg(warmupIters),
+        job->timers[CT_FP].getP50(warmupIters),
+        job->timers[CT_LOSS].getP50(warmupIters),
+        job->timers[CT_BP].getP50(warmupIters),
+        job->timers[CT_STOP].getP50(warmupIters));
+    fclose (pFile);
+  }
+  else{
+    FILE * pFileComm = fopen(format("/DeepPool/%s_rank_%d_COMMS_timings.txt", job->name.c_str(), rtctx->rank).c_str(),"w");
+    job->model->printProfileTimers(warmupIters, pFileComm, LayerTimingStage::COMMS);
+    size_t totiters = job->totiters - warmupIters;
+    using msec = std::chrono::duration<double, std::milli>;
+    double elapsed_ms = std::chrono::duration_cast<msec>(job->end - job->start).count();
+    double total_iter_ms = elapsed_ms / (double)totiters;
+    double total_iter_ps = 1e3 / total_iter_ms;
+    double be_img_ps = job->be_img_end - job->be_img_start;
+    be_img_ps = 1e3 * be_img_ps / elapsed_ms;
+    fprintf (pFileComm, "A training job %s is completed (%lu iters, %.2f ms/iter, %.2f iter/s, %.2f be img/s)."
+        " AverageTiming (ms) => load:%.1f, fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f"
+        " P50 (ms) => fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f",
+        job->name.c_str(), totiters, total_iter_ms, total_iter_ps, be_img_ps,
+        job->timers[CT_LOAD].getAvg(warmupIters),
+        job->timers[CT_FP].getAvg(warmupIters),
+        job->timers[CT_LOSS].getAvg(warmupIters),
+        job->timers[CT_BP].getAvg(warmupIters),
+        job->timers[CT_STOP].getAvg(warmupIters),
+        job->timers[CT_FP].getP50(warmupIters),
+        job->timers[CT_LOSS].getP50(warmupIters),
+        job->timers[CT_BP].getP50(warmupIters),
+        job->timers[CT_STOP].getP50(warmupIters));
+    fclose (pFileComm);
+  }
 }
 
 /**
@@ -495,6 +537,8 @@ TaskManager::printJobStatistics(JobContext* job)
 int
 TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
 {
+
+  at::cuda::CUDAStreamGuard stream_guard(rtctx->torch_stream);
   if (job->state == JobState::INIT) {
 
     if (be_bsize > 0 && job->totiters == 0) {
@@ -521,18 +565,21 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
       job->epoch++;
     }
     
-    if (job->epoch >= job->epochsToTrain || 
-        (rtctx->profile && job->totiters == job->iters_before_graph_capture)) {
+    if (job->epoch >= job->epochsToTrain ){
+        // (rtctx->profile && job->totiters == job->iters_before_graph_capture)) {
       *jobCompleted = true;
       return 0;
     }
 
+    // if (!job->model->isGraphCapturing)
     job->model->resetProfileTimers();
     for (int tpIdx = CT_NUM_OF_EVENTS - 1; tpIdx >= CT_START; --tpIdx) {
       DP_LOG(DEBUG, "timer.saveAndReset() for %d. recorded:%d", tpIdx, job->timers[tpIdx].isRecorded());
-      job->timers[tpIdx].saveAndReset();
+      if (!job->model->isGraphCapturing)
+        job->timers[tpIdx].saveAndReset();
     }
-    job->timers[CT_START].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_START].record();
     DP_LOG(DEBUG, "JobState::INIT.");
 
     job->model->iterInit();
@@ -542,6 +589,7 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
       if (job->run_with_be && be_bsize > 0) be_controller.Pause();
       c10::cuda::device_synchronize();
       DP_LOG(NOTICE, "Starting capture.");
+      job->model->isGraphCapturing = true;
       job->model->graph.capture_begin();
       job->commHandler->precapture();
     } else if (job->totiters >= rtctx->iters_per_capture + job->iters_before_graph_capture) {
@@ -551,9 +599,10 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     }
 
     job->optimizer->zero_grad();
-    job->timers[CT_ZERO].record();
-
-    job->timers[CT_LOAD].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_ZERO].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_LOAD].record();
     job->state = JobState::FORWARD;
     DP_LOG(DEBUG, "Foward pass is starting soon.");
   } else if (job->state == JobState::FORWARD) {
@@ -578,12 +627,14 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     JobStatus status = job->model->forwardAStep(capture);
 
     if (status == COMPLETED) {
-      job->timers[CT_FP].record();
+      if (!job->model->isGraphCapturing)
+        job->timers[CT_FP].record();
       // TODO: add a loss calculation here? or as another state?
       DP_LOG(DEBUG, "Foward pass is completed. Calculating loss.");
       
       job->model->loss();
-      job->timers[CT_LOSS].record();
+      if (!job->model->isGraphCapturing)
+        job->timers[CT_LOSS].record();
       assert(job->model->layerQ.empty());
       job->model->layerQ.push_back(&job->model->layers.back());
       DP_LOG(DEBUG, "Moving to backward pass.");
@@ -593,24 +644,32 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     DP_LOG(DEBUG, "JobState::BACKWARD.");
     
     bool capture = rtctx->profile && job->totiters == job->iters_before_graph_capture - 5;
+
+    // for (auto & l : job->model->layers) {
+    //   l.status = LayerStatus::PENDING_FP;
+    // }
     JobStatus status = job->model->backwardAStep(capture);
     // TODO: get idle time for backward separately.
     
     if (status == COMPLETED) {
-      job->timers[CT_BP].record();
+      if (!job->model->isGraphCapturing)
+        job->timers[CT_BP].record();
       job->state = JobState::SYNC;
       DP_LOG(DEBUG, "Backward pass is completed. Moving to gradient all-reduce.");
     }
+
   } else if (job->state == JobState::SYNC) {
     DP_LOG(DEBUG, "JobState::SYNC.");
     // DP_LOG(DEBUG, "All-reduce parameter sync is not implemented yet.");
     job->model->gradientSync();
-    job->timers[CT_SYNC].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_SYNC].record();
     job->state = JobState::STEP;
   } else if (job->state == JobState::STEP) {
     DP_LOG(DEBUG, "JobState::STEP");
     job->optimizer->step();
-    job->timers[CT_OPT].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_OPT].record();
     job->state = JobState::FINISH;
   } else if (job->state == JobState::FINISH) {
     DP_LOG(DEBUG, "JobState::FINISH");
@@ -621,6 +680,7 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     if (job->totiters == rtctx->iters_per_capture - 1 + job->iters_before_graph_capture) {
       job->commHandler->postcapture();
       job->model->graph.capture_end();
+      job->model->isGraphCapturing = false;
       if (job->run_with_be && be_bsize > 0) be_controller.Resume();
       DP_LOG(NOTICE, "Ending capture.");
     }
@@ -629,7 +689,8 @@ TaskManager::trainSingleStep(JobContext* job, bool* jobCompleted)
     fgcounter++;
 
     job->state = JobState::INIT;
-    job->timers[CT_STOP].record();
+    if (!job->model->isGraphCapturing)
+      job->timers[CT_STOP].record();
     return 1;
   }
   return 0;

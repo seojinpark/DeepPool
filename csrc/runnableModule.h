@@ -40,11 +40,24 @@ using torch::autograd::variable_list;
  */
 class CommunicationHandler;
 class CudaTimer;
+class CudaSelfTimer;
 struct Layer;
 struct IdleTimeCtx;
 
 typedef int Tag;
 typedef int Rank;
+
+enum class LayerTimingStage {
+  FP = 0,
+  BP,
+  COMMS,
+  ALL
+};
+
+enum class LossFunctions {
+  NLLLoss = 0, 
+  CrossEntropyLoss
+};
 
 struct TsrXfer {
   TsrXfer(CommunicationHandler* comm) : commHandler(comm), type(None),
@@ -54,6 +67,7 @@ struct TsrXfer {
   enum Type {
     None, Send, Recv
   };
+
   Type type;
   std::vector<int64_t> splitSizes; // used only for send's forward or recv's backward.
   int splitCatDim;
@@ -141,7 +155,9 @@ struct Layer {
   std::vector<int64_t> emptyInSizes;  // primarily used for creating empty tensors for recv.
   std::vector<int64_t> emptyOutSizes; // primarily used for creating empty tensors for recv.
   std::unique_ptr<CudaTimer> fpTimer, bpTimer; // Used during profile mode only.
+  std::unique_ptr<CudaSelfTimer> commTimer; // Used during profile mode only.
   std::string moduleName; // Used to output profiled runtimes.
+  int64_t layerIters {0};
 };
 
 
@@ -270,7 +286,7 @@ class RunnableModule : public torch::nn::Module {
   void gradientSync();
   void initProfileTimers(CudaTimer* ct_load, CudaTimer* ct_loss);
   void resetProfileTimers();
-  void printProfileTimers(int warmupIters);
+  void printProfileTimers(int warmupIters, FILE* pFile=NULL, LayerTimingStage printStage=LayerTimingStage::ALL);
   void printLayerInGraphTimes();
 
   ////////////////////////////////////////////
@@ -285,6 +301,7 @@ class RunnableModule : public torch::nn::Module {
   CommunicationHandler* commHandler;
   c10::Device device;
   std::vector<Layer> layers; // Topologically sorted list of layers.
+  LossFunctions lossfn;
 
   ////////////////////////////////////////////
   // Context for tracking particial progress.
@@ -301,6 +318,7 @@ class RunnableModule : public torch::nn::Module {
   bool backwards_did_sync{false};
 
   at::cuda::CUDAGraph graph;
+  bool isGraphCapturing {false};
   // Performance Stat
   CpuTimer detachTimer;
 

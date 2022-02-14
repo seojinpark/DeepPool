@@ -23,6 +23,7 @@
 #include "Cycles.h"
 
 #define ENABLE_TIMERS 0
+#define ENABLE_TIMERS2 1
 
 class CpuTimer {
  public:
@@ -84,6 +85,9 @@ class CudaTimer {
     }
     recorded = false;
   }
+
+  void reset() {recorded = false;};
+
   size_t count() { return counter; }
   float getAvg(size_t skipIterCount = 0) {
 #if ENABLE_TIMERS
@@ -133,6 +137,118 @@ class CudaTimer {
  private:
   CudaTimer* fromTimer;
   cudaEvent_t evt;
+  bool recorded{false};
+  size_t counter{0};
+  std::vector<float> elapsedTimes;
+  cudaStream_t stream;
+};
+
+
+class CudaSelfTimer {
+ public:
+  CudaSelfTimer(size_t reservedEntries = 2500)
+  {
+#if ENABLE_TIMERS2
+    elapsedTimes.reserve(reservedEntries);
+    CUDACHECK(cudaEventCreateWithFlags(&evt, cudaEventBlockingSync));
+    CUDACHECK(cudaEventCreateWithFlags(&fevt, cudaEventBlockingSync));
+#endif
+  }
+
+  void record() {
+#if ENABLE_TIMERS2
+    CUDACHECK(cudaEventRecord(fevt, rtctx->torch_stream));
+    
+#endif
+    recorded = true;
+  }
+
+  // Be wary for the order of invocation. Should not invoke this method before
+  // other CudaTimer measuring time from this timer invokes.
+  void saveAndReset() {
+    if (recorded) {
+#if ENABLE_TIMERS2
+      CUDACHECK(cudaEventRecord(evt, rtctx->torch_stream));
+      CUDACHECK(cudaEventSynchronize(evt));
+      // assert(fromTimer->recorded);
+      float ms;
+      CUDACHECK(cudaEventElapsedTime(&ms, fevt, evt));
+      elapsedTimes.push_back(ms);
+#endif
+      counter++;
+    }
+    recorded = false;
+  };
+
+  void saveAndAdd() {
+    if (recorded) {
+#if ENABLE_TIMERS2
+      CUDACHECK(cudaEventRecord(evt, rtctx->torch_stream));
+      CUDACHECK(cudaEventSynchronize(evt));
+      // assert(fromTimer->recorded);
+      float ms;
+      CUDACHECK(cudaEventElapsedTime(&ms, fevt, evt));
+      
+      if (elapsedTimes.size() > 0){
+        // ms += elapsedTimes.back();
+        // elapsedTimes.pop_back();
+        elapsedTimes[elapsedTimes.size()-1] += ms;
+      }
+      else
+        elapsedTimes.push_back(ms);
+#endif
+      counter++;
+    }
+    recorded = false;
+  };
+
+  void reset() {recorded = false;};
+
+  size_t count() { return counter; };
+  float getAvg(size_t skipIterCount = 0) {
+#if ENABLE_TIMERS2
+    if (skipIterCount >= elapsedTimes.size()) {
+      skipIterCount = 0;
+    }
+    float sum = 0;
+    for (size_t i = skipIterCount; i < elapsedTimes.size(); ++i) {
+      sum += elapsedTimes[i];
+    }
+    if (elapsedTimes.size() == 0) {
+      return 0;
+    }
+    return sum / (elapsedTimes.size() - skipIterCount);
+#else
+    return 0;
+#endif
+  }
+
+  float getPercentile(float percentile, size_t skipIterCount) {
+#if ENABLE_TIMERS2
+    if (skipIterCount >= elapsedTimes.size()) {
+      skipIterCount = 0;
+    }
+    if (elapsedTimes.size() == 0) {
+      return 0;
+    }
+    std::vector<float> sortedTimes(elapsedTimes.begin() + skipIterCount,
+                                   elapsedTimes.end());
+    std::sort(sortedTimes.begin(), sortedTimes.end());
+    size_t idx = sortedTimes.size() * percentile / 100.0;
+    return sortedTimes[idx];
+#else
+    return 0;
+#endif
+  }
+
+  float getP50(size_t skipIterCount = 0) { return getPercentile(50, skipIterCount); }
+  float getP99(size_t skipIterCount = 0) { return getPercentile(99, skipIterCount); }
+
+  cudaEvent_t* getCudaEvent() { return &evt; }
+  bool isRecorded() { return recorded; }
+  
+ private:
+  cudaEvent_t evt, fevt;
   bool recorded{false};
   size_t counter{0};
   std::vector<float> elapsedTimes;
