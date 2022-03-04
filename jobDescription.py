@@ -112,7 +112,6 @@ class Layer:
         if hasattr(self.module, 'weight'):
             h = hashlib.md5()
             h.update(self.module.weight.cpu().detach().numpy())
-            print(self.name, h.hexdigest())
             return self.name +\
                 json.dumps(self.params, sort_keys=True, separators=('_', '-'))+str(h.hexdigest())
         else:
