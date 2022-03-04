@@ -64,6 +64,7 @@ class CostSim:
         self.layers: List[Layer] = []
         self.NET_BANDWIDTH = netBw
         self.NET_LATENCY = 240 #40
+        # self.NET_LATENCY = 40 #40
         # self.NET_LATENCY = 400 #40
         self.verbose = verbose
         self.layerProfileCache = {}
@@ -1456,6 +1457,9 @@ class CostSim:
     def searchLinear(self, preStartLayer, preStartConfig, startLayer, ctx: SearchContext):
         layer = startLayer
         while True:
+            if layer.prevLayers != None and len(layer.prevLayers) > 1: # Joining layer.
+                return layer
+
             layer.t = {}
 
             initCfg = self.getInitialConfig(layer, ctx.globalBatch)
@@ -1541,8 +1545,8 @@ class CostSim:
                 return layer
             elif len(layer.nextLayers) == 1:
                 layer = layer.nextLayers[0]
-                if len(layer.prevLayers) > 1: # Joining layer.
-                    return layer
+                # if len(layer.prevLayers) > 1: # Joining layer.
+                #     return layer
             else:
                 print("Error!")
         return
