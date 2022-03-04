@@ -392,9 +392,19 @@ RunnableModule::RunnableModule(RuntimeContext* rtctx,
   auto inputFn = [=] { return torch::randn(inputSizes); };
   input_pipeline = TensorGeneratorPipeline(inputFn);
   int targetCount = layersInJson.back()["config"][0];
-  auto targetOpts = torch::TensorOptions().dtype(torch::kInt64);
-  auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1000, {targetCount}, targetOpts); };
-  target_pipeline = TensorGeneratorPipeline(targetFn);
+
+  if (layersInJson.back()["outputDim"].size() <= 2) {
+    auto targetOpts = torch::TensorOptions().dtype(torch::kInt64);
+    auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1000, {targetCount}, targetOpts); };
+    target_pipeline = TensorGeneratorPipeline(targetFn);
+  } else {
+    std::vector<int64_t> outputSizes;
+    outputSizes.push_back(targetCount);
+    for (int size : layersInJson.back()["outputDim"]) outputSizes.push_back(size);
+    outputSizes.erase(outputSizes.begin() + 1);
+    auto targetFn = [=] { return torch::randn(outputSizes); };
+    target_pipeline = TensorGeneratorPipeline(targetFn);
+  }
 }
 
 /**
