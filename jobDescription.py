@@ -22,6 +22,7 @@ from typing import Optional, IO, List, Any
 from collections import defaultdict
 import copy
 import sys
+import hashlib
 
 class TensorProperties:
     def __init__(self, tensor: torch.Tensor = None):
@@ -108,12 +109,15 @@ class Layer:
         return fakeInputs
 
     def getModuleId(self):
-        import hashlib
-        m = hashlib.sha256()
-        m.update(json.dumps([str(a) for a in self.getInputShapes()], separators=('_', '-')).encode("utf-8"))
-        return self.name +\
-            json.dumps(self.params, sort_keys=True, separators=('_', '-')) +\
-            m.hexdigest()
+        if hasattr(self.module, 'weight'):
+            h = hashlib.md5()
+            h.update(self.module.weight.cpu().detach().numpy())
+            print(self.name, h.hexdigest())
+            return self.name +\
+                json.dumps(self.params, sort_keys=True, separators=('_', '-'))+str(h.hexdigest())
+        else:
+            return self.name +\
+                json.dumps(self.params, sort_keys=True, separators=('_', '-'))
 
     def scriptModule(self):
         if not self.moduleSavedLocation:

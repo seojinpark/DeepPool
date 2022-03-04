@@ -220,7 +220,7 @@ class BasicBlock(nn.Module):
         inplanes: int,
         planes: int,
         stride: int = 1,
-        downsample: Optional[nn.Module] = None,
+        downsample = None,
         groups: int = 1,
         base_width: int = 64,
         dilation: int = 1,
@@ -228,31 +228,35 @@ class BasicBlock(nn.Module):
     ) -> None:
         super(BasicBlock, self).__init__()
         if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
+            norm_layer = cs.BatchNorm2d
         if groups != 1 or base_width != 64:
             raise ValueError('BasicBlock only supports groups=1 and base_width=64')
         if dilation > 1:
             raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
         # Both self.conv1 and self.downsample layers downsample the input when stride != 1
-        if downsample is not None and len(cs.layers) >= 2:
-            custom_previous_layers = [cs.layers[-2]]
-        else:
-            custom_previous_layers = None
-        # custom_previous_layers = [cs.layers[-2]]
-        join_layers = [cs.layers[-1]]
-        self.conv1 = conv3x3(inplanes, planes, stride, custom_previous_layers=custom_previous_layers)
+        identity = cs.layers[-1]
+        self.conv1 = conv3x3(inplanes, planes, stride)
         self.bn1 = norm_layer(planes)
-        self.relu = nn.ReLU(inplace=True)
+        self.relu1 = cs.ReLU(inplace=False)
         self.conv2 = conv3x3(planes, planes)
         self.bn2 = norm_layer(planes)
+        
+        pre_downsample = cs.layers[-1]
 
         if downsample is not None:
-            join_layers += [cs.layers[-1]]
-            self.addLayer = AddLayer(join_layers[0], join_layers[1])
-            print(join_layers[0].name, join_layers[1].name)
-            cs.GeneralLayer(self.addLayer, "add", {}, mustTrace=True, custom_previous_layers = join_layers)
+            # join_layers += [cs.layers[-1]]
+            # self.addLayer = AddLayer(join_layers[0], join_layers[1])
+            # print(join_layers[0].name, join_layers[1].name)
+            # cs.GeneralLayer(self.addLayer, "add", {}, mustTrace=True, custom_previous_layers = join_layers)
+            self.downsample = downsample([identity])
+            identity = cs.layers[-1]
+        else:
+            self.downsample = None
 
-        self.downsample = downsample
+        self.addLayer = AddLayer(None, None)
+        cs.GeneralLayer(self.addLayer, "add", {}, mustTrace=True, custom_previous_layers = [pre_downsample, identity])
+        self.relu2 = cs.ReLU(inplace=False)
+        # self.downsample = downsample
         self.stride = stride
 
     def forward(self, x: Tensor) -> Tensor:
@@ -260,7 +264,7 @@ class BasicBlock(nn.Module):
 
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.relu(out)
+        out = self.relu1(out)
 
         out = self.conv2(out)
         out = self.bn2(out)
@@ -269,7 +273,7 @@ class BasicBlock(nn.Module):
             identity = self.downsample(x)
 
         out += identity
-        out = self.relu(out)
+        out = self.relu2(out)
 
         return out
 
@@ -297,16 +301,18 @@ class Bottleneck(nn.Module):
     ) -> None:
         super(Bottleneck, self).__init__()
         if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
+            norm_layer = cs.BatchNorm2d
         width = int(planes * (base_width / 64.)) * groups
         # Both self.conv2 and self.downsample layers downsample the input when stride != 1
         layerSideBranch = cs.layers[-1]
         self.conv1 = conv1x1(inplanes, width)
-        self.bn1 = norm_layer(width)
+        self.bn1 = cs.BatchNorm2d(width)
+        self.relu1 = cs.ReLU(inplace=False)
         self.conv2 = conv3x3(width, width, stride, groups, dilation)
-        self.bn2 = norm_layer(width)
+        self.bn2 = cs.BatchNorm2d(width)
+        self.relu2 = cs.ReLU(inplace=False)
         self.conv3 = conv1x1(width, planes * self.expansion)
-        self.bn3 = norm_layer(planes * self.expansion)
+        self.bn3 = cs.BatchNorm2d(planes * self.expansion)
         layerMainBranch = cs.layers[-1]
         if False and downsampleParams is not None: # hack to test resnet152
             convDownsample = conv1x1(*(downsampleParams[0]), [layerSideBranch])
@@ -315,7 +321,7 @@ class Bottleneck(nn.Module):
         else:
             self.downsample = None
         # self.relu = cs.ReLU(inplace=True, custom_previous_layers=[layerMainBranch, layerSideBranch])
-        self.relu = cs.ReLU(inplace=True)
+        self.relu3 = cs.ReLU(inplace=False)
         self.stride = stride
 
     def forward(self, x: Tensor) -> Tensor:
@@ -323,11 +329,11 @@ class Bottleneck(nn.Module):
 
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.relu(out)
+        out = self.relu1(out)
 
         out = self.conv2(out)
         out = self.bn2(out)
-        out = self.relu(out)
+        out = self.relu2(out)
 
         out = self.conv3(out)
         out = self.bn3(out)
@@ -336,55 +342,10 @@ class Bottleneck(nn.Module):
             identity = self.downsample(x)
 
         out += identity
-        out = self.relu(out)
+        out = self.relu3(out)
 
         return out
 
-
-# class ResNet(nn.Module):
-
-#     def __init__(
-#         self,
-#         block: Type[Union[BasicBlock, Bottleneck]],
-#         layers: List[int],
-#         num_classes: int = 1000,
-#         zero_init_residual: bool = False,
-#         groups: int = 1,
-#         width_per_group: int = 64,
-#         replace_stride_with_dilation: Optional[List[bool]] = None,
-#         norm_layer: Optional[Callable[..., nn.Module]] = None
-#     ) -> None:
-#         super(ResNet, self).__init__()
-#         if norm_layer is None:
-#             norm_layer = nn.BatchNorm2d
-#         self._norm_layer = norm_layer
-
-#         self.inplanes = 64
-#         self.dilation = 1
-#         if replace_stride_with_dilation is None:
-#             # each element in the tuple indicates if we should replace
-#             # the 2x2 stride with a dilated convolution instead
-#             replace_stride_with_dilation = [False, False, False]
-#         if len(replace_stride_with_dilation) != 3:
-#             raise ValueError("replace_stride_with_dilation should be None "
-#                              "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
-#         self.groups = groups
-#         self.base_width = width_per_group
-#         self.conv1 = cs.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3,
-#                                bias=False)
-#         self.bn1 = norm_layer(self.inplanes)
-#         self.relu = cs.ReLU(inplace=True)
-#         self.maxpool = cs.MaxPool2d(kernel_size=3, stride=2, padding=1)
-#         self.layer1 = self._make_layer(block, 64, layers[0])
-#         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
-#                                        dilate=replace_stride_with_dilation[0])
-#         self.layer3 = self._make_layer(block, 256, layers[2], stride=2,
-#                                        dilate=replace_stride_with_dilation[1])
-#         self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
-#                                        dilate=replace_stride_with_dilation[2])
-#         self.avgpool = cs.AdaptiveAvgPool2d((1, 1))
-#         cs.Flatten()
-#         self.fc = cs.Linear(512 * block.expansion, num_classes)
 
 class ResNet(nn.Module):
     def __init__(
@@ -409,7 +370,7 @@ class ResNet(nn.Module):
 
         self.printcount = 0
         if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
+            norm_layer = cs.BatchNorm2d
         self._norm_layer = norm_layer
 
         self.inplanes = 64
@@ -444,8 +405,8 @@ class ResNet(nn.Module):
         self.base_width = width_per_group
         self.conv1 = cs.Conv2d(in_channels, self.inplanes, kernel_size=7, stride=2, padding=3,
                                bias=False)
-        self.bn1 = norm_layer(self.inplanes)
-        self.relu = cs.ReLU(inplace=True)
+        self.bn0 = cs.BatchNorm2d(self.inplanes)
+        self.relu1 = cs.ReLU(inplace=False)
         self.maxpool = cs.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
@@ -465,39 +426,40 @@ class ResNet(nn.Module):
         bn_eps = 1e-3 #self._global_params['batch_norm_epsilon']
 
         # Head
-        ConvTranspose2d = get_same_padding_conv_transpose2d()
+        # ConvTranspose2d = get_same_padding_conv_transpose2d()
         in_channels = 256*block.expansion  # output of final block
         #scaled_output_filters = unscaled_output_filters*1280/self._blocks_args[-1].output_filters
         #out_channels = round_filters(scaled_output_filters, self._global_params)
         out_channels = 3
-        self._conv_head0 = cs.ConvTranspose2d(in_channels, out_channels, kernel_size=3, stride=(2,2), padding=0, bias=False)
+        self.conv_head0 = cs.ConvTranspose2d(in_channels, out_channels, kernel_size=3, stride=(2,2), padding=0, bias=False)
         
-        self._bn0 = cs.BatchNorm2d(num_features=out_channels, momentum=bn_mom, eps=bn_eps)
-        self._swish = Swish()
-        self._conv_head1 = cs.ConvTranspose2d(out_channels, 3,
+        self.bn_head0 = cs.BatchNorm2d(num_features=out_channels, momentum=bn_mom, eps=bn_eps)
+        self.swish = Swish()
+        cs.GeneralLayer(self.swish, "swish", {}, mustTrace=True)
+        self.conv_head1 = cs.ConvTranspose2d(out_channels, 3,
                                            kernel_size=3, stride=(2,2), bias=False, padding=1, dilation=(1,1))
-        self._bn1 = nn.BatchNorm2d(num_features=out_channels, momentum=bn_mom, eps=bn_eps)
+        # self._bn1 = cs.BatchNorm2d(num_features=out_channels, momentum=bn_mom, eps=bn_eps)
         # self._conv_head2 = cs.ConvTranspose2d(out_channels, 3,
         #                                    kernel_size=3, stride=(2,2), bias=False)
 
 
 
-        # for m in self.modules():
-        #     if isinstance(m, nn.Conv2d):
-        #         nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        #     elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-        #         nn.init.constant_(m.weight, 1)
-        #         nn.init.constant_(m.bias, 0)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
-        # # Zero-initialize the last BN in each residual branch,
-        # # so that the residual branch starts with zeros, and each residual block behaves like an identity.
-        # # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
-        # if zero_init_residual:
-        #     for m in self.modules():
-        #         if isinstance(m, Bottleneck):
-        #             nn.init.constant_(m.bn3.weight, 0)
-        #         elif isinstance(m, BasicBlock):
-        #             nn.init.constant_(m.bn2.weight, 0)
+        # Zero-initialize the last BN in each residual branch,
+        # so that the residual branch starts with zeros, and each residual block behaves like an identity.
+        # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
+        if zero_init_residual:
+            for m in self.modules():
+                if isinstance(m, Bottleneck):
+                    nn.init.constant_(m.bn3.weight, 0)
+                elif isinstance(m, BasicBlock):
+                    nn.init.constant_(m.bn2.weight, 0)
 
     def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
         norm_layer = self._norm_layer
@@ -507,11 +469,14 @@ class ResNet(nn.Module):
             self.dilation *= stride
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
+            # downsample = nn.Sequential(
+            #     conv1x1(self.inplanes, planes * block.expansion, stride, custom_previous_layers=prevlayer),
+            #     cs.BatchNorm2d(planes * block.expansion),
+            # )
+            downsample = lambda prevlayer: nn.Sequential(
+                conv1x1(self.inplanes, planes * block.expansion, stride, custom_previous_layers=prevlayer),
                 norm_layer(planes * block.expansion),
             )
-            
 
         layers = []
         layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
@@ -524,11 +489,11 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def set_swish(self, memory_efficient=True):
-        """Sets swish function as memory efficient (for training) or standard (for export)"""
-        self._swish = MemoryEfficientSwish() if memory_efficient else Swish()
-        # for block in self._blocks:
-        #     block.set_swish(memory_efficient)
+    # def set_swish(self, memory_efficient=True):
+    #     """Sets swish function as memory efficient (for training) or standard (for export)"""
+    #     self._swish = MemoryEfficientSwish() if memory_efficient else Swish()
+    #     # for block in self._blocks:
+    #     #     block.set_swish(memory_efficient)
 
     def _space_to_depth(self, x, block_size):
         n, c, h, w = x.size()
@@ -544,8 +509,8 @@ class ResNet(nn.Module):
         # x = self._space_to_depth(x, 8)
         # x = self.conv1_new(x)
         x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
+        x = self.bn0(x)
+        x = self.relu1(x)
         x = self.maxpool(x)
 
         # print(x.size())
@@ -559,11 +524,11 @@ class ResNet(nn.Module):
         # x = self.layer4(x)
 
         # print(x.size())
-        x = self._conv_head0(x)
+        x = self.conv_head0(x)
         # print('_conv_head0', x.size())
-        x = self._swish(self._bn1(x))
+        x = self.swish(self.bn_head0(x))
         # print('_swish', x.size())
-        x = self._conv_head1(x)
+        x = self.conv_head1(x)
         # print('_conv_head1', x.size())
         # x = self.avgpool(x)
         # x = torch.flatten(x, 1)
@@ -717,22 +682,27 @@ def wide_resnet101_2(pretrained=False, progress=True, **kwargs):
 
 
 def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66E5, spatialSplit=False, simResultFilename=None, simOnly=False, use_be=False):
-    profiler = GpuProfiler("cuda")
-    profiler.loadProfile()
+    # profiler = GpuProfiler("cuda")
+    # profiler.loadProfile()
     global cs
-    cs = CostSim(profiler, netBw=netBw, verbose=True, gpuProfileLoc="resnetLayerGpuProfileA100V2.txt", gpuProfileLocSub="resnetLayerGpuProfileA100.txt")
-    model = resnet34()
+    cs = CostSim(None, netBw=netBw, verbose=True, gpuProfileLoc="profile/A100_anvil.prof")#, gpuProfileLocSub="resnetLayerGpuProfileA100.txt")
+    model = resnet34(pretrained='/anvil/data/pretrained/resnet34.pth')
+    # model.load_state_dict(torch.load('/anvil/planes_checkpoints_0_997AUC/weights_0499.pth'), strict=True)
+    # model.load_state_dict(torch.load('/DeepPool/weights_0499.pth'), strict=True)
     # model = resnet152()
     # model = wide_resnet101_2()
     # cs.printAllLayers(slient=True)
     cs.printAllLayers(slient=False)
     cs.computeInputDimensions((2,240,240))
+    cs.to_dot("Digraph", globalBatch, justdag=True)
+
     # job, iterMs, gpuMs = cs.searchBestSplits(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit, lossfn=0)
-    job, iterMs, gpuMs, maxGpusUsed = cs.searchBestSplitsV3(gpuCount, globalBatch, lossfn=1, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
+    # job, iterMs, gpuMs, maxGpusUsed = cs.searchBestSplitsV3(gpuCount, globalBatch, lossfn=2, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
+    job, iterMs, gpuMs, maxGpusUsed = cs.JustDoDP(gpuCount, globalBatch, lossfn=2)
     print("  %2d    %2d   %4.1f  %4.1f\n" % (globalBatch, maxGpusUsed, iterMs, gpuMs))
 
     jobInJson = job.dumpInJSON()
-    profiler.saveProfile()
+    # profiler.saveProfile()
     # for rank in range(4):
     #     print("GPU rank: %d"%rank)
     #     print(job.dumpSingleRunnableModule(rank))
@@ -745,7 +715,7 @@ def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fal
     
     if not spatialSplit and not simOnly:
         cc = ClusterClient()
-        jobName = "Resnet34_%d_%d_%2.1f%s" % (gpuCount, globalBatch, amplificationLimit, "_DP" if dataParallelBaseline else "")
+        jobName = "anvil_%d_%d_%2.1f%s" % (gpuCount, globalBatch, amplificationLimit, "_DP" if dataParallelBaseline else "")
         jobName += "_BE" if use_be else ""
         cc.submitTrainingJob(jobName, jobInJson, use_be)
 
@@ -889,7 +859,7 @@ if __name__ == "__main__":
             main(int(sys.argv[1]), int(sys.argv[2]), amplificationLimit=float(sys.argv[3]), use_be=use_be)
     elif len(sys.argv) == 2:
         print("Run all configs")
-        runAllConfigs("resnet34", sys.argv[1])
+        runAllConfigs("anvil", sys.argv[1])
     elif len(sys.argv) == 1:
         generateJit()
         # for modelName in ['resnet50', 'resnet34']:

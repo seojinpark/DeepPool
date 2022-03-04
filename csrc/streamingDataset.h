@@ -3,21 +3,22 @@
 #include <torch/torch.h>
 #include <torch/types.h>
 #include <pthread.h>
+#include "dataset.h"
 
 struct sharedBuffers { 
     bool ready = false;
     int stopWorker = 0;
     int sock = -1;
-    int64_t batchSize;
+    int64_t datasetSize;
     int64_t index;
 
     // uint64_t numH5Files;
     // uint64_t h5FileIdx;
     // char h5FileNamesBuffer[2048] = {0};
 
-    size_t iidVecStrLen;
-    size_t iidVecLen;
-    void* iidVec;
+    // size_t iidVecStrLen;
+    // size_t iidVecLen;
+    // void* iidVec;
 
     uint64_t weightsNDims;
     uint64_t weightsDims[8] = {0};
@@ -34,13 +35,43 @@ struct sharedBuffers {
     size_t labelsLen;
     void* labels;
 
-    char mutexID[32] = {0};
+    char mutexID[64] = {0};
     pthread_mutex_t* mp_mutex;
     pthread_mutexattr_t mutexAttr;
+
+    // munmap(allocation, 5000);
+    ~sharedBuffers();
+};
+
+struct batchPath{ 
+    int64_t index;
+    std::string path;
+
+    batchPath& operator=(const batchPath other)
+    {
+        index = other.index;
+        path = other.path;
+        return *this;
+    }
+    bool operator()(batchPath const& left, batchPath const& right) {
+        return (left.index) > (right.index);
+    }
+
+    bool operator==(const batchPath& rhs) const {
+        return index == rhs.index;
+    }
+
+    bool operator<(const batchPath& rhs) const {
+        return index < rhs.index;
+    }
+
+    bool operator>(const batchPath& rhs) const {
+        return index > rhs.index;
+    }
 };
 
 struct batchData { 
-    int64_t len;
+    int64_t datasetSize;
     int64_t index;
     // std::vector<std::string> iidVec;
     torch::Tensor weights;
@@ -49,90 +80,156 @@ struct batchData {
 
     batchData& operator=(const batchData other)
     {
-        // std::cout << "copy assignment of batchData\n";
-        len = other.len;
+        datasetSize = other.datasetSize;
         index = other.index;
-        // iidVec = other.iidVec;
         weights = other.weights;
         images = other.images;
         labels = other.labels;
-        // std::swap(n, other.n);
-        // std::swap(s1, other.s1);
         return *this;
     }
+
+    bool operator()(batchData const& left, batchData const& right)
+    {
+        return (left.index) > (right.index);
+    }
+
+    bool operator<(const batchData& rhs) const
+    {
+        return index < rhs.index;
+    }
+
+    bool operator>(const batchData& rhs) const
+    {
+        return index > rhs.index;
+    }
+
+    // bool operator< (batchData left, batchData right) { return (left.index) > (right.index); };
 };
 
-// const int kNumberOfExamplesAfterWhichTheDatasetExhausts = 10;
-// const int kNumberOfWorkers = 4;
+// class Dataset {
+//  public:
+//   virtual torch::data::Example<> getNext() = 0;
+//   virtual size_t GetItersPerEpoch() = 0;
+//   virtual bool IsDone() = 0;
+//   virtual void Reset() = 0;
+//   static Dataset *fromName(std::string name, size_t rank, long globalBatchSize,
+//                            std::vector<long> initialBatchSizes,
+//                            std::vector<long> sampleIndices,
+//                            size_t fake_train_iters_per_epoch);
 
-struct StreamingDataset : public torch::data::datasets::StatefulDataset<StreamingDataset, batchData, size_t>
+//   torch::data::Example<> getNextThisRank() {
+//     auto ex = getNext();
+
+//     torch::Tensor data, target;
+//     if (initialBatchSizes_.at(rank_))
+//       data = ex.data.split_with_sizes(initialBatchSizes_)[rank_];
+
+//     if (sampleIndices_.size()) {
+//       std::vector<long> spl(globalBatchSize_, 1);
+//       auto splitsamples =
+//           ex.target.split_with_sizes(spl);  // TODO make this clean....
+//       std::vector<torch::Tensor> samplesOrdered;
+//       for (auto &s : sampleIndices_)
+//         samplesOrdered.push_back(splitsamples.at(s));
+//       target = torch::cat(samplesOrdered);
+//     }
+//     return {data, target};
+//   }
+//  protected:
+//   long globalBatchSize_;
+//   Dataset(size_t rank, long globalBatchSize,
+//           std::vector<long> initialBatchSizes, std::vector<long> sampleIndices)
+//       : globalBatchSize_(globalBatchSize),
+//         rank_(rank),
+//         initialBatchSizes_(initialBatchSizes),
+//         sampleIndices_(sampleIndices){};
+
+//  private:
+//   size_t rank_;
+//   std::vector<long> initialBatchSizes_;
+//   std::vector<long> sampleIndices_;
+
+struct StreamingDataset : public Dataset
 {
-    // public:
-        int rank = 0;
-        int worldSize = 0;
-        int stopDataset = 0;
-        int64_t epochLen;
-        int64_t batchSize;
+    private:
+        bool is_eval_;
+        size_t worldSize_ = 0;
+        int64_t stopDataset_ = 0;
+        bool startedDataset_ = false;
+        int64_t epochLen_;
+        int64_t epochCount_ = 0;
+        int64_t datasetSize_;
+        int64_t batchSize_;
+        int64_t lastBatchIdx = -1;
         std::vector<std::thread> threads;
-        std::deque<batchData> readyBatches;
+
+        // Using lambda to compare elements.
+
+        // auto cmp = [](batchData left, batchData right) { return (left.index) > (right.index); };
+        std::priority_queue<batchData, std::vector<batchData>, std::greater<batchData>> readyBatches;
+        // std::deque<batchData> readyBatches;
         // torch::Tensor states_, labels_;
 
+        std::mutex local_mutex_;
+        std::mutex local_get_file_mutex_;
+        char mutexID_[64] = {0};
+        pthread_mutex_t* mp_mutex_;
+        pthread_mutexattr_t mutexAttr_;
 
-        std::mutex local_mutex;
-        std::mutex local_get_file_mutex;
-        char mutexID[32] = {0};
-        pthread_mutex_t* mp_mutex;
-        pthread_mutexattr_t mutexAttr;
-
-
-
-        int counter = 0;
+        int counter_ = 0;
+        bool done_ = false;
         // pthread_mutex_t* mp_mutex;
         // pthread_mutexattr_t mutexAttr;
-        int64_t workerID;
-        int64_t bufferIndex;
-        uint64_t numWorkers = 4;
-        std::vector<sharedBuffers*> sharedWorkerBuffs;
+        int64_t workerID_;
+        int64_t bufferIndex_;
+        uint64_t numWorkers_ = 2;
+        std::vector<sharedBuffers*> sharedWorkerBuffs_;
+        bool moved_from_ = false;
 
-    // public:
-        // bool is_stateful = false;
-        explicit StreamingDataset(int rank, int worldSize);
-        ~StreamingDataset(void);
-        torch::optional<batchData> read_batch(void);
-        torch::optional<batchData> read_batch_worker(void);
-        void workerRunMain(void);
-        void workerToTensorsThread(int wID);
-        int64_t init(void);
-        int64_t test(void);
-        torch::optional<batchData> get_batch(size_t) override;
-        torch::optional<size_t> size() const override;
-        void reset() override {counter = 0;};
-        void save(torch::serialize::OutputArchive& archive) const override{((void)archive);};
-        void load(torch::serialize::InputArchive& archive) override {((void)archive);};
-        // torch::Tensor read_data(const std::string& loc);
-        // torch::data::Example<> get(size_t index);
-        // torch::data::Example<> get(size_t index) ;//override;
-        // explicit StreamingDataset(const std::string& loc_states, const std::string& loc_labels) 
-        //     : states_(read_data(loc_states)),
-        //       labels_(read_data(loc_labels)) {   };
+    public:
+        StreamingDataset(size_t rank, long globalBatchSize,
+                           std::vector<long> initialBatchSizes,
+                           std::vector<long> sampleIndices, bool is_eval,
+                           size_t worldSize = 1);
+        ~StreamingDataset();
 
 
-        //   explicit RandomDataset(Mode mode = Mode::kTrain);
-        // {  this->batchSize = batchSize; std::cout << "Hello World!\n";  };
-        // torch::data::AnvilExample<> get(size_t index) override;
-        // torch::data::Example<> get(size_t index) override;
-        //  {
-        //     std::lock_guard<std::mutex> lock(mutex);
-        //     if (counter < kNumberOfExamplesAfterWhichTheDatasetExhausts) {
-        //         return torch::nullopt;
-        //     }
-        //     return torch::nullopt;
+        // bool batchComp(batchData left, batchData right) { return (left.index) > (right.index); };
+
+        // StreamingDataset(StreamingDataset const &) = delete;
+        // StreamingDataset& operator=(StreamingDataset const &) = delete;
+
+        // StreamingDataset(StreamingDataset &&moveable) noexcept :
+        //     Dataset(moveable.rank_, moveable.globalBatchSize_, moveable.initialBatchSizes_, moveable.sampleIndices_){
+        //     std::cout << "moving - StreamingDataset\n";
+        //     moved_from_ = false;
+        //     moveable.moved_from_ = true;
+        //     // And now we spell out the explicit default move constructor
         // }
 
-	    /// Returns the size of the dataset.
-	    // torch::optional<size_t> size() const override;
-        // batchData* begin();// { batchData newbatch; auto tmp = StreamingDataset::read_batch(&newbatch); return newbatch; }
-        // batchData* end();// { return iterator(val + len); }
+        // StreamingDataset& operator=(StreamingDataset &&moveable) noexcept {
+        //     std::cout << "moving oper - StreamingDataset\n";
+        //     moved_from_ = false;
+        //     moveable.moved_from_ = true;
+        //     // And now we spell out the explicit default move assignment operator
+        //     return *this;
+        // }
 
 
+
+
+        torch::optional<batchData> read_batch();
+        torch::optional<batchData> read_batch_worker();
+        void worker_RunMain();
+        void worker_BlobToTensorsThread(int wID);
+        int64_t init();
+        int64_t test();
+        // torch::optional<batchData> get_batch(void);
+        // torch::optional<batchData> 
+        std::map<std::string, at::Tensor> getNextThisRank() override;
+        // torch::optional<size_t> size();
+        void Reset() {counter_ = 0; done_=false;};
+        bool IsDone(){return done_;};
+        size_t GetItersPerEpoch() override;
+        std::map<std::string, torch::Tensor> getNext() override;
 };

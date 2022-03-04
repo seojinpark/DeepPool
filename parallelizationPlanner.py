@@ -484,7 +484,7 @@ class CostSim:
 
     # num_features, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True, device=None, dtype=None
     def BatchNorm2d(self, num_features: int, eps: float = 1e-05, momentum: float = 0.1,
-            affine: bool = False, track_running_stats: bool = True,
+            affine: bool = True, track_running_stats: bool = True,
             custom_previous_layers: list = None):
         module = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum, affine=affine, 
                     track_running_stats=track_running_stats)
@@ -1797,7 +1797,7 @@ class CostSim:
         plt.savefig("gpuTimeline.pdf")
 
     """ Generate a simple DP only plan, or use randomMode to randomly distribute layers """
-    def JustDoDP(self, totalGpus: int, globalBatch: int, per_layer_rand_prob: float = 0.0):
+    def JustDoDP(self, totalGpus: int, globalBatch: int, per_layer_rand_prob: float = 0.0, lossfn: int = 0):
         randomMode = per_layer_rand_prob > 0.0
         if randomMode: random.seed(0)
         lastCfg = 0
@@ -1857,10 +1857,10 @@ class CostSim:
             gpusUsed = totalGpus
             gpuTime = 1
             finalTime = max(cumulativeTime, finalTime)
-        moduleDesc = TrainingJob("test", self.layers, [layer.bestCfg for layer in self.layers], globalBatch, totalGpus, "na")
+        moduleDesc = TrainingJob("test", self.layers, [layer.bestCfg for layer in self.layers], globalBatch, lossfn, totalGpus, "na")
         return (moduleDesc, dpTime / 1000., 0 / 1000., totalGpus)
 
-    def searchBestSplitsV3(self, totalGpus: int, globalBatch: int = 16, amplificationLimit: float = 2.0, dataParallelBaseline = False, sampleSplit=True, spatialSplit=False, filterSplit=False):
+    def searchBestSplitsV3(self, totalGpus: int, globalBatch: int = 16, lossfn: int = 0, amplificationLimit: float = 2.0, dataParallelBaseline = False, sampleSplit=True, spatialSplit=False, filterSplit=False):
         """ Parallelization strategy findiing for DeepPool. """
         ctx = SearchContext(totalGpus, globalBatch, lossfn, amplificationLimit, dataParallelBaseline, sampleSplit=sampleSplit, spatialSplit=spatialSplit, filterSplit=filterSplit)
         ctx.doNotBench = totalGpus == 1

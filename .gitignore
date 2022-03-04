@@ -186,3 +186,7 @@ runtime/*
 *.out
 csrc/_deps/*
 csrc/CMakeFiles/*
+samples/*
+*.hdf5
+*.pth
+*.jpg

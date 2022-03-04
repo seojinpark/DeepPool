@@ -6,46 +6,52 @@
 #include "runtime.h"
 #include "utils.h"
 
+#include "cifar10.h"
+
 class Dataset {
  public:
-  virtual torch::data::Example<> getNext() = 0;
+ 
+  Dataset(size_t rank, long globalBatchSize,
+          std::vector<long> initialBatchSizes, 
+          std::vector<long> sampleIndices)
+      : rank_(rank),
+        globalBatchSize_(globalBatchSize),
+        initialBatchSizes_(initialBatchSizes),
+        sampleIndices_(sampleIndices){}
+  virtual ~Dataset() {}
+  virtual std::map<std::string, torch::Tensor> getNext() = 0;
   virtual size_t GetItersPerEpoch() = 0;
   virtual bool IsDone() = 0;
   virtual void Reset() = 0;
-  static Dataset *fromName(std::string name, size_t rank, long globalBatchSize,
+  virtual std::map<std::string, torch::Tensor> getNextThisRank() = 0;
+  
+  static std::shared_ptr<Dataset> fromName(std::string name, size_t rank, long globalBatchSize,
                            std::vector<long> initialBatchSizes,
                            std::vector<long> sampleIndices,
-                           size_t fake_train_iters_per_epoch);
+                           size_t fake_train_iters_per_epoch,
+                           size_t worldSize = 1);
 
-  torch::data::Example<> getNextThisRank() {
-    auto ex = getNext();
 
-    torch::Tensor data, target;
-    if (initialBatchSizes_.at(rank_))
-      data = ex.data.split_with_sizes(initialBatchSizes_)[rank_];
+  // Dataset(Dataset const &) = delete;
+  // Dataset &operator=(Dataset const &) = delete;
 
-    if (sampleIndices_.size()) {
-      std::vector<long> spl(globalBatchSize_, 1);
-      auto splitsamples =
-          ex.target.split_with_sizes(spl);  // TODO make this clean....
-      std::vector<torch::Tensor> samplesOrdered;
-      for (auto &s : sampleIndices_)
-        samplesOrdered.push_back(splitsamples.at(s));
-      target = torch::cat(samplesOrdered);
-    }
-    return {data, target};
-  }
+  // Dataset(Dataset &&moveable){
+  //   std::cout << "moving dataset\n";
+  //     // moved_from = false;
+  //     // moveable.moved_from = true;
+  //     // And now we spell out the explicit default move constructor
+  // }
+
+  // Dataset &operator=(Dataset &&moveable) {
+  //   std::cout << "moving oper - dataset\n";
+  //     // moved_from = false;
+  //     // moveable.moved_from = true;
+  //     // And now we spell out the explicit default move assignment operator
+  //     return *this;
+  // }
 
  protected:
   long globalBatchSize_;
-  Dataset(size_t rank, long globalBatchSize,
-          std::vector<long> initialBatchSizes, std::vector<long> sampleIndices)
-      : globalBatchSize_(globalBatchSize),
-        rank_(rank),
-        initialBatchSizes_(initialBatchSizes),
-        sampleIndices_(sampleIndices){};
-
- private:
   size_t rank_;
   std::vector<long> initialBatchSizes_;
   std::vector<long> sampleIndices_;
@@ -96,8 +102,8 @@ class DatasetPipelineWrapper {
  public:
   DatasetPipelineWrapper(std::shared_ptr<Dataset> dataset) : dataset_(dataset) {
     auto next_sample = dataset_->getNextThisRank();
-    data_pipeline_.reset(new TensorPipeline(next_sample.data));
-    target_pipeline_.reset(new TensorPipeline(next_sample.target));
+    for ( const auto &[key, value]: next_sample)
+        pipelines_[key].reset(new TensorPipeline(value));
   }
 
   bool IsDone() { return is_done_; }
@@ -108,27 +114,81 @@ class DatasetPipelineWrapper {
     dataset_->Reset();
     is_done_ = false;
     auto next_sample = dataset_->getNextThisRank();
-    data_pipeline_->SupplyNext(next_sample.data);
-    target_pipeline_->SupplyNext(next_sample.target);
+    for ( const auto &[key, pipe]: pipelines_)
+        pipe->SupplyNext(next_sample[key]);
   }
 
-  torch::data::Example<> getNextThisRank() {
+  std::map<std::string, torch::Tensor> getNextThisRank() {
     assert(!is_done_);
+    std::map<std::string, torch::Tensor> rtn_vals;
     if (dataset_->IsDone()) {
-      auto data = data_pipeline_->GetNext({});
-      auto target = target_pipeline_->GetNext({});
+      for ( const auto &[key, pipe]: pipelines_)
+        rtn_vals[key] = pipe->GetNext({});
       is_done_ = true;
-      return {data, target};
+      return rtn_vals;
     }
-    auto next_sample = dataset_->getNextThisRank();
-    auto data = data_pipeline_->GetNext(next_sample.data);
-    auto target = target_pipeline_->GetNext(next_sample.target);
-    return {data, target};
+    else{
+      auto next_sample = dataset_->getNextThisRank();
+      if(dataset_->IsDone())
+        is_done_ = true;
+      if (next_sample.size() > 0)
+        for ( const auto &[key, pipe]: pipelines_)
+            rtn_vals[key] = pipe->GetNext(next_sample[key]);
+    }
+    return rtn_vals;
   }
 
  private:
   std::shared_ptr<Dataset> dataset_;
-  std::unique_ptr<TensorPipeline> data_pipeline_;
-  std::unique_ptr<TensorPipeline> target_pipeline_;
+  std::map<std::string, std::unique_ptr<TensorPipeline>> pipelines_;
   bool is_done_{false};
+};
+
+
+
+class FakeDataset : public Dataset {
+ public:
+  FakeDataset(size_t rank, long globalBatchSize,
+              std::vector<long> initialBatchSizes,
+              std::vector<long> sampleIndices,
+              std::function<torch::data::Example<>()> gen,
+              size_t images_per_epoch);
+  std::map<std::string, torch::Tensor> getNextThisRank() override; 
+  std::map<std::string, torch::Tensor> getNext() override;
+  bool IsDone() override;
+  void Reset() override;
+  size_t GetItersPerEpoch() override;
+  ~FakeDataset() {cached_.clear();};
+
+ private:
+  size_t batches_per_epoch_;
+  size_t ctr_{0};
+  std::vector<torch::data::Example<>> cached_;
+};
+
+
+
+class CifarDataset : public Dataset {
+ public:
+  CifarDataset(size_t rank, long globalBatchSize,
+               std::vector<long> initialBatchSizes,
+               std::vector<long> sampleIndices, bool is_eval);
+  std::map<std::string, torch::Tensor> getNext();
+  bool IsDone();
+  void Reset();
+  size_t GetItersPerEpoch();
+  std::map<std::string, torch::Tensor> getNextThisRank(); 
+  ~CifarDataset() {};
+
+ private:
+  c10::optional<torch::data::Iterator<torch::data::Example<>>> cur_iter;
+  size_t batches_per_epoch_;
+
+  std::unique_ptr<torch::data::StatelessDataLoader<
+      torch::data::datasets::MapDataset<
+          torch::data::datasets::MapDataset<
+              CIFAR10, torch::data::transforms::Normalize<>>,
+          torch::data::transforms::Stack<torch::data::Example<>>>,
+      torch::data::samplers::SequentialSampler>>
+      loader;
 };

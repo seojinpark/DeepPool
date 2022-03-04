@@ -146,6 +146,9 @@ enum JobStatus { IN_PROGRESS = 0, COMPLETED, YIELD };
 enum class LossFunctions {
   NLLLoss = 0,
   CrossEntropyLoss,
+#ifdef ENABLE_STREAMING_DATASET
+  AnvilLoss
+#endif
 };
 
 enum class JobState {
@@ -187,11 +190,20 @@ class RunnableModule {
 
   torch::Tensor getOutput() { return fpOutput; }
 
-  void SetInputsTargets(torch::Tensor input, torch::Tensor target = {});
+  void SetInputsTargets(torch::Tensor input, torch::Tensor target = {}, torch::Tensor weights = {});
 
   const auto& GetTimers() { return timers; }
 
   long GetGlobalBatchSize() const { return globalBatchSize; }
+
+  double GetAvgLoss() {
+    return loss_tracker_.item().toDouble() / static_cast<double>(nr_iters_);
+  }
+
+  void ResetAvgLoss() {
+    loss_tracker_ *= 0;
+    nr_iters_ = 0;
+  }
 
  private:
   friend struct Layer;
@@ -219,7 +231,7 @@ class RunnableModule {
   }
 
   inline void TimerRecordStage(std::string name) {
-    if (rtctx->profile_stage_time && !has_graph && !graph_recording)
+    if (rtctx->profile_stage_time && !graph_recording)
       timers.Record(name);
   }
 
@@ -236,7 +248,13 @@ class RunnableModule {
   GradientSyncManager sync_manager_;
   // Topologically sorted list of layers.
   std::vector<std::shared_ptr<Layer>> layers;
+  std::vector<torch::Tensor> parameters;
+#ifdef ENABLE_STREAMING_DATASET
+  std::shared_ptr<torch::optim::RMSprop> optimizer;
+  std::unique_ptr<torch::optim::StepLR> lrsched;
+#else
   std::unique_ptr<torch::optim::SGD> optimizer;
+#endif
   ////////////////////////////////////////////
   // Context for tracking partial progress.
   ////////////////////////////////////////////
@@ -250,24 +268,32 @@ class RunnableModule {
   // torch::data::Iterator<batchData> batch_data_loader_iter;// = batch_data_loader->begin();
 
   torch::Tensor fpTargets;
+  torch::Tensor fpWeights;
   torch::Tensor fpOutput;
+  torch::Tensor fpLossResult;
   LossFunctions lossfn_;
+
+  torch::Tensor loss_tracker_;
+  size_t nr_iters_{0};
 
   JobState state{JobState::INIT};
 
   bool backwards_did_sync{false};
   bool has_graph{false};
   bool graph_recording{false};
-  torch::Tensor input_buf, target_buf;
+  torch::Tensor input_buf, target_buf, weight_buf;
 
-  std::shared_ptr<GraphPieces> fullgraph;
-  DeepPool::CUDAGraph maingraph, syncgraph, stepgraph;
+  std::shared_ptr<GraphPieces> main_fw_graph, main_bw_graph, step_graph;
+  DeepPool::CUDAGraph fw_graph, bw_graph, syncgraph, stepgraph;
   at::cuda::MempoolId_t graph_mempool;
 
   void ResetGraphs() {
-    fullgraph.reset();
+    main_fw_graph.reset();
+    main_bw_graph.reset();
+    step_graph.reset();
     has_graph = false;
-    maingraph = DeepPool::CUDAGraph();
+    fw_graph = DeepPool::CUDAGraph();
+    bw_graph = DeepPool::CUDAGraph();
     syncgraph = DeepPool::CUDAGraph();
     stepgraph = DeepPool::CUDAGraph();
     rtctx->torch_stream

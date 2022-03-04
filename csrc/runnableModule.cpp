@@ -116,6 +116,12 @@ RunnableModule::RunnableModule(
 
     auto layer = std::make_shared<Layer>(module, specialModule, id,
                                          layerIsActive, doLocalGradSync);
+    if (layer->active){
+      for (const auto& params : layer->module.parameters()) {
+        parameters.push_back(params);
+      }
+    }
+
     layers.push_back(layer);
 
     layer->commGroupKey = RankVecToKey(ldsc["gpuAssignment"]);
@@ -192,33 +198,9 @@ RunnableModule::RunnableModule(
            layer->id, layer->fwUsec, layer->bwUsec);
   }
 
-  /* set up fake data pipelines for input + target */
-  // std::vector<int64_t> inputSizes;
-  // inputSizes.push_back(initialBatchSize);
-  // for (int size : layersInJson[0]["inputDim"]) inputSizes.push_back(size);
-
-  // if (lossfn == LossFunctions::CrossEntropyLoss){
-  //   // auto inputsOpts = torch::TensorOptions().dtype(torch::kInt32);
-  //   // auto inputFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, inputsOpts).detach(); };
-  //   // input_pipeline = TensorGeneratorPipeline(inputFn);
-  // }
-  // else{
-  //   auto inputFn = [=] { return torch::randn(inputSizes); };
-  //   input_pipeline = TensorGeneratorPipeline(inputFn);
-  // }
-
-  // if (lossfn == LossFunctions::CrossEntropyLoss){
-  //   // int targetCount = layersInJson.back()["config"][0];
-  //   // auto targetOpts = torch::TensorOptions().dtype(torch::kInt32);
-  //   // auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1024, inputSizes, targetOpts); };
-  //   // target_pipeline = TensorGeneratorPipeline(targetFn);
-  // }
-  // else{
-  //   int targetCount = layersInJson.back()["config"][0];
-  //   auto targetOpts = torch::TensorOptions().dtype(torch::kInt64);
-  //   auto targetFn = [=] { return torch::randint(/*low=*/0, /*high=*/1000, {targetCount}, targetOpts); };
-  //   target_pipeline = TensorGeneratorPipeline(targetFn);
   SetupOptimizer();
+
+  loss_tracker_ = torch::zeros({1}).to(rtctx->c10dev);
 
   /* Debug check */
   for (auto& l : layers) {
@@ -242,6 +224,8 @@ void RunnableModule::SetMode(bool train) {
     else
       l->module.eval();
   }
+  loss_tracker_ = torch::zeros({1}).to(rtctx->c10dev);
+  nr_iters_ = 0;
 }
 
 /**
@@ -255,40 +239,19 @@ void RunnableModule::SetupOptimizer() {
       parameters.push_back(params);
     }
   }
+
+#ifdef ENABLE_STREAMING_DATASET
+  auto options = torch::optim::RMSpropOptions().lr(0.001).momentum(0.9).alpha(0.9).eps(0.001).weight_decay(0.00001);
+  optimizer = std::make_shared<torch::optim::RMSprop>(parameters, options);
+  lrsched = std::make_unique<torch::optim::StepLR>(*optimizer, 10, 0.5);
+#else
   optimizer = std::make_unique<torch::optim::SGD>(parameters, /*lr=*/0.01);
+#endif
 }
 
-/**
- * Initiate an iteration.
- */
-// void
-// RunnableModule::iterInit()
-// {
-//   layerQ.clear();
-//   layerQ.push_back(&layers[0]);
-
-//   auto t1 = std::chrono::high_resolution_clock::now();
-//   // fpBatch = std::move(*batch_data_loader_iter);
-//   // fpBatch.images = fpBatch.images.to(torch::device({torch::kCUDA, this->device.index()}));//torch::device(torch::kCUDA));
-//   // batch_data_loader_iter = std::next(batch_data_loader_iter);
-//   torch::optional<batchData> b = batch_dataset.read_batch();
-//   fpBatch = b.value();
-//   // fpBatch.images = fpBatch.images.to(torch::device({torch::kCUDA, this->device.index()}));
-//   // memcpy(&fpBatch, b.value(), sizeof(batchData));
-//   auto t2 = std::chrono::high_resolution_clock::now();
-//   if(fpBatch.index % 50 == 0){
-//       auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
-//       std::cout << fpBatch.index << " iterInit "  << " : " << duration.count() << " microseconds/batch" << std::endl;
-//   }
-//   // batch_data_loader = batch_data_loader.operator++();
-//   // fpInput = input_pipeline.GetNext();
-//   // fpTargets = target_pipeline.GetNext();
-//   fpOutput.reset();
-//   fpLoss.reset();
-//   // reduceBuckets.clear();
-//   // reduceBuckets.emplace_back();
 void RunnableModule::SetInputsTargets(torch::Tensor input,
-                                      torch::Tensor target) {
+                                      torch::Tensor target,
+                                      torch::Tensor weight) {
   assert(state == JobState::INIT);
 
   size_t input_nb = input.defined() ? input.nbytes() : 0;
@@ -325,9 +288,27 @@ void RunnableModule::SetInputsTargets(torch::Tensor input,
     target.record_stream(rtctx->torch_stream);
   }
 
+  size_t weight_nb = weight.defined() ? weight.nbytes() : 0;
+
+  if (weight_nb) {
+    /* should already be on device */
+    assert(weight.is_cuda());
+
+    if (!weight_buf.defined() || weight_nb != weight_buf.nbytes()) {
+      /* reallocate target buffer */
+      assert(!has_graph);
+      weight_buf = torch::empty(weight.sizes(), weight.options());
+      assert(weight_buf.is_cuda());
+    }
+
+    weight_buf.copy_(weight, /*non_blocking=*/true);
+    weight.record_stream(rtctx->torch_stream);
+  }
+
   /* enqueue input to first layer */
   layers[0]->tensors_in[0] = input_buf;
   fpTargets = target_buf;
+  fpWeights = weight_buf;
 }
 
 torch::Tensor Layer::DoForward(bool captureLayer) {
@@ -555,62 +536,24 @@ JobStatus RunnableModule::forwardAStep(bool captureLayer) {
 /**
  * Compute the loss from forward pass.
  */
-// void
-// RunnableModule::loss()
-// {
-//   if (fpOutput.defined()) { 
-//     at::Tensor fpLoss;
-//     if(lossfn == LossFunctions::CrossEntropyLoss){
-//       // auto batch_size = globalBatchSize;
-//       // auto shift_logits = fpOutput.index({torch::indexing::Ellipsis, torch::indexing::Slice(torch::indexing::None, -1), torch::indexing::Slice()}).contiguous();
-//       // auto shift_labels = fpTargets.index({torch::indexing::Ellipsis, torch::indexing::Slice(1,torch::indexing::None)}).contiguous();
-//       // auto loss_fct = torch::nn::CrossEntropyLoss();
-//       // fpLoss = loss_fct(shift_logits.view({-1, shift_logits.size(-1)}), shift_labels.view({-1}).to(torch::kLong));
-
-//       // std::cout << "fpBatch.weights " << tsrSizeToStr(fpBatch.weights).c_str() << std::endl;
-//       // std::cout << "fpBatch.labels " << tsrSizeToStr(fpBatch.labels).c_str() << std::endl;
-//       // std::cout << "fpBatch.weights " << fpBatch.weights.requires_grad() << std::endl;
-//       // std::cout << "fpBatch.labels " << fpBatch.labels.requires_grad() << std::endl;
-//       // std::cout << "fpBatch.weights " << fpBatch.weights.options() << std::endl;
-//       // loss_fct->weight = fpBatch.weights;
-//       // fpOutput = fpOutput*fpBatch.weights;
-//       // std::cout << "fpOutput " << tsrSizeToStr(fpOutput).c_str() << std::endl;
-//       // std::cout << "fpOutput " << fpOutput.requires_grad() << std::endl;
-//       // std::cout << "fpLoss " << fpLoss.requires_grad() << std::endl;
-//       // std::cout << "fpLoss " << tsrSizeToStr(fpLoss).c_str() << std::endl;
-//       // fpLoss.retain_grad();
-//       // std::cout << "fpLoss " << fpLoss.requires_grad() << std::endl;
-//       // fpLoss = at::_cast_Long(fpLoss);
-//       // std::cout << "fpLoss " << fpLoss.requires_grad() << std::endl;
-//       // std::cout << "fpLoss " << tsrSizeToStr(fpLoss).c_str() << std::endl;
-
-//       auto loss_fct = torch::nn::CrossEntropyLoss();
-//       // fpBatch.weights = fpBatch.weights.to(torch::device({torch::kCUDA, this->device.index()})).set_requires_grad(true);
-//       // fpBatch.labels = fpBatch.labels.to(torch::device({torch::kCUDA, this->device.index()}));
-
-//       fpLoss = loss_fct(fpOutput, fpBatch.labels);
-      
-//       fpLoss = fpLoss*fpBatch.weights;
-//       fpLoss = fpLoss.sum();
-//     }
-//     else{
-//       fpLoss = torch::nll_loss(fpOutput, fpTargets);
-//       // DP_LOG(DEBUG, "fpLoss: %s", tsrToStr(fpLoss).c_str());
-//     }
-//     fpLoss.backward();
-//     DP_LOG(DEBUG, "fpLoss.backward() done. ");
-//     // idleCtxPtr->processLayerTime(1000, true);
-
 void RunnableModule::loss() {
   if (!fpOutput.defined()) return;
 
   if (lossfn_ == LossFunctions::CrossEntropyLoss) {
     auto loss_fct = torch::nn::CrossEntropyLoss();
     fpOutput = loss_fct(fpOutput, fpTargets.view({-1}));
+#ifdef ENABLE_STREAMING_DATASET
+  } else if (lossfn_ == LossFunctions::AnvilLoss) {
+    auto loss_fct = torch::nn::CrossEntropyLoss(torch::nn::CrossEntropyLossOptions().reduction(torch::kNone));
+    fpOutput = loss_fct(fpOutput, fpTargets);
+    fpOutput = torch::mul(fpOutput,fpWeights);
+    fpOutput = fpOutput.sum();
+#endif
   } else {
     assert(lossfn_ == LossFunctions::NLLLoss);
     fpOutput = torch::nll_loss(fpOutput.log_softmax(1), fpTargets);
   }
+  loss_tracker_ += fpOutput;
 }
 
 /**
@@ -679,6 +622,9 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     layerQ.clear();
     layerQ.push_back(layers[0].get());
 
+    if(!doGraphCapture)
+      nr_iters_++;
+
     if (layers[0]->active && !layers[0]->tensors_in[0].defined())
       assert("MISSING INPUT TO FIRST LAYER!" && false);
 
@@ -690,11 +636,12 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
       graph_recording = true;
       c10::cuda::device_synchronize();
       graph_mempool = DeepPool::graph_pool_handle();
-      maingraph.capture_begin(graph_mempool);
+      fw_graph.capture_begin(graph_mempool);
       commHandler->precapture();
     } else if (has_graph) {
       /* skip to forward phase */
       state = JobState::FORWARD;
+      TimerRecordStage("zero");
       return 0;
     }
 
@@ -710,8 +657,16 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
 
     if (has_graph) {
       DP_LOG(DEBUG, "Replay iter.");
-      fullgraph->Launch(rtctx->torch_stream);
-      state = JobState::FINISH;
+      main_fw_graph->Launch(rtctx->torch_stream);
+      TimerRecordStage("forward");
+      TimerRecordStage("loss");
+      if (!isTrain_){
+        TimerRecordStage("backward");
+        TimerRecordStage("step");
+        state = JobState::FINISH;
+      }
+      else
+        state = JobState::BACKWARD;
       return 0;
     }
 
@@ -719,12 +674,25 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
 
     if (status == COMPLETED) {
       TimerRecordStage("forward");
+      if (doGraphCapture) {
+        sync_manager_.Join();
+        commHandler->postcapture();
+        fw_graph.capture_end();
+        if(isTrain_){
+          bw_graph.capture_begin(graph_mempool);
+          commHandler->precapture();
+        }
+      }
       if (!isTrain_) {
         for (auto& layer : layers) {
           layer->status = LayerStatus::PENDING_FP;
           layer->nr_current_depedencies = layer->prevLayers.size();
         }
         DP_LOG(DEBUG, "Foward pass is completed.");
+
+        TimerRecordStage("loss");
+        TimerRecordStage("backward");
+        TimerRecordStage("step");
         state = JobState::FINISH;
       } else {
         DP_LOG(DEBUG, "Foward pass is completed. Calculating loss soon.");
@@ -743,6 +711,14 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
   } else if (state == JobState::BACKWARD) {
     DP_LOG(DEBUG, "JobState::BACKWARD.");
 
+    if (has_graph) {
+      DP_LOG(DEBUG, "Replay iter.");
+      main_bw_graph->Launch(rtctx->torch_stream);
+      state = JobState::STEP;
+      TimerRecordStage("backward");
+      return 0;
+    }
+
     JobStatus status = backwardAStep(layerProfile);
     if (status == COMPLETED) {
       TimerRecordStage("backward");
@@ -756,7 +732,7 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     if (doGraphCapture) {
       sync_manager_.Join();
       commHandler->postcapture();
-      maingraph.capture_end();
+      bw_graph.capture_end();
       syncgraph.capture_begin(graph_mempool);
     }
 
@@ -765,13 +741,22 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
 
     if (doGraphCapture) {
       syncgraph.capture_end();
-      stepgraph.capture_begin(graph_mempool);
     }
-
-    TimerRecordStage("sync");
+    
     state = JobState::STEP;
   } else if (state == JobState::STEP) {
     DP_LOG(DEBUG, "JobState::STEP");
+    if (has_graph) {
+      step_graph->Launch(rtctx->torch_stream);
+      state = JobState::FINISH;
+      TimerRecordStage("step");
+      return 0;
+    }
+     if (doGraphCapture) {
+      stepgraph.capture_begin(graph_mempool);
+      commHandler->precapture();
+    }
+    
     optimizer->step();
     TimerRecordStage("step");
     state = JobState::FINISH;
@@ -784,25 +769,38 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
 
       if (!isTrain_) {
         commHandler->postcapture();
-        maingraph.capture_end();
-        auto maingraph_e =
-            GraphPieces::GraphToExecs(maingraph.getGRAPH(), maingraphsplit);
-        fullgraph = GraphPieces::MergePieces({maingraph_e});
+        auto mainfwgraph_e =
+            GraphPieces::GraphToExecs(fw_graph.getGRAPH(), maingraphsplit);
+        main_fw_graph = GraphPieces::MergePieces({mainfwgraph_e});
       } else {
+        commHandler->postcapture();
         stepgraph.capture_end();
 
-        auto maingraph_e =
-            GraphPieces::GraphToExecs(maingraph.getGRAPH(), maingraphsplit);
+        auto mainfwgraph_e =
+            GraphPieces::GraphToExecs(fw_graph.getGRAPH(), maingraphsplit);
+        main_fw_graph = GraphPieces::MergePieces({mainfwgraph_e});
+
+        auto mainbwgraph_e =
+            GraphPieces::GraphToExecs(bw_graph.getGRAPH(), maingraphsplit);
         auto syncgraph_e =
             GraphPieces::GraphToExecs(syncgraph.getGRAPH(), -1.0);
+        main_bw_graph =
+            GraphPieces::MergePieces({mainbwgraph_e, syncgraph_e});
         auto stepgraph_e =
             GraphPieces::GraphToExecs(stepgraph.getGRAPH(), stepgraphsplit);
-        fullgraph =
-            GraphPieces::MergePieces({maingraph_e, syncgraph_e, stepgraph_e});
+        step_graph =
+            GraphPieces::MergePieces({stepgraph_e});
       }
       has_graph = true;
       graph_recording = false;
       DP_LOG(NOTICE, "Ending capture.");
+
+      //record zero for timers
+      TimerRecordStage("zero");
+      TimerRecordStage("forward");
+      TimerRecordStage("loss");
+      TimerRecordStage("backward");
+      TimerRecordStage("step");
     }
 
     state = JobState::INIT;
@@ -817,11 +815,11 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
  * Reset timers for profiling each layer. Happens every iteration.
  */
 void RunnableModule::resetTimers() {
-  if (has_graph || graph_recording) return;
+  if (graph_recording) return;
 
   if (rtctx->profile_stage_time) timers.SaveAndReset();
 
-  if (rtctx->profile_layer_times_timers) {
+  if (!has_graph && rtctx->profile_layer_times_timers) {
     layerts_fwd.SaveAndReset();
     layerts_bwd.SaveAndReset();
   }

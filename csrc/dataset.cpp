@@ -3,52 +3,13 @@
 #include <absl/flags/flag.h>
 #include <torch/torch.h>
 
-#include "cifar10.h"
 #include "logger.h"
+#ifdef ENABLE_STREAMING_DATASET
+#include "streamingDataset.h"
+#endif
 
 ABSL_FLAG(std::string, cifar_dataset,
           "/home/friedj/mlsf/multimodel/data/cifar-10-batches-bin/", "");
-
-class FakeDataset : public Dataset {
- public:
-  FakeDataset(size_t rank, long globalBatchSize,
-              std::vector<long> initialBatchSizes,
-              std::vector<long> sampleIndices,
-              std::function<torch::data::Example<>()> gen,
-              size_t images_per_epoch);
-  torch::data::Example<> getNext() override;
-  bool IsDone() override;
-  void Reset() override;
-  size_t GetItersPerEpoch() override;
-
- private:
-  size_t batches_per_epoch_;
-  size_t ctr_{0};
-  std::vector<torch::data::Example<>> cached_;
-};
-
-class CifarDataset : public Dataset {
- public:
-  CifarDataset(size_t rank, long globalBatchSize,
-               std::vector<long> initialBatchSizes,
-               std::vector<long> sampleIndices, bool is_eval);
-  torch::data::Example<> getNext() override;
-  bool IsDone() override;
-  void Reset() override;
-  size_t GetItersPerEpoch() override;
-
- private:
-  c10::optional<torch::data::Iterator<torch::data::Example<>>> cur_iter;
-  size_t batches_per_epoch_;
-
-  std::unique_ptr<torch::data::StatelessDataLoader<
-      torch::data::datasets::MapDataset<
-          torch::data::datasets::MapDataset<
-              CIFAR10, torch::data::transforms::Normalize<>>,
-          torch::data::transforms::Stack<torch::data::Example<>>>,
-      torch::data::samplers::SequentialSampler>>
-      loader;
-};
 
 FakeDataset::FakeDataset(size_t rank, long globalBatchSize,
                          std::vector<long> initialBatchSizes,
@@ -64,12 +25,35 @@ size_t FakeDataset::GetItersPerEpoch() { return batches_per_epoch_; };
 
 bool FakeDataset::IsDone() { return ctr_ >= batches_per_epoch_; }
 
-torch::data::Example<> FakeDataset::getNext() {
+std::map<std::string, torch::Tensor> FakeDataset::getNext() {
   assert(!IsDone());
-  return cached_[ctr_++ % cached_.size()];
+  torch::data::Example<> vals = cached_[ctr_++ % cached_.size()];
+  return {{std::string("data"), vals.data}, {std::string("target"), vals.target}};
 }
 
 void FakeDataset::Reset() { ctr_ = 0; }
+
+std::map<std::string, torch::Tensor> FakeDataset::getNextThisRank(){
+  std::map<std::string, torch::Tensor> rtn;
+  auto ex = getNext();
+  if (initialBatchSizes_.at(rank_))
+    rtn["data"] = ex["data"].split_with_sizes(initialBatchSizes_)[rank_];
+
+  if (sampleIndices_.size()){
+    std::vector<long> spl(globalBatchSize_, 1);
+    auto splitsamples =
+        ex["target"].split_with_sizes(spl); // TODO make this clean....
+    std::vector<torch::Tensor> samplesOrdered;
+    for (auto &s : sampleIndices_)
+      samplesOrdered.push_back(splitsamples.at(s));
+    rtn["target"] = torch::cat(samplesOrdered);
+  }
+  return rtn;
+}
+
+
+
+
 
 CifarDataset::CifarDataset(size_t rank, long globalBatchSize,
                            std::vector<long> initialBatchSizes,
@@ -97,25 +81,53 @@ bool CifarDataset::IsDone() {
   return false;
 }
 
-torch::data::Example<> CifarDataset::getNext() {
+std::map<std::string, torch::Tensor> CifarDataset::getNextThisRank(){
+  std::map<std::string, torch::Tensor> rtn;
+  auto ex = getNext();
+
+  // torch::Tensor data, target;
+  if (initialBatchSizes_.at(rank_))
+    rtn["data"] = ex["data"].split_with_sizes(initialBatchSizes_)[rank_];
+
+  if (sampleIndices_.size()){
+    std::vector<long> spl(globalBatchSize_, 1);
+    auto splitsamples =
+        ex["target"].split_with_sizes(spl); // TODO make this clean....
+    std::vector<torch::Tensor> samplesOrdered;
+    for (auto &s : sampleIndices_)
+      samplesOrdered.push_back(splitsamples.at(s));
+    rtn["target"] = torch::cat(samplesOrdered);
+  }
+  return rtn;
+}
+
+std::map<std::string, torch::Tensor> CifarDataset::getNext()
+{
   assert(!IsDone());
   auto cur_example = *cur_iter.value();
   cur_iter = ++cur_iter.value();
-  return cur_example;
+  return {{std::string("data"), cur_example.data}, {std::string("target"), cur_example.target}};
 }
 
 size_t CifarDataset::GetItersPerEpoch() { return batches_per_epoch_; };
 
 void CifarDataset::Reset() { cur_iter = loader->begin(); }
 
-Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
+
+std::shared_ptr<Dataset> Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
                            std::vector<long> initialBatchSizes,
                            std::vector<long> sampleIndices,
-                           size_t fake_train_iters_per_epoch) {
+                           size_t fake_train_iters_per_epoch,
+                           size_t worldSize) {
   bool eval = name.find("eval") != std::string::npos;
   if (name.find("cifar") != std::string::npos)
-    return new CifarDataset(rank, globalBatchSize, initialBatchSizes,
+    return std::make_shared<CifarDataset>(rank, globalBatchSize, initialBatchSizes,
                             sampleIndices, eval);
+#ifdef ENABLE_STREAMING_DATASET
+  else if (name.find("anvil") != std::string::npos)
+    return std::make_shared<StreamingDataset>(rank, globalBatchSize, initialBatchSizes,
+                            sampleIndices, eval, worldSize);
+#endif
 
   long fake_images = globalBatchSize * fake_train_iters_per_epoch;
 
@@ -131,7 +143,7 @@ Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
                                    {globalBatchSize, 1024}, topts);
       return torch::data::Example<>(data, target);
     };
-    return new FakeDataset(rank, globalBatchSize, initialBatchSizes,
+    return std::make_shared<FakeDataset>(rank, globalBatchSize, initialBatchSizes,
                            sampleIndices, gen, eval ? 1000 : fake_images);
   }
 
@@ -145,6 +157,6 @@ Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
         torch::randint(/*low=*/0, /*high=*/1000, {globalBatchSize}, targetOpts);
     return torch::data::Example<>(data, target);
   };
-  return new FakeDataset(rank, globalBatchSize, initialBatchSizes,
+  return std::make_shared<FakeDataset>(rank, globalBatchSize, initialBatchSizes,
                          sampleIndices, gen, eval ? 1000 : fake_images);
 }

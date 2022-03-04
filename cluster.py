@@ -104,10 +104,10 @@ class Location:
         self.serverId = None
         self.proxy = None
         self.isCpp = isCpp
-        self.is_local = address == "127.0.0.1"
+        self.is_local = (address == "127.0.0.1" or address == "localhost")
         self.process = None
 
-    def getProxy(self, maxRetry = 180):
+    def getProxy(self, maxRetry = 360):
         if self.proxy != None:
             # print("getProxy() returned from cached proxy value.")
             return self.proxy
@@ -260,11 +260,18 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         if len(self.locations) < gpusUsed:
             return "Not enough servers available. %d gpus available while %d needed" % (len(self.locations), gpusUsed)
 
+        lfn = "NLL"
+        if "gpt2" in jobName:
+            lfn = "CrossEntropyLoss"
+        elif "anvil" in jobName:
+            lfn = "AnvilLoss"
         jobParams = {
             "run_with_be": runbe,
             "nr_gpus": gpusUsed,
             "cifar_training": "cifar" in jobName,
-            "lossfn": "CrossEntropyLoss" if "gpt2" in jobName else "NLL",
+            "lossfn": lfn,
+            "epochsToTrain": 500,
+            "autocast": True
         }
 
         jobParamsInJson = json.dumps(jobParams)
@@ -523,11 +530,11 @@ def parse_args():
                         help="To launch CPP version runtimes.")
     parser.add_argument('--manualLaunch', default=False, action='store_true',
                         help="Do not runtimes automatically. Primarily for using gdb on runtime processes.")
-    # parser.add_argument("--localhost", type=str, default=True,
-    #                     help="Run cluster on local host only")
-    # parser.add_argument("--logdir", type=str, default=os.getcwd(),
-    #                     help="Run cluster on local host only")
-    parser.add_argument("--logdir", type=str, default="", help="Full path of log directory")
+    parser.add_argument("--localhost", type=str, default=True,
+                        help="Run cluster on local host only")
+    parser.add_argument("--logdir", type=str, default=os.getcwd(),
+                        help="Run cluster on local host only")
+    # parser.add_argument("--logdir", type=str, default="", help="Full path of log directory")
     # For installing nsys.. (with other cuda toolkit..)
     # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/cuda-ubuntu1804.pin
     # sudo mv cuda-ubuntu1804.pin /etc/apt/preferences.d/cuda-repository-pin-600

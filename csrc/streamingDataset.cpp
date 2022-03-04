@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/prctl.h>
 #include <filesystem>
 #include <fcntl.h>
 
@@ -21,7 +22,7 @@
 #define MAX_FILE_NAME_LEN 128
 #define NUM_FILE_STRINGS 8
 #define MAX_STRING_SIZE 1024
-#define PORT 9008
+// #define PORT 9008
 std::vector<int> pids;
 
 void signalHandler(int signum)
@@ -355,12 +356,15 @@ void *create_shared_memory(size_t size)
     return mmap(NULL, size, protection, visibility, -1, 0);
 }
 
-int get_batch_filename(void *buffer, int rank = -1, int worldSize = -1, std::deque<std::string> *hdf5_file_vec = NULL)
+int get_batch_filename(void *buffer, int rank = -1, int worldSize = -1, 
+                       std::set<batchPath> *hdf5_file_vec = NULL,
+                       bool is_eval = false, int64_t lastIdx=-1)
 {
-    std::string path = "/dev/shm/batches";
+    std::string path = (is_eval) ? "/dev/shm/eval-batches" : "/dev/shm/batches";
     int64_t minBatchIndex = -1;
     std::string minBatchFile;
     std::filesystem::path lockPathExt = std::filesystem::path(".lock");
+    
     while (minBatchIndex == -1)
     {
         for (const auto &entry : std::filesystem::directory_iterator(path))
@@ -371,14 +375,20 @@ int get_batch_filename(void *buffer, int rank = -1, int worldSize = -1, std::deq
 
                 std::string fileName = entry.path().stem();
                 int batchIndex = atoi(fileName.substr(6).c_str());
+                if (lastIdx > 0 && batchIndex < lastIdx)
+                    continue;
 
                 if (rank > -1 && worldSize > -1)
                 {
                     assert(rank < worldSize);
                     if (batchIndex - rank >= 0 && batchIndex % worldSize == rank)
                     {
+                        batchPath bp;
+                        bp.index = batchIndex;
+                        bp.path = entry.path();
+
                         if (hdf5_file_vec != NULL)
-                            hdf5_file_vec->push_back(entry.path());
+                            hdf5_file_vec->insert(bp);
                         if (minBatchIndex == -1 || batchIndex < minBatchIndex)
                         {
                             minBatchIndex = batchIndex;
@@ -405,7 +415,7 @@ void init_sharedBuffers(sharedBuffers *sbufs, char *hdf5_file)
 {
     auto batchFile = H5Fopen(hdf5_file, H5F_ACC_RDONLY, H5P_DEFAULT);
 
-    parse_HDF5_llong_scalar_dataset(batchFile, "/len", &sbufs->batchSize);
+    parse_HDF5_llong_scalar_dataset(batchFile, "/len", &sbufs->datasetSize);
     parse_HDF5_llong_scalar_dataset(batchFile, "/index", &sbufs->index);
 
     // sbufs->iidVecLen = HDF5_get_dataset_len(batchFile, "/iid");
@@ -437,13 +447,13 @@ void init_shared_mutex(sharedBuffers *sbufs)
 
     if (mutex_fd < 0)
     {
-        perror("failure on shm_open on mutex_fd");
+        throw std::runtime_error("failure on shm_open on mutex_fd");
         exit(1);
     }
 
     if (ftruncate(mutex_fd, sizeof(pthread_mutex_t)) == -1)
     {
-        perror("Error on ftruncate to sizeof pthread_mutex_t\n");
+        throw std::runtime_error("Error on ftruncate to sizeof pthread_mutex_t\n");
         exit(-1);
     }
 
@@ -452,7 +462,7 @@ void init_shared_mutex(sharedBuffers *sbufs)
 
     if (sbufs->mp_mutex == MAP_FAILED)
     {
-        perror("Error on mmap on mutex\n");
+        throw std::runtime_error("Error on mmap on mutex\n");
         exit(1);
     }
     close(mutex_fd);
@@ -462,93 +472,104 @@ void init_shared_mutex(sharedBuffers *sbufs)
     pthread_mutex_init(sbufs->mp_mutex, &sbufs->mutexAttr);
 }
 
-void free_sharedBuffers(sharedBuffers *sbufs)
+sharedBuffers::~sharedBuffers()
 {
-    // munmap(sbufs->iidVec, sizeof(char)*sbufs->iidVecLen*MAX_STRING_SIZE+1);
-    munmap(sbufs->weights, sizeof(float) * sbufs->weightsLen);
-    munmap(sbufs->images, sizeof(float) * sbufs->imagesLen);
-    munmap(sbufs->labels, sizeof(int64_t) * sbufs->labelsLen);
-    munmap(sbufs, sizeof(sharedBuffers));
+    if(this->weights != NULL)
+        munmap(this->weights, sizeof(float) * this->weightsLen);
+    if(this->images != NULL)
+        munmap(this->images, sizeof(float) * this->imagesLen);
+    if(this->labels != NULL)
+        munmap(this->labels, sizeof(int64_t) * this->labelsLen);
+    if(this->mp_mutex != NULL)
+        munmap(this->mp_mutex, sizeof(pthread_mutex_t));
 
-    pthread_mutexattr_destroy(&sbufs->mutexAttr);
-    pthread_mutex_destroy(sbufs->mp_mutex);
-    shm_unlink(sbufs->mutexID);
-    munmap(sbufs->mp_mutex, sizeof(pthread_mutex_t));
 }
-
-StreamingDataset::StreamingDataset(int rank, int worldSize)
+StreamingDataset::StreamingDataset(size_t rank, long globalBatchSize,
+                           std::vector<long> initialBatchSizes,
+                           std::vector<long> sampleIndices, bool is_eval, 
+                           size_t worldSize)
+    : Dataset(rank, globalBatchSize, initialBatchSizes, sampleIndices), is_eval_(is_eval), worldSize_(worldSize)
 {
-    this->rank = rank;
-    this->worldSize = worldSize;
+    std::cout << "StreamingDataset Constructor - eval = " << is_eval_ << " is being created (" << this << ")\n";
+
+// }
+// StreamingDataset::StreamingDataset(int rank, int worldSize)
+// {
+    // this->rank = rank;
+    // this->worldSize = worldSize;
 
     int mutex_fd;
     int mode = S_IRWXU | S_IRWXG;
-    sprintf(mutexID, "/main-mutex");
+    sprintf(mutexID_, (is_eval_) ? "/main-mutex-eval" : "/main-mutex");
 
-    mutex_fd = shm_open(mutexID, O_CREAT | O_RDWR, mode);
+    mutex_fd = shm_open(mutexID_, O_CREAT | O_RDWR, mode);
 
     if (mutex_fd < 0)
     {
-        perror("failure on shm_open on mutex_fd");
-        exit(1);
+        throw std::runtime_error("failure on shm_open on mutex_fd");
+        // exit(-1);
     }
 
     if (ftruncate(mutex_fd, sizeof(pthread_mutex_t)) == -1)
     {
-        perror("Error on ftruncate to sizeof pthread_mutex_t\n");
-        exit(-1);
+        throw std::runtime_error("Error on ftruncate to sizeof pthread_mutex_t\n");
+        // exit(-1);
     }
 
-    mp_mutex = (pthread_mutex_t *)mmap(NULL, sizeof(pthread_mutex_t),
+    mp_mutex_ = (pthread_mutex_t *)mmap(NULL, sizeof(pthread_mutex_t),
                                        PROT_READ | PROT_WRITE, MAP_SHARED, mutex_fd, 0);
 
-    if (mp_mutex == MAP_FAILED)
+    if (mp_mutex_ == MAP_FAILED)
     {
-        perror("Error on mmap on mutex\n");
-        exit(1);
+        throw std::runtime_error("Error on mmap on mutex\n");
+        // exit(-1);
     }
     close(mutex_fd);
 
     /* set mutex shared between processes */
-    pthread_mutexattr_setpshared(&mutexAttr, PTHREAD_PROCESS_SHARED);
-    pthread_mutex_init(mp_mutex, &mutexAttr);
+    pthread_mutexattr_setpshared(&mutexAttr_, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(mp_mutex_, &mutexAttr_);
 
     uint64_t BUFFERSIZE = 1024;
     char buffer[BUFFERSIZE];
 
-    for (uint64_t w = 0; w < numWorkers; w++)
+    for (uint64_t w = 0; w < numWorkers_; w++)
     {
         sharedBuffers *newBufs = (sharedBuffers *)create_shared_memory(sizeof(sharedBuffers));
 
         memset(buffer, 0, BUFFERSIZE);
-        get_batch_filename(buffer, (rank * numWorkers) + w, worldSize * numWorkers);
+        get_batch_filename(buffer, (rank * numWorkers_) + w, worldSize_ * numWorkers_, NULL, is_eval_);
         init_sharedBuffers(newBufs, buffer);
+        datasetSize_ = newBufs->datasetSize;
+        if (!is_eval_)
+            epochLen_ = (int64_t)(std::ceil(datasetSize_/worldSize_/500));
+        else
+            epochLen_ = (int64_t)(std::ceil(datasetSize_/worldSize_));
+            // epochLen_ = 100;
 
-        sprintf(newBufs->mutexID, "/mutex-%ld", w);
+        sprintf(newBufs->mutexID, (is_eval_) ? "/mutex-eval-%ld" : "/mutex-%ld", w);
         init_shared_mutex(newBufs);
 
-        newBufs->ready = true;
-        sharedWorkerBuffs.push_back(newBufs);
-
-        remove(buffer);
+        // newBufs->ready = true;
+        sharedWorkerBuffs_.push_back(newBufs);
     }
 
     int pid = 0;
-    for (uint64_t w = 0; w < numWorkers; w++)
+    for (uint64_t w = 0; w < numWorkers_; w++)
     {
         pid = fork();
         if (pid == 0)
         {
-            // printf("worker id %d starting\n", w);
-            workerID = w;
-            bufferIndex = w;
-            workerRunMain();
+            printf("worker id %d starting\n", w);
+            workerID_ = w;
+            bufferIndex_ = w;
+            worker_RunMain();
             break;
         }
         else
         {
             pids.push_back(pid);
-            std::thread thObj(&StreamingDataset::workerToTensorsThread, this, w);
+            std::thread thObj(&StreamingDataset::worker_BlobToTensorsThread, this, w);
             threads.push_back(std::move(thObj));
         }
     }
@@ -558,43 +579,88 @@ StreamingDataset::StreamingDataset(int rank, int worldSize)
         signal(SIGINT, signalHandler);
         signal(SIGTERM, signalHandler);
         signal(SIGKILL, signalHandler);
+        sleep(10);
     }
 };
 
-StreamingDataset::~StreamingDataset(void)
+StreamingDataset::~StreamingDataset()
 {
+    if (moved_from_) {
+      std::cout << "StreamingDataset Destructor - eval = " << is_eval_ << " is being moved (" << this << ")\n";
+      return;
+    }
+    else
+      std::cout << "StreamingDataset Destructor - eval = " << is_eval_ << " is being deleted (" << this << ")\n";
+    
+    stopDataset_ = 1;
+    for (auto sbufs : sharedWorkerBuffs_)
+        sbufs->stopWorker = 1;
+
+    for (std::thread & th : threads)
+        th.join();
+    
+    // for (auto sbufs : sharedWorkerBuffs_)
+    //     free_sharedBuffers(sbufs);
+
+    sharedWorkerBuffs_.clear();
+    // readyBatches.clear();
     // pthread_mutexattr_destroy(&mutexAttr);
     // pthread_mutex_destroy(mp_mutex);
-    // shm_unlink(MUTEX);
-
-    for (auto sbufs : sharedWorkerBuffs)
-        free_sharedBuffers(sbufs);
 };
 
-void StreamingDataset::workerRunMain(void)
+void StreamingDataset::worker_RunMain(void)
 {
     uint64_t BUFFERSIZE = 1024;
     char buffer[BUFFERSIZE] = {0};
-    std::deque<std::string> hdf5_file_vec;
-    sharedBuffers *sbufs = sharedWorkerBuffs[workerID];
-    printf("worker id %ld starting\n", workerID);
+    // std::deque<std::string> hdf5_file_vec;
+    // auto cmp = [](batchPath left, batchPath right) { return (left.index) > (right.index); };
+    std::set<batchPath> hdf5_file_vec;
+
+    sharedBuffers *sbufs = sharedWorkerBuffs_[workerID_];
+    int64_t lastIdx = -1;
+
+    // const char * name = "it_worked";
+    printf("RM-eval-%d id %ld starting\n", is_eval_, workerID_);
+    sprintf(buffer, "RM-eval-%d-%ld", is_eval_, workerID_);
+    if (prctl(PR_SET_NAME, buffer) < 0)
+        printf("RM-eval-%d id %ld: error setting process name\n", is_eval_, workerID_);
 
     while (!sbufs->stopWorker)
     {
         // auto t1 = std::chrono::high_resolution_clock::now();
 
-        if (hdf5_file_vec.size() == 0)
-            get_batch_filename(buffer, (rank * numWorkers) + workerID, worldSize * numWorkers, &hdf5_file_vec);
         memset(buffer, 0, BUFFERSIZE);
-        memcpy(buffer, hdf5_file_vec.front().c_str(), hdf5_file_vec.front().size());
-        hdf5_file_vec.pop_front();
+        // if (hdf5_file_vec.size() == 0)
+        get_batch_filename(buffer, (rank_ * numWorkers_) + workerID_, worldSize_ * numWorkers_, NULL, is_eval_, lastIdx);
+
+        // std::cout << rank_ << ' ' << numWorkers_ << ' ' << workerID_ << ' ' << is_eval_ << " myset contains:";
+        // for (auto it=hdf5_file_vec.begin(); it!=hdf5_file_vec.end(); ++it)
+        //     std::cout << ' ' << it->index;
+        // std::cout << '\n';
+
+        // auto bp = hdf5_file_vec.begin();
+        // memcpy(buffer, bp->path.c_str(), bp->path.size());
+        // hdf5_file_vec.erase(bp);
+
+
+
+        // std::cout << is_eval_ << " " << buffer << '\n';
+
+
+        // std::cout << rank_ << ' ' << numWorkers_ << ' ' << workerID_ << ' ' << is_eval_  << " myset contains post:";
+        // for (auto it=hdf5_file_vec.begin(); it!=hdf5_file_vec.end(); ++it)
+        //     std::cout << ' ' << it->index;
+        // std::cout << '\n';
 
         // auto t2 = std::chrono::high_resolution_clock::now();
 
-        while (sbufs->ready)
+        while (sbufs->ready && !sbufs->stopWorker)
         {
             usleep(100); /* wait for buffer to be accessed */
+            // get_batch_filename(NULL, (rank_ * numWorkers_) + workerID_, worldSize_ * numWorkers_, &hdf5_file_vec, is_eval_);
         };
+        if (sbufs->stopWorker)
+            break;
 
         // auto t3 = std::chrono::high_resolution_clock::now();
 
@@ -612,66 +678,72 @@ void StreamingDataset::workerRunMain(void)
         H5close();
 
         sbufs->ready = true;
-        remove(buffer);
-        // auto t4 = std::chrono::high_resolution_clock::now();
-
-        // if(sbufs->index % 50 == 0){
-        //     // auto t2 = std::chrono::high_resolution_clock::now();
-        //     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
-        //     auto duration2 = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2);
-        //     auto duration3 = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3);
-        //     std::cout << workerID << " " << sbufs->index << " \t\t\t\tworkerRunMain " << duration.count() << " " \
-        //         << duration2.count() << " " << duration3.count() << " microseconds/batch" << std::endl;
-        // }
+        remove(buffer); //remove file
     }
 }
 
-void StreamingDataset::workerToTensorsThread(int wID)
+void StreamingDataset::worker_BlobToTensorsThread(int wID)
 {
     batchData batch;
     // static int last = 0;
     // int64_t index = -1;
-    sharedBuffers *sbufs = sharedWorkerBuffs[wID];
+    sharedBuffers *sbufs = sharedWorkerBuffs_[wID];
 
-    while (!stopDataset)
+
+    uint64_t BUFFERSIZE = 1024;
+    char buffer[BUFFERSIZE] = {0};
+    printf("BtTT-eval-%d id %d starting\n", is_eval_, wID);
+    sprintf(buffer, "BtTT-eval-%d-%d", is_eval_, wID);
+    if (prctl(PR_SET_NAME, buffer) < 0)
+        printf("BtTT-eval-%d id %d: error setting process name\n", is_eval_, wID);
+
+    while (!stopDataset_)
     {
         // auto t1 = std::chrono::high_resolution_clock::now();
-        while (!sbufs->ready)
+        while ((readyBatches.size() > 256 || !sbufs->ready) && !stopDataset_)
         {
             usleep(100);
+            // if(lastBatchIdx+1 % ((rank_ * numWorkers_) + workerID_) == 0)
+            //     break;
         };
+        if(stopDataset_)
+            break;
         // pthread_mutex_lock(sbufs->mp_mutex);
         // auto t2 = std::chrono::high_resolution_clock::now();
         // sbufs->ready = false;
 
-        batch.len = sbufs->batchSize;
+        batch.datasetSize = sbufs->datasetSize;
         batch.index = sbufs->index;
 
         auto options = torch::TensorOptions().dtype(torch::kFloat32); //.device(torch::kCUDA, 1);
 
         at::IntArrayRef weightsDimsArr((int64_t *)sbufs->weightsDims, (int64_t *)sbufs->weightsDims + sbufs->weightsNDims);
-        batch.weights = torch::from_blob((void *)sbufs->weights, weightsDimsArr, options).to(torch::device({torch::kCUDA, this->rank})).set_requires_grad(true);
+        // batch.weights = torch::from_blob((void *)sbufs->weights, weightsDimsArr, options).to(torch::device({torch::kCUDA, this->rank_})).set_requires_grad(true);
+        batch.weights = torch::from_blob((void *)sbufs->weights, weightsDimsArr, options).clone(); //.set_requires_grad(true);
 
         at::IntArrayRef imagesDimsArr((int64_t *)sbufs->imagesDims, (int64_t *)sbufs->imagesDims + sbufs->imagesNDims);
-        batch.images = torch::from_blob((void *)sbufs->images, imagesDimsArr, options).to(torch::device({torch::kCUDA, this->rank}));
+        // batch.images = torch::from_blob((void *)sbufs->images, imagesDimsArr, options).to(torch::device({torch::kCUDA, this->rank_}));
+        batch.images = torch::from_blob((void *)sbufs->images, imagesDimsArr, options).clone();
 
         auto longOptions = torch::TensorOptions().dtype(torch::kInt64);
         at::IntArrayRef labelsDimsArr((int64_t *)sbufs->labelsDims, (int64_t *)sbufs->labelsDims + sbufs->labelsNDims);
-        batch.labels = torch::from_blob((void *)sbufs->labels, labelsDimsArr, longOptions).to(torch::device({torch::kCUDA, this->rank}));
+        // batch.labels = torch::from_blob((void *)sbufs->labels, labelsDimsArr, longOptions).to(torch::device({torch::kCUDA, this->rank_}));
+        batch.labels = torch::from_blob((void *)sbufs->labels, labelsDimsArr, longOptions).clone();
 
         // pthread_mutex_unlock(sbufs->mp_mutex);
-        local_mutex.lock();
-        readyBatches.push_back(batch);
+        local_mutex_.lock();
+        readyBatches.push(batch);
         sbufs->ready = false;
-        local_mutex.unlock();
+        local_mutex_.unlock();
+        // std::cout << batch.index << " worker_BlobToTensorsThread " << wID << std::endl;
         // if(batch.index % 50 == wID){
         //     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
-        //     std::cout << batch.index << " workerToTensorsThread " << wID << " : " << duration.count() << " microseconds/batch" << std::endl;
+            // std::cout << batch.index << " worker_BlobToTensorsThread " << wID << " : " << duration.count() << " microseconds/batch" << std::endl;
         // }
-        while (readyBatches.size() > 256)
-        {
-            usleep(100);
-        }
+        // while (readyBatches.size() > 256  && !stopDataset_)
+        // {
+        //     usleep(100);
+        // }
     }
 }
 
@@ -680,19 +752,38 @@ torch::optional<batchData> StreamingDataset::read_batch()
     batchData batch;
     while (1)
     {
-        local_mutex.lock();
+        // batch = readyBatches.top();
+        // if(batch.index == lastBatchIdx+1){
+
+        // if(is_eval_ && counter_ > 20)
+        //     done_=true;
+        local_mutex_.lock();
         if (readyBatches.size() > 0)
         {
-            batch = readyBatches.front();
-            if (batch.index % 50 == 0)
-                std::cout << "readyBatches.size()  " << readyBatches.size() << std::endl;
-            readyBatches.pop_front();
-            local_mutex.unlock();
+            batch = readyBatches.top();
+            readyBatches.pop();
+            lastBatchIdx = batch.index;
+            local_mutex_.unlock();
             break;
         }
-        else
-            local_mutex.unlock();
+        else{
+            local_mutex_.unlock();
+            std::string path = (is_eval_) ? "/dev/shm/eval-batches/done.lock" : "/dev/shm/batches/done.lock";
+            std::string dirpath = (is_eval_) ? "/dev/shm/eval-batches" : "/dev/shm/batches";
+            uint64_t numfiles = 0;
+            for (const auto & entry : std::filesystem::directory_iterator(dirpath))
+                numfiles += 1;
+            
+            // epochLen_*epochCount_ + counter_ >= datasetSize_/worldSize_
+            if (std::filesystem::exists(path) && numfiles == 1 && readyBatches.size() == 0){
+                done_=true;
+                return torch::nullopt;
+            }
+        }
+        // }
     }
+    // std::cout << "\n\nINPUT" << batch.images.index({0,0,0}) << std::endl << std::endl << std::endl << std::endl;
+    // std::cout << "\t\t\t\t\t\tbatch.index : " << batch.index << "  readyBatches.size() : " << readyBatches.size() << std::endl;
     return batch;
 }
 
@@ -701,15 +792,53 @@ int64_t StreamingDataset::init(void)
     return 0;
 }
 
-torch::optional<batchData> StreamingDataset::get_batch(size_t)
+// torch::optional<batchData> StreamingDataset::get_batch(void)
+// {
+//     return read_batch();
+// }
+
+std::map<std::string, torch::Tensor> StreamingDataset::getNext()
 {
-    return read_batch();
+  assert(!IsDone());
+  auto batch = read_batch();
+  if (batch){
+    counter_++;
+    if (counter_==epochLen_){
+        done_ = true;
+        epochCount_++;
+    }
+    int64_t scalar[] = {batch->index};
+    return {{"idx", torch::from_blob(scalar, {1}, torch::TensorOptions().dtype(torch::kInt64)).clone()}, 
+            {"data", batch->images}, {"target", batch->labels}, {"weight", batch->weights}};
+  }
+  else{
+      done_ = true;
+      return {};
+  }
+  
 }
 
-torch::optional<size_t> StreamingDataset::size() const
-{
-    return this->epochLen * 500;
+size_t StreamingDataset::GetItersPerEpoch(){
+    // epochLen = (uint64_t)datasetSize/500;
+    return epochLen_;
 }
+
+std::map<std::string, at::Tensor> StreamingDataset::getNextThisRank() {
+//   if(!startedDataset_){
+//     for (uint64_t w = 0; w < numWorkers_; w++){
+//       std::thread thObj(&StreamingDataset::worker_BlobToTensorsThread, this, w);
+//       threads.push_back(std::move(thObj));
+//     }
+//     startedDataset_ = true;
+//   }
+    
+  return getNext();
+}
+
+// torch::optional<size_t> StreamingDataset::size()
+// {
+//     return this->epochLen * 500;
+// }
 
 int64_t StreamingDataset::test(void)
 {

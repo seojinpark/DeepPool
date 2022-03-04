@@ -5,19 +5,23 @@ list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/nfsnccl")
 list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/libtorch")
 list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/cuda")
 find_package(Torch REQUIRED)
+message("TORCH_LIBRARIES:${TORCH_LIBRARIES}")
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED on)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS} -std=c++17 -lstdc++fs -Wall -Wextra")
-set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -g")
+set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
 enable_language(CUDA)
 #set(CUDA_ATTACH_VS_BUILD_RULE_TO_CUDA_FILE ON)
 set(BUILD_SHARED_LIBS ON)
 set(CUDA_SEPARABLE_COMPILATION ON)
+set(CMAKE_CUDA_ARCHITECTURES "80")
 set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS} -std=c++17)
 
 cuda_add_library("cudasleep"
@@ -70,20 +74,23 @@ add_custom_command(
         "${dp_proto}"
       DEPENDS "${dp_proto}")
 
-message(STATUS "PYTHON_LIBRARY = ${PYTHON_LIBRARY}")
 
-# # dependencies
-# set(Python_ADDITIONAL_VERSIONS 3.9)
-# find_package(PythonInterp 3.9 REQUIRED)
-# find_package(PythonLibs 3.9 REQUIRED)
+if(${BUILD_ANVIL})
+    include(FetchContent)
+    FetchContent_Declare(matplotplusplus
+            GIT_REPOSITORY https://github.com/alandefreitas/matplotplusplus
+            GIT_TAG 3fd7593f3bf98ca60fdf3db17073ea8bbe161263 # or whatever tag you want
+    )
 
-# find_package(Python COMPONENTS Interpreter Development)
-# message("Python_FOUND:${Python_FOUND}")
-# message("Python_VERSION:${Python_VERSION}")
-# message("Python_Development_FOUND:${Python_Development_FOUND}")
-# message("Python_LIBRARIES:${Python_LIBRARIES}")
+    FetchContent_GetProperties(matplotplusplus)
+    if(NOT matplotplusplus_POPULATED)
+        FetchContent_Populate(matplotplusplus)
+        add_subdirectory(${matplotplusplus_SOURCE_DIR} ${matplotplusplus_BINARY_DIR} EXCLUDE_FROM_ALL)
+    endif()
 
-# include_directories(${PYTHON_INCLUDE_DIRS})
+    message("matplotplusplus_SOURCE_DIR:${matplotplusplus_SOURCE_DIR}")
+    message("matplotplusplus_BINARY_DIR:${matplotplusplus_BINARY_DIR}")
+endif()
 
 # Include generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
@@ -107,25 +114,53 @@ target_link_libraries(dp_grpc_proto
   ${_PROTOBUF_LIBPROTOBUF})
 
 
-# find_package(HDF5 REQUIRED)
-# include_directories(${HDF5_INCLUDE_DIRS})
-find_package(HDF5 COMPONENTS C CXX HL REQUIRED)
-link_directories( ${HDF5_LIBRARY_DIRS} )
-include_directories( ${HDF5_INCLUDE_DIRS} )
+if(${BUILD_ANVIL})
+    find_package(HDF5 REQUIRED)
+    include_directories(${HDF5_INCLUDE_DIRS})
 
-# Linking info for runtime.
-add_executable(runtime
-  "runtime.cpp" "runnableModule.cpp" "JobContext.cpp" "logger.cpp"
-  "communication.cpp" "rpcService.cpp" "GraphPieces.cpp" "BeTask.cpp" "streamingDataset.cpp"
-  "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" "cifar10.cpp" "dataset.cpp" "GradSync.cpp" "CUDAGraph.cpp")
-target_link_libraries(runtime
-  dp_grpc_proto
-  cudasleep
-  absl::flags absl::flags_parse
-  ${_REFLECTION}
-  ${_GRPC_GRPCPP}
-  ${_PROTOBUF_LIBPROTOBUF}
-  ${TORCH_LIBRARIES}
-  ${HDF5_CXX_LIBRARIES})
-
+    find_package(OpenCV REQUIRED)
+    message(STATUS "OpenCV library status:")
+    message(STATUS "    config: ${OpenCV_DIR}")
+    message(STATUS "    version: ${OpenCV_VERSION}")
+    message(STATUS "    libraries: ${OpenCV_LIBS}")
+    message(STATUS "    include path: ${OpenCV_INCLUDE_DIRS}")
+    
+  add_executable(runtime
+    "runtime.cpp" "runnableModule.cpp" "JobContext.cpp" "logger.cpp"
+    "communication.cpp" "rpcService.cpp" "GraphPieces.cpp" "BeTask.cpp" 
+    "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" "cifar10.cpp" 
+    "dataset.cpp" "GradSync.cpp" "CUDAGraph.cpp"
+    "streamingDataset.cpp" "stats.cpp"
+  )
+  target_link_libraries(runtime
+    dp_grpc_proto
+    cudasleep
+    absl::flags absl::flags_parse
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF}
+    ${TORCH_LIBRARIES}
+    ${OpenCV_LIBS}
+    ${HDF5_LIBRARIES}
+    matplot
+  )
+else()
+  add_executable(runtime
+    "runtime.cpp" "runnableModule.cpp" "JobContext.cpp" "logger.cpp"
+    "communication.cpp" "rpcService.cpp" "GraphPieces.cpp" "BeTask.cpp" 
+    "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" "cifar10.cpp" 
+    "dataset.cpp" "GradSync.cpp" "CUDAGraph.cpp"
+  )
+  target_link_libraries(runtime
+    dp_grpc_proto
+    cudasleep
+    absl::flags absl::flags_parse
+    ${_REFLECTION}
+    ${_GRPC_GRPCPP}
+    ${_PROTOBUF_LIBPROTOBUF}
+    ${TORCH_LIBRARIES}
+  )
+endif()
+  
+# opencv_imgcodecs
 set_property(TARGET runtime PROPERTY CXX_STANDARD 17)
