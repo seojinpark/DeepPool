@@ -835,11 +835,6 @@ std::map<std::string, at::Tensor> StreamingDataset::getNextThisRank() {
   return getNext();
 }
 
-// torch::optional<size_t> StreamingDataset::size()
-// {
-//     return this->epochLen * 500;
-// }
-
 int64_t StreamingDataset::test(void)
 {
     // Generate a data loader.

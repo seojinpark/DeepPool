@@ -127,6 +127,21 @@ void JobContext::printJobStatistics() {
       timers.GetP50("forward", warmupIters), timers.GetP50("loss", warmupIters),
       timers.GetP50("backward", warmupIters),
       timers.GetP50("stop", warmupIters));
+  printf(
+      "A training job %s is completed (%lu iters, %.2f ms/iter, %.2f iter/s, "
+      "%.2f be img/s, %lu globalBatchSize)."
+      " AverageTiming (ms) => zero: %.1f, load:%.1f, fp:%.1f, loss:%.1f, "
+      "bp:%.1f, opt: %.1f, iter:%.1f"
+      " P50 (ms) => fp:%.1f, loss:%.1f, bp:%.1f, iter:%.1f\n",
+      name.c_str(), iters, total_iter_ms, total_iter_ps, be_img_ps,
+      model->globalBatchSize, timers.GetAvg("zero", warmupIters),
+      timers.GetAvg("load", warmupIters), timers.GetAvg("forward", warmupIters),
+      timers.GetAvg("loss", warmupIters),
+      timers.GetAvg("backward", warmupIters),
+      timers.GetAvg("step", warmupIters), timers.GetAvg("stop", warmupIters),
+      timers.GetP50("forward", warmupIters), timers.GetP50("loss", warmupIters),
+      timers.GetP50("backward", warmupIters),
+      timers.GetP50("stop", warmupIters));
 }
 
 /**
@@ -154,7 +169,7 @@ void JobContext::StepOne(bool *iter_done) {
     }
   }
 
-  at::autocast::set_enabled(autocast_);
+  at::autocast::set_enabled(autocast_ && model->isTrain_);
   iter_in_progress = !model->AdvanceTraining(graphCapture, profile);
   at::autocast::set_enabled(false);
 

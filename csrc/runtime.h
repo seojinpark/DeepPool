@@ -27,6 +27,7 @@
 #include "JobContext.h"
 
 #define VERBOSE 0
+#define ENABLE_STREAMING_DATASET 1
 
 /**
  * Forward declarations

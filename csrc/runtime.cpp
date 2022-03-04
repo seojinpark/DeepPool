@@ -33,6 +33,7 @@
 #include "rpcService.h"
 #include "runtime.grpc.pb.h"
 #include "utils.h"
+#include "runnableModule.h"
 
 // #include "streamingDataset.h"
 
@@ -168,11 +169,36 @@ int RuntimeContext::poll() {
       BePause();
   }
 
-  if (mainJob->ShouldRunTest()) mainJob->Test();
+  auto warmupIters = mainJob->getWarmupIters();
+  const auto &timers = mainJob->model->GetTimers();
+  CpuTimer trainEpochTimer("epochTimer");
+  bool skipTest = false;
+  // if (mainJob->ShouldRunTest()) mainJob->Test(1000);
   for (size_t i = 0; i < mainJob->GetEpochsToTrain(); i++) {
-    mainJob->TrainOneEpoch();
-    if (mainJob->ShouldRunTest()) mainJob->Test();
+    if(i >= 10) trainEpochTimer.start();
+    mainJob->TrainOneEpoch(i);
+    if(i >= 10) trainEpochTimer.stop();
+    // if (mainJob->ShouldRunTest()) mainJob->Test();
+    printf(
+      " AverageTiming (ms) => fp:%.4f, "
+      "bp:%.4f, opt: %.4f, Total Epoch: %.4f (%.4f per batch), "
+      " P50 (ms) => fp:%.4f, loss:%.4f, bp:%.4f\n",
+      timers.GetAvg("forward", warmupIters),
+      timers.GetAvg("backward", warmupIters),
+      timers.GetAvg("step", warmupIters),
+      trainEpochTimer.avgMs(),
+      trainEpochTimer.avgMs()/mainJob->getTrainItersPerEpoch(),
+      timers.GetP50("forward", warmupIters),
+      timers.GetP50("loss", warmupIters),
+      timers.GetP50("backward", warmupIters));
+
+    if (std::isnan(mainJob->model->GetAvgLoss())){
+      printf("GetAvgLoss is NaN, ending training");
+      skipTest = true;
+      break;
+    }
   }
+  if (mainJob->ShouldRunTest() && !skipTest) mainJob->Test(mainJob->GetEpochsToTrain());
 
   torch_stream.synchronize();
   mainJob->printJobStatistics();
@@ -240,6 +266,7 @@ int main(int argc, char** argv) {
 
   // std::exit(0);
 
+  // torch::manual_seed(0);
   RuntimeContext ctx;
   rtctx = &ctx;
   ctx.shutdownRequested = false;
@@ -256,8 +283,15 @@ int main(int argc, char** argv) {
   InitBeTask(becfg);
 
   std::cout << "myAddr: " << absl::GetFlag(FLAGS_myAddr)
-            << " rank: " << ctx.rank << std::endl;
+            << " rank: " << ctx.rank << " "
+            << " device: " << ctx.device << std::endl;
   std::cout << "myPID: " << getpid() << std::endl;
+  std::cout << "CUDA DEVICE COUNT: " << torch::cuda::device_count() << std::endl;
+  if(const char* env_p = std::getenv("CUDA_VISIBLE_DEVICES"))
+      std::cout << "Your CUDA_VISIBLE_DEVICES is: " << env_p << '\n';
+  else
+      std::cout << "Your CUDA_VISIBLE_DEVICES is NULL\n";
+
   initGrpcServer(&ctx);
 
   if (ctx.debug) {

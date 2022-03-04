@@ -175,6 +175,10 @@ RunnableModule::RunnableModule(
           layer->tx_lids.insert(src_lid);
       }
     }
+    // layer->moduleName = name + ldsc["params"].dump() + "[" +
+    //                     std::to_string(layerLocalBatch) + "]" +
+    //                     ldsc["inputDim"].dump();
+    // std::cout << "layer->moduleName.c_str()  " << layer->moduleName.c_str() << std::endl;
 
     if (rtctx->profile_layer_times_graph) {
       // TODO: if it's not that accurate, maybe add layer id?
@@ -241,9 +245,9 @@ void RunnableModule::SetupOptimizer() {
   }
 
 #ifdef ENABLE_STREAMING_DATASET
-  auto options = torch::optim::RMSpropOptions().lr(0.001).momentum(0.9).alpha(0.9).eps(0.001).weight_decay(0.00001);
+  auto options = torch::optim::RMSpropOptions().lr(0.0001).momentum(0.9).alpha(0.9).eps(0.001).weight_decay(0.00001);
   optimizer = std::make_shared<torch::optim::RMSprop>(parameters, options);
-  lrsched = std::make_unique<torch::optim::StepLR>(*optimizer, 10, 0.5);
+  lrsched = std::make_unique<torch::optim::StepLR>(*optimizer, 10, 0.9);
 #else
   optimizer = std::make_unique<torch::optim::SGD>(parameters, /*lr=*/0.01);
 #endif

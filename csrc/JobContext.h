@@ -87,6 +87,10 @@ class JobContext {
   size_t profile_iter_start{3};
   size_t niter_to_profile{5};
   bool autocast_{false};
+  bool early_stopping{false};
+  double early_min_improvement{0.03};
+  size_t early_retries{10};
+  std::deque<size_t> early_loss_log;
 
   bool job_done_{false};
 
