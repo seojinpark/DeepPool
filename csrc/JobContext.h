@@ -49,10 +49,12 @@ class JobContext {
   torch::Tensor Infer(torch::Tensor input);
 
   /* Run one training iteration with this input/target */
-  void Train(torch::Tensor input, torch::Tensor target);
+  void Train(torch::Tensor input,
+             torch::Tensor target, 
+             torch::Tensor weights = {});
 
   /* Test the model on the test dataset */
-  void Test();
+  void Test(int64_t curEpoch = -1);
 
   /* Advance one step through the the model */
   void StepOne(bool *iter_done);
@@ -61,15 +63,18 @@ class JobContext {
   void FinishIteration();
 
   /* Train one full epoch */
-  void TrainOneEpoch();
+  void TrainOneEpoch(int64_t curEpoch = -1);
 
   void printJobStatistics();
 
-  std::unique_ptr<RunnableModule> model;
+  std::shared_ptr<RunnableModule> model;
   std::string name;
   std::shared_ptr<CommunicationHandler> commHandler;
   std::chrono::time_point<std::chrono::steady_clock> start, end;
   uint64_t be_img_start, be_img_end;
+
+  size_t getTrainItersPerEpoch();
+  size_t getWarmupIters(){return warmupIters;};
 
  private:
   // Params

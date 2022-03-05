@@ -67,13 +67,13 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
   if (job_params.contains("epochs_to_train"))
     epochsToTrain = job_params["epochs_to_train"].get<size_t>();
 
-  train_dataset_.reset(
-      Dataset::fromName(dset, rtctx->rank, model->globalBatchSize,
-                        model->initialBatchSizes, model->sampleIndices, 2000));
-  eval_dataset_.reset(
-      Dataset::fromName(dset + "_eval", rtctx->rank, model->globalBatchSize,
-                        model->initialBatchSizes, model->sampleIndices, 10));
-  dataset_pipeline_.reset(new DatasetPipelineWrapper(train_dataset_));
+  train_dataset_ = Dataset::fromName(dset, rtctx->rank, model->globalBatchSize,
+                        model->initialBatchSizes, model->sampleIndices, 2000, rtctx->worldSize);
+
+  eval_dataset_ = Dataset::fromName(dset + "_eval", rtctx->rank, model->globalBatchSize,
+                        model->initialBatchSizes, model->sampleIndices, 10, rtctx->worldSize);
+
+  dataset_pipeline_ = std::make_shared<DatasetPipelineWrapper>(train_dataset_);
 
   if (!rtctx->use_fg_graph)
     iters_before_graph_capture = itersToTrain * epochsToTrain;
@@ -158,11 +158,12 @@ void JobContext::StepOne(bool *iter_done) {
       job_done_ = true;
       return;
     }
-    ++totiters;
+    if (!graphCapture)
+      ++totiters;
   }
 }
 
-void JobContext::Test() {
+void JobContext::Test(int64_t curEpoch) {
   double total = 0.0;
   torch::Tensor correct = torch::zeros({1}).to(at::kLong).to(rtctx->c10dev);
 
@@ -176,12 +177,12 @@ void JobContext::Test() {
     total += model->GetGlobalBatchSize();
 
     auto batch = eval_dataset_->getNextThisRank();
-    torch::Tensor input = batch.data;
+    torch::Tensor input = batch["data"];
     if (input.defined()) input = input.to(rtctx->c10dev);
     auto output = Infer(input);
     if (output.defined() && output.nbytes() > 0) {
       auto pred = output.argmax(1);
-      correct += pred.eq(batch.target.to(rtctx->c10dev)).sum();
+      correct += pred.eq(batch["target"].to(rtctx->c10dev)).sum();
     }
     DP_LOG(DEBUG, "Evaluate iteration %lu/%lu\n", ++i,
            eval_dataset_->GetItersPerEpoch());
@@ -204,29 +205,62 @@ void JobContext::Test() {
 }
 
 torch::Tensor JobContext::Infer(torch::Tensor input) {
+  bool will_do_graph_capture = false;
+  if(totiters == iters_before_graph_capture && !model->has_graph)
+    will_do_graph_capture = true;
+
   torch::NoGradGuard guard;
   model->SetEval();
-  model->SetInputsTargets(input, {});
+  model->SetInputsTargets(input);
   FinishIteration();
+
+  if(will_do_graph_capture){
+    //model doesnt actuall run when the graph is captured
+    model->SetInputsTargets(input);
+    FinishIteration();
+  }
   return model->getOutput();
 }
 
-void JobContext::Train(torch::Tensor input, torch::Tensor target) {
+void JobContext::Train(torch::Tensor input, torch::Tensor target, torch::Tensor weights) {
+  bool will_do_graph_capture = false;
+  if(totiters == iters_before_graph_capture && !model->has_graph)
+    will_do_graph_capture = true;
+
   model->SetTrain();
-  model->SetInputsTargets(input, target);
+  model->SetInputsTargets(input, target, weights);
   FinishIteration();
+
+  if(will_do_graph_capture){
+    //model doesnt actuall run when the graph is captured
+    model->SetInputsTargets(input, target, weights);
+    FinishIteration();
+  }
 }
 
-void JobContext::TrainOneEpoch() {
+void JobContext::TrainOneEpoch(int64_t curEpochh) {
   dataset_pipeline_->Reset();
+  model->ResetAvgLoss();
   size_t i = 0;
   if (iters_before_graph_capture < totiters && rtctx->use_fg_graph)
     iters_before_graph_capture = totiters + 5;
   while (!dataset_pipeline_->IsDone() && !job_done_) {
     auto batch = dataset_pipeline_->getNextThisRank();
-    Train(batch.data, batch.target);
+    if(batch.find("data") == batch.end())
+      continue;
+
+    Train(batch["data"], batch["target"], batch["weight"]);
     DP_LOG(DEBUG, "Training iteration %lu/%lu\n", ++i,
            dataset_pipeline_->GetItersPerEpoch());
+           
+    if (nr_gpus_ > 1) {
+      rtctx->torch_stream.synchronize();  // sync before calling into NCCL
+      commHandler->comm_start();
+      auto tmp_sync = torch::zeros({1}).to(rtctx->c10dev);;
+      commHandler->all_reduce(tmp_sync, c10d::ReduceOp::SUM);
+      commHandler->comm_end();
+      commHandler->sync();
+    }
   }
   double loss = model->GetAvgLoss();
   DP_LOG(DEBUG, "Epoch done. Loss %.2f", loss);
@@ -251,3 +285,7 @@ void JobContext::FinishIteration() {
     StepOne(&iter_done);
   } while (!iter_done && !job_done_);
 }
+
+size_t JobContext::getTrainItersPerEpoch(){
+  return train_dataset_->GetItersPerEpoch();
+};

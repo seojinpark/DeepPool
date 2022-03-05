@@ -228,6 +228,7 @@ std::unique_ptr<JobContext> RuntimeServiceImpl::parseAndCreateTrainingTask(
     commHandler = std::make_shared<CommunicationHandlerGRPC>(
         name, worldSize, tensorTags, rank, jobRankToGlobalRank);
   }
+  DP_LOG(DEBUG, "commHandler constructed.");
 
   json jobParams = json::parse(request->job_meta_params_in_json());
   DP_LOG(DEBUG, "parsed jobParams into json");

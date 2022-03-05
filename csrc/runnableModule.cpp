@@ -115,6 +115,12 @@ RunnableModule::RunnableModule(
 
     auto layer = std::make_shared<Layer>(module, specialModule, id,
                                          layerIsActive, doLocalGradSync);
+    if (layer->active){
+      for (const auto& params : layer->module.parameters()) {
+        parameters.push_back(params);
+      }
+    }
+
     layers.push_back(layer);
 
     layer->commGroupKey = RankVecToKey(ldsc["gpuAssignment"]);
@@ -236,7 +242,8 @@ void RunnableModule::SetupOptimizer() {
 }
 
 void RunnableModule::SetInputsTargets(torch::Tensor input,
-                                      torch::Tensor target) {
+                                      torch::Tensor target,
+                                      torch::Tensor weight) {
   assert(state == JobState::INIT);
 
   size_t input_nb = input.defined() ? input.nbytes() : 0;
@@ -273,9 +280,27 @@ void RunnableModule::SetInputsTargets(torch::Tensor input,
     target.record_stream(rtctx->torch_stream);
   }
 
+  size_t weight_nb = weight.defined() ? weight.nbytes() : 0;
+
+  if (weight_nb) {
+    /* should already be on device */
+    assert(weight.is_cuda());
+
+    if (!weight_buf.defined() || weight_nb != weight_buf.nbytes()) {
+      /* reallocate target buffer */
+      assert(!has_graph);
+      weight_buf = torch::empty(weight.sizes(), weight.options());
+      assert(weight_buf.is_cuda());
+    }
+
+    weight_buf.copy_(weight, /*non_blocking=*/true);
+    weight.record_stream(rtctx->torch_stream);
+  }
+
   /* enqueue input to first layer */
   layers[0]->tensors_in[0] = input_buf;
   fpTargets = target_buf;
+  fpWeights = weight_buf;
 }
 
 torch::Tensor Layer::DoForward(bool captureLayer) {
@@ -582,8 +607,9 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
 
     layerQ.clear();
     layerQ.push_back(layers[0].get());
-
-    nr_iters_++;
+    
+    if(!doGraphCapture)
+      nr_iters_++;
 
     if (layers[0]->active && !layers[0]->tensors_in[0].defined())
       assert("MISSING INPUT TO FIRST LAYER!" && false);
@@ -596,11 +622,12 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
       graph_recording = true;
       c10::cuda::device_synchronize();
       graph_mempool = DeepPool::graph_pool_handle();
-      maingraph.capture_begin(graph_mempool);
+      fw_graph.capture_begin(graph_mempool);
       commHandler->precapture();
     } else if (has_graph) {
       /* skip to forward phase */
       state = JobState::FORWARD;
+      TimerRecordStage("zero");
       return 0;
     }
 
@@ -616,8 +643,16 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
 
     if (has_graph) {
       DP_LOG(DEBUG, "Replay iter.");
-      fullgraph->Launch(rtctx->torch_stream);
-      state = JobState::FINISH;
+      main_fw_graph->Launch(rtctx->torch_stream);
+      TimerRecordStage("forward");
+      TimerRecordStage("loss");
+      if (!isTrain_){
+        TimerRecordStage("backward");
+        TimerRecordStage("step");
+        state = JobState::FINISH;
+      }
+      else
+        state = JobState::BACKWARD;
       return 0;
     }
 
@@ -625,12 +660,25 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
 
     if (status == COMPLETED) {
       TimerRecordStage("forward");
+      if (doGraphCapture) {
+        sync_manager_.Join();
+        commHandler->postcapture();
+        fw_graph.capture_end();
+        if(isTrain_){
+          bw_graph.capture_begin(graph_mempool);
+          commHandler->precapture();
+        }
+      }
       if (!isTrain_) {
         for (auto& layer : layers) {
           layer->status = LayerStatus::PENDING_FP;
           layer->nr_current_depedencies = layer->prevLayers.size();
         }
         DP_LOG(DEBUG, "Foward pass is completed.");
+
+        TimerRecordStage("loss");
+        TimerRecordStage("backward");
+        TimerRecordStage("step");
         state = JobState::FINISH;
       } else {
         DP_LOG(DEBUG, "Foward pass is completed. Calculating loss soon.");
@@ -649,6 +697,14 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
   } else if (state == JobState::BACKWARD) {
     DP_LOG(DEBUG, "JobState::BACKWARD.");
 
+    if (has_graph) {
+      DP_LOG(DEBUG, "Replay iter.");
+      main_bw_graph->Launch(rtctx->torch_stream);
+      state = JobState::STEP;
+      TimerRecordStage("backward");
+      return 0;
+    }
+
     JobStatus status = backwardAStep(layerProfile);
     if (status == COMPLETED) {
       TimerRecordStage("backward");
@@ -662,7 +718,7 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     if (doGraphCapture) {
       sync_manager_.Join();
       commHandler->postcapture();
-      maingraph.capture_end();
+      bw_graph.capture_end();
       syncgraph.capture_begin(graph_mempool);
     }
 
@@ -671,13 +727,22 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
 
     if (doGraphCapture) {
       syncgraph.capture_end();
-      stepgraph.capture_begin(graph_mempool);
     }
-
-    TimerRecordStage("sync");
+    
     state = JobState::STEP;
   } else if (state == JobState::STEP) {
     DP_LOG(DEBUG, "JobState::STEP");
+    if (has_graph) {
+      step_graph->Launch(rtctx->torch_stream);
+      state = JobState::FINISH;
+      TimerRecordStage("step");
+      return 0;
+    }
+     if (doGraphCapture) {
+      stepgraph.capture_begin(graph_mempool);
+      commHandler->precapture();
+    }
+    
     optimizer->step();
     TimerRecordStage("step");
     state = JobState::FINISH;
@@ -690,25 +755,38 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
 
       if (!isTrain_) {
         commHandler->postcapture();
-        maingraph.capture_end();
-        auto maingraph_e =
-            GraphPieces::GraphToExecs(maingraph.getGRAPH(), maingraphsplit);
-        fullgraph = GraphPieces::MergePieces({maingraph_e});
+        auto mainfwgraph_e =
+            GraphPieces::GraphToExecs(fw_graph.getGRAPH(), maingraphsplit);
+        main_fw_graph = GraphPieces::MergePieces({mainfwgraph_e});
       } else {
+        commHandler->postcapture();
         stepgraph.capture_end();
 
-        auto maingraph_e =
-            GraphPieces::GraphToExecs(maingraph.getGRAPH(), maingraphsplit);
+        auto mainfwgraph_e =
+            GraphPieces::GraphToExecs(fw_graph.getGRAPH(), maingraphsplit);
+        main_fw_graph = GraphPieces::MergePieces({mainfwgraph_e});
+
+        auto mainbwgraph_e =
+            GraphPieces::GraphToExecs(bw_graph.getGRAPH(), maingraphsplit);
         auto syncgraph_e =
             GraphPieces::GraphToExecs(syncgraph.getGRAPH(), -1.0);
+        main_bw_graph =
+            GraphPieces::MergePieces({mainbwgraph_e, syncgraph_e});
         auto stepgraph_e =
             GraphPieces::GraphToExecs(stepgraph.getGRAPH(), stepgraphsplit);
-        fullgraph =
-            GraphPieces::MergePieces({maingraph_e, syncgraph_e, stepgraph_e});
+        step_graph =
+            GraphPieces::MergePieces({stepgraph_e});
       }
       has_graph = true;
       graph_recording = false;
       DP_LOG(NOTICE, "Ending capture.");
+
+      //record zero for timers
+      TimerRecordStage("zero");
+      TimerRecordStage("forward");
+      TimerRecordStage("loss");
+      TimerRecordStage("backward");
+      TimerRecordStage("step");
     }
 
     state = JobState::INIT;
@@ -723,11 +801,11 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
  * Reset timers for profiling each layer. Happens every iteration.
  */
 void RunnableModule::resetTimers() {
-  if (has_graph || graph_recording) return;
+  if (graph_recording) return;
 
   if (rtctx->profile_stage_time) timers.SaveAndReset();
 
-  if (rtctx->profile_layer_times_timers) {
+  if (!has_graph && rtctx->profile_layer_times_timers) {
     layerts_fwd.SaveAndReset();
     layerts_bwd.SaveAndReset();
   }

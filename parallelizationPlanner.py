@@ -45,11 +45,12 @@ import matplotlib.pyplot as plt
 
 
 class SearchContext:
-    def __init__(self, totalGpus: int, globalBatch: int, amplificationLimit: float = 2.0,
+    def __init__(self, totalGpus: int, globalBatch: int, lossfn: int, amplificationLimit: float = 2.0,
             dataParallelBaseline = False, sampleSplit=True, spatialSplit=False, filterSplit=False,
             doNotBench = False):
         self.totalGpus = totalGpus
         self.globalBatch = globalBatch
+        self.lossfn = lossfn
         self.amplificationLimit = amplificationLimit
         self.dataParallelBaseline = dataParallelBaseline
         self.sampleSplit = sampleSplit
@@ -68,6 +69,7 @@ class CostSim:
         # self.NET_LATENCY = 400 #40
         self.verbose = verbose
         self.layerProfileCache = {}
+        # if gpuProfileLoc != None and False:
         if gpuProfileLocSub != None:
             self.loadGpuProfile(gpuProfileLocSub)
         if gpuProfileLoc != None:
@@ -105,7 +107,7 @@ class CostSim:
         p = GpuProfiler("cuda")
         return p.queryFwBwTime(layer, config)
 
-    def generateModuleDescription(self, layerConfigs: list, globalBatch: int):
+    def generateModuleDescription(self, layerConfigs: list, globalBatch: int, lossfn: int):
         # gpuTimeSum = 0
         # profiler.start()
         maxGpuUsed = 0
@@ -119,7 +121,7 @@ class CostSim:
         # print("gpuTimeSum: ", gpuTimeSum)
         # profiler.stop()
 
-        return TrainingJob("test", self.layers, layerConfigs, globalBatch, maxGpuUsed, "na")
+        return TrainingJob("test", self.layers, layerConfigs, globalBatch, lossfn, maxGpuUsed, "na")
         
         # job.dumpSingleRunnableModule(15)
 
@@ -474,6 +476,39 @@ class CostSim:
             custom_previous_layers = [self.layers[-1]]
         layer = Layer(module, "avgPool2d",
                             {"kernel_size": kernel_size, "stride": stride, "padding": padding},
+                            prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+
+        return module
+
+    def BatchNorm2d(self, num_features: int, eps: float = 1e-05, momentum: float = 0.1,
+            affine: bool = True, track_running_stats: bool = True,
+            custom_previous_layers: list = None):
+        module = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum, affine=affine, 
+                    track_running_stats=track_running_stats)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "batchNorm2d",
+                            {"num_features": num_features, "eps": eps, "momentum": momentum},
+                            prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+
+        return module
+
+    def ConvTranspose2d(self, in_channels: int, out_channels: int, kernel_size: int,
+            stride: int = 1, padding: int = 0, output_padding: int = 0, groups: int = 1,
+            bias: bool = True, dilation: int = 1, padding_mode='zeros',
+            custom_previous_layers: list = None):
+        module = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride,
+                    padding=padding, output_padding=output_padding, groups=groups, bias=bias,
+                    dilation=dilation, padding_mode=padding_mode)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "convTranspose2d",
+                            {"in_channels": in_channels, "out_channels": out_channels, "kernel_size": kernel_size,
+                             "stride": stride, "bias": bias},
                             prevLayers = custom_previous_layers)
         self.layers.append(layer)
 
@@ -1098,7 +1133,7 @@ class CostSim:
             (branch, idx, config, endTime) = schedule[i]
             print("%sLayer(%d, %2d) config: %15s done at %d" % (" "*55*branch, branch, idx, config, endTime))
             
-    def searchBestSplits(self, totalGpus: int, globalBatch: int = 16, amplificationLimit: float = 2.0, dataParallelBaseline = False, spatialSplit=False):
+    def searchBestSplits(self, totalGpus: int, globalBatch: int = 16, amplificationLimit: float = 2.0, dataParallelBaseline = False, spatialSplit=False, lossfn=0):
         t = [[] for i in range(len(self.layers))] # [layer] = list of (config, cumulativeTime, prevConfigIndex)
 
         initialConfigs = []
@@ -1318,7 +1353,7 @@ class CostSim:
                     gpuUsecSum
                     ))
         # print ()
-        moduleDesc = self.generateModuleDescription([t[i][bestConfigChain[i]][0] for i in range(len(bestConfigChain))], globalBatch)
+        moduleDesc = self.generateModuleDescription([t[i][bestConfigChain[i]][0] for i in range(len(bestConfigChain))], globalBatch, lossfn)
         return (moduleDesc, finalTime / 1000., gpuUsecSum / 1000.)
 
     def searchBestSplitsV2(self, totalGpus: int, globalBatch: int = 16, useZhihaoAlgo = False):
@@ -1502,7 +1537,7 @@ class CostSim:
                 gpuTime = self.benchGpuTime(layer, config, ctx=ctx)
                 syncTime = self.calcSyncTime(layer, config, ctx)
                 
-                if layer == startLayer:
+                if layer == startLayer or len(layer.prevLayers) == 0:
                     if preStartLayer != None:
                         cumulativeTime, prevLayerTime, prevConfigOfPrev, _, prevMpIdleTime = preStartLayer.t[preStartConfig]
                         activationTime, activationSizeMatrix = self.calcInputXfer(preStartLayer, layer, preStartConfig, config)
@@ -1756,7 +1791,7 @@ class CostSim:
         plt.savefig("gpuTimeline.pdf")
 
     """ Generate a simple DP only plan, or use randomMode to randomly distribute layers """
-    def JustDoDP(self, totalGpus: int, globalBatch: int, per_layer_rand_prob: float = 0.0):
+    def JustDoDP(self, totalGpus: int, globalBatch: int, per_layer_rand_prob: float = 0.0, lossfn: int = 0):
         randomMode = per_layer_rand_prob > 0.0
         if randomMode: random.seed(0)
         lastCfg = 0
@@ -1816,12 +1851,12 @@ class CostSim:
             gpusUsed = totalGpus
             gpuTime = 1
             finalTime = max(cumulativeTime, finalTime)
-        moduleDesc = TrainingJob("test", self.layers, [layer.bestCfg for layer in self.layers], globalBatch, totalGpus, "na")
+        moduleDesc = TrainingJob("test", self.layers, [layer.bestCfg for layer in self.layers], globalBatch, lossfn, totalGpus, "na")
         return (moduleDesc, dpTime / 1000., 0 / 1000., totalGpus)
 
-    def searchBestSplitsV3(self, totalGpus: int, globalBatch: int = 16, amplificationLimit: float = 2.0, dataParallelBaseline = False, sampleSplit=True, spatialSplit=False, filterSplit=False):
+    def searchBestSplitsV3(self, totalGpus: int, globalBatch: int = 16, lossfn: int = 0, amplificationLimit: float = 2.0, dataParallelBaseline = False, sampleSplit=True, spatialSplit=False, filterSplit=False):
         """ Parallelization strategy findiing for DeepPool. """
-        ctx = SearchContext(totalGpus, globalBatch, amplificationLimit, dataParallelBaseline, sampleSplit=sampleSplit, spatialSplit=spatialSplit, filterSplit=filterSplit)
+        ctx = SearchContext(totalGpus, globalBatch, lossfn, amplificationLimit, dataParallelBaseline, sampleSplit=sampleSplit, spatialSplit=spatialSplit, filterSplit=filterSplit)
         ctx.doNotBench = totalGpus == 1
         finalLayer = self.searchLinear(None, None, self.layers[0], ctx)
 
@@ -2020,6 +2055,9 @@ class CostSim:
             if layer.name in ["conv2d"]:
                 print("%11s (b=%2d, w=%3d, h=%3d, c=%4d, f=%4d) => " % (layer.name, *layer.initCfg), end="")
                 print("(b=%2d, w=%3d, h=%3d, c=%4d, f=%4d) " % layer.bestCfg, end="")
+            elif len(layer.initCfg) == 2:
+                print("%11s (b=%2d, seq=%6d)        => " % (layer.name, *layer.initCfg), end="")
+                print("(b=%2d, seq=%6d)        " % layer.bestCfg, end="")
             elif len(layer.initCfg) == 3: #layer.name in ["linear", "ReLU1d"]:
                 print("%11s (b=%2d, in=%6d, out=%6d)        => " % (layer.name, *layer.initCfg), end="")
                 print("(b=%2d, in=%6d, out=%6d)        " % layer.bestCfg, end="")
@@ -2039,7 +2077,7 @@ class CostSim:
                  % (finalTime/1000, gpuUsecSum/1000, dpTime/1000, maxGpusUsed))
 
         # moduleDesc = self.generateModuleDescription([layer.bestCfg for layer in self.layers], ctx.globalBatch)
-        moduleDesc = TrainingJob("test", self.layers, [layer.bestCfg for layer in self.layers], ctx.globalBatch, maxGpusUsed, "na")
+        moduleDesc = TrainingJob("test", self.layers, [layer.bestCfg for layer in self.layers], ctx.globalBatch, ctx.lossfn, maxGpusUsed, "na")
         # moduleDesc = None
         if ctx.dataParallelBaseline:
             return (moduleDesc, dpTime / 1000., gpuUsecSum / 1000., ctx.totalGpus)

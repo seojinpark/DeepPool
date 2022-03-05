@@ -29,6 +29,8 @@
 #include "rpcService.h"
 #include "utils.h"
 
+#define SIZE_16_MiB 16*1024*1024
+
 using json = nlohmann::json;
 
 class CommunicationHandler {

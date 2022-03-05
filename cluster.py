@@ -28,6 +28,7 @@ from jobDescription import TrainingJob
 import grpc
 import runtime_pb2
 import runtime_pb2_grpc
+import os
 
 # import examples.vgg as vgg  # TODO: this is used for debugging. Remove this later.
 
@@ -79,7 +80,7 @@ class CppRuntimeProxy:
         response = self.stub.InitCommNCCL(runtime_pb2.InitCommNCCLMsg(
             message=message, msg_type=msgType, group_id=groupId, members=members))
         print("received: " + response.message)
-        return response.group_id;
+        return response.group_id
 
     def initCommGRPC(self, rankToIpMap):
         rankToIpMapInJson = json.dumps(rankToIpMap)
@@ -103,10 +104,10 @@ class Location:
         self.serverId = None
         self.proxy = None
         self.isCpp = isCpp
-        self.is_local = address == "127.0.0.1"
+        self.is_local = (address == "127.0.0.1" or address == "localhost")
         self.process = None
 
-    def getProxy(self, maxRetry = 180):
+    def getProxy(self, maxRetry = 360):
         if self.proxy != None:
             # print("getProxy() returned from cached proxy value.")
             return self.proxy
@@ -200,11 +201,13 @@ class Location:
 class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
     """ GPU cluster coordinator. It accepts training jobs from clients and schedule them to runtimes. """
 
-    def __init__(self, addrToBind: str, portToBind: int, locations: List[Location], workDir: str, be_batch_size: int):
+    def __init__(self, addrToBind: str, portToBind: int, locations: List[Location], workDir: str, be_batch_size: int, localhost:bool):
         super(ClusterCoordinator, self).__init__((addrToBind, portToBind))
         self.myAddr = addrToBind
         self.myPort = portToBind
         self.locations = locations
+        self.worldSize = len(locations)
+        self.localhost = localhost
         self.workDir = workDir
         self.processes = []  # from subprocess calls used for launching runtime.
         self.nextTagStartOffset = 1
@@ -233,7 +236,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         return 'Returned from poke at %s' % self.myAddr
 
     def export_scheduleTraining(self, jobName: str, trainingJobInJSON: str, runbe):
-        job = TrainingJob("test", None, None, 0, 0, "")
+        job = TrainingJob("test", None, None, 0, 0, 0, "")
         job.loadJSON(trainingJobInJSON)
         print("received job")
         
@@ -257,11 +260,15 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         if len(self.locations) < gpusUsed:
             return "Not enough servers available. %d gpus available while %d needed" % (len(self.locations), gpusUsed)
 
+        lfn = "NLL"
+        if "gpt2" in jobName:
+            lfn = "CrossEntropyLoss"
         jobParams = {
             "run_with_be": runbe,
             "nr_gpus": gpusUsed,
             "cifar_training": "cifar" in jobName,
-            "lossfn": "CrossEntropyLoss" if "gpt2" in jobName else "NLL",
+            "lossfn": lfn,
+            "epochsToTrain": 100
         }
 
         jobParamsInJson = json.dumps(jobParams)
@@ -277,7 +284,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
             thread.start()
         waitthreads(threadList)
 
-        self.ongoingJobs[jobName] = {"iterTime": 0, "gpuMsec": 0, "gpusUsed": gpusUsed, "gpusFinished": 0, "globalBatchSize": job.globalBatchSize}
+        self.ongoingJobs[jobName] = {"iterTime": 0, "gpuMsec": 0, "gpusUsed": gpusUsed, "gpusFinished": 0, "globalBatchSize": job.globalBatchSize, "lossfn": job.lossfn}
         self.ongoingJobs[jobName].update({"beImagesPerIter": 0.0, "idleMsPerIter": 0.0})
 
         # for rank in range(gpusUsed):
@@ -518,7 +525,11 @@ def parse_args():
                         help="To launch CPP version runtimes.")
     parser.add_argument('--manualLaunch', default=False, action='store_true',
                         help="Do not runtimes automatically. Primarily for using gdb on runtime processes.")
-    parser.add_argument("--logdir", type=str, default="", help="Full path of log directory")
+    parser.add_argument("--localhost", type=str, default=True,
+                        help="Run cluster on local host only")
+    parser.add_argument("--logdir", type=str, default=os.getcwd(),
+                        help="Run cluster on local host only")
+    # parser.add_argument("--logdir", type=str, default="", help="Full path of log directory")
     # For installing nsys.. (with other cuda toolkit..)
     # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/cuda-ubuntu1804.pin
     # sudo mv cuda-ubuntu1804.pin /etc/apt/preferences.d/cuda-repository-pin-600
@@ -542,12 +553,15 @@ def main():
         for deviceConfig in serverConfig["deviceList"]:
             rankToIpMap[str(len(locations))] = serverConfig["addr"] + ":" + str(deviceConfig["port"])
             commGrpRanksWorld.append(len(locations))
-            locations.append(Location(serverConfig["addr"], deviceConfig["port"], deviceConfig["device"], serverConfig["userId"], serverConfig["sshKeyPath"], args.cpp))
+            if args.localhost:
+                locations.append(Location(serverConfig["addr"], deviceConfig["port"], deviceConfig["device"], serverConfig["userId"], None, args.cpp))
+            else:
+                locations.append(Location(serverConfig["addr"], deviceConfig["port"], deviceConfig["device"], serverConfig["userId"], None, args.cpp))
     addrToBindCombo = re.split('[-:]', args.addrToBind)
     addrToBind = addrToBindCombo[0]
     portToBind = int(addrToBindCombo[1])
 
-    coordinator = ClusterCoordinator(addrToBind, portToBind, locations, clusterConfig["workDir"], args.be_batch_size)
+    coordinator = ClusterCoordinator(addrToBind, portToBind, locations, clusterConfig["workDir"], args.be_batch_size, args.localhost)
     if args.install:
         coordinator.installPackages()
     
