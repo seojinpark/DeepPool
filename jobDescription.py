@@ -22,6 +22,7 @@ from typing import Optional, IO, List, Any
 from collections import defaultdict
 import copy
 import sys
+import hashlib
 
 class TensorProperties:
     def __init__(self, tensor: torch.Tensor = None):
@@ -108,12 +109,14 @@ class Layer:
         return fakeInputs
 
     def getModuleId(self):
-        import hashlib
-        m = hashlib.sha256()
-        m.update(json.dumps([str(a) for a in self.getInputShapes()], separators=('_', '-')).encode("utf-8"))
-        return self.name +\
-            json.dumps(self.params, sort_keys=True, separators=('_', '-')) +\
-            m.hexdigest()
+        if hasattr(self.module, 'weight'):
+            h = hashlib.md5()
+            h.update(self.module.weight.cpu().detach().numpy())
+            return self.name +\
+                json.dumps(self.params, sort_keys=True, separators=('_', '-'))+str(h.hexdigest())
+        else:
+            return self.name +\
+                json.dumps(self.params, sort_keys=True, separators=('_', '-'))
 
     def scriptModule(self):
         if not self.moduleSavedLocation:
@@ -187,11 +190,12 @@ class Layer:
 
 
 class TrainingJob:
-    def __init__(self, name: str, layers: List[Layer], layerConfigs: List[tuple], globalBatchSize: int, maxGpusUsed: int, datasetDir: str):
+    def __init__(self, name: str, layers: List[Layer], layerConfigs: List[tuple], globalBatchSize: int, lossfn: int, maxGpusUsed: int, datasetDir: str):
         self.name = name
         self.layers = layers
         self.layerConfigs = layerConfigs
         self.globalBatchSize = globalBatchSize
+        self.lossfn = lossfn
         self.maxGpusUsed = maxGpusUsed
         self.datasetDir = datasetDir
         self.bytesPerParam = 4
@@ -202,6 +206,7 @@ class TrainingJob:
     def loadJSON(self, jobInJson: str):
         job = json.loads(jobInJson)
         self.globalBatchSize = job["globalBatchSize"]
+        self.lossfn = job["lossfn"]
         self.maxGpusUsed = job["maxGpusUsed"]
         self.layers = []
         self.layerConfigs = []
@@ -250,7 +255,7 @@ class TrainingJob:
             prop = l.dumpForJSON()
             prop["config"] = config
             allProps.append(prop)
-        fullDesc = {"globalBatchSize": self.globalBatchSize, "maxGpusUsed": self.maxGpusUsed, "layers": allProps}
+        fullDesc = {"globalBatchSize": self.globalBatchSize, "lossfn": self.lossfn, "maxGpusUsed": self.maxGpusUsed, "layers": allProps}
         # return json.dumps(fullDesc, indent=1, sort_keys=False)
         return json.dumps(fullDesc, sort_keys=False)
 
