@@ -38,8 +38,16 @@ class CpuTimer {
     return RAMCloud::Cycles::toMicroseconds(totalCycles / count);
   }
 
-  double avgMs() {
+  double avgMils() {
+    if (count == 0)
+      return 0;
     return (double)this->avgMicros()/1000.0;
+  }
+
+  double avgSec() {
+    if (count == 0)
+      return 0;
+    return RAMCloud::Cycles::toSeconds(totalCycles / count);
   }
 
   const char* name;

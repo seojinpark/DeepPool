@@ -153,6 +153,7 @@ struct StreamingDataset : public Dataset
 {
     private:
         bool is_eval_;
+        bool is_validation_;
         size_t worldSize_ = 0;
         int64_t stopDataset_ = 0;
         bool startedDataset_ = false;
@@ -190,7 +191,7 @@ struct StreamingDataset : public Dataset
         StreamingDataset(size_t rank, long globalBatchSize,
                            std::vector<long> initialBatchSizes,
                            std::vector<long> sampleIndices, bool is_eval,
-                           size_t worldSize = 1);
+                           size_t worldSize = 1, bool is_validation_ = false);
         ~StreamingDataset();
 
 
@@ -228,7 +229,7 @@ struct StreamingDataset : public Dataset
         // torch::optional<batchData> 
         std::map<std::string, at::Tensor> getNextThisRank() override;
         // torch::optional<size_t> size();
-        void Reset() {counter_ = 0; done_=false;};
+        void Reset(); // {counter_ = 0; done_=false;};
         bool IsDone(){return done_;};
         size_t GetItersPerEpoch() override;
         std::map<std::string, torch::Tensor> getNext() override;

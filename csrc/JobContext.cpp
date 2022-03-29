@@ -28,6 +28,9 @@
 #include "runnableModule.h"
 #include "runtime.h"
 #include "utils.h"
+#include "AutoLRSClient.h"
+#include <filesystem>
+#include <matplot/matplot.h>
 
 #ifdef ENABLE_STREAMING_DATASET
 #include <opencv2/opencv.hpp>
@@ -65,8 +68,8 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
   } else if (name.find("anvil") != std::string::npos) {
     dset = "anvil";
     epochsToTrain = 300;
-    if (job_params.contains("epochsToTrain"))
-      epochsToTrain = job_params["epochsToTrain"].get<uint64_t>();
+    // if (job_params.contains("epochs_to_train"))
+    //   epochsToTrain = job_params["epochs_to_train"].get<uint64_t>();
     runTestRoutine_ = true;
 #endif
   }
@@ -82,13 +85,29 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
   if (job_params.contains("epochs_to_train"))
     epochsToTrain = job_params["epochs_to_train"].get<size_t>();
 
+  if(job_params.contains("checkpointDir")){
+    checkpointDir = job_params["checkpointDir"].get<std::string>();
+    std::filesystem::create_directory(checkpointDir);
+  }
+
   train_dataset_ = Dataset::fromName(dset, rtctx->rank, model->globalBatchSize,
                         model->initialBatchSizes, model->sampleIndices, 2000, rtctx->worldSize);
 
   eval_dataset_ = Dataset::fromName(dset + "_eval", rtctx->rank, model->globalBatchSize,
                         model->initialBatchSizes, model->sampleIndices, 10, rtctx->worldSize);
 
+  validation_dataset_ = Dataset::fromName(dset + "_validation", rtctx->rank, model->globalBatchSize,
+                        model->initialBatchSizes, model->sampleIndices, 10, rtctx->worldSize);
+
   dataset_pipeline_ = std::make_shared<DatasetPipelineWrapper>(train_dataset_);
+
+
+  if (job_params.contains("auto_lrs") && job_params["auto_lrs"].get<bool>())
+    lrsched_ = std::make_shared<AutoLRSClient>(model, model->optimizer, this, 
+              checkpointDir, std::string("localhost"), 22334, train_dataset_->GetItersPerEpoch()*20, 0.001);
+  else
+    // lrsched_ = std::make_shared<torch::optim::StepLR>(*model->optimizer, 10, 0.9);
+    lrsched_ = std::make_shared<AutoLRSClient>(model, model->optimizer, this, checkpointDir, 5, 0.9, 10);
 
   if (!rtctx->use_fg_graph)
     iters_before_graph_capture = itersToTrain * epochsToTrain;
@@ -144,6 +163,16 @@ void JobContext::printJobStatistics() {
       timers.GetP50("stop", warmupIters));
 }
 
+
+void JobContext::saveModel(std::string inpath){
+  lrsched_->save_variables(inpath);
+  lrsched_->restore_variables(inpath);
+}
+
+void JobContext::restoreModel(std::string inpath){
+  lrsched_->restore_variables(inpath);
+}
+
 /**
  * A helper to run a job.
  *
@@ -169,7 +198,7 @@ void JobContext::StepOne(bool *iter_done) {
     }
   }
 
-  at::autocast::set_enabled(autocast_ && model->isTrain_);
+  at::autocast::set_enabled(autocast_ && model->runMode_ == RunMode::train);
   iter_in_progress = !model->AdvanceTraining(graphCapture, profile);
   at::autocast::set_enabled(false);
 
@@ -217,12 +246,13 @@ auto tensorToCvImage(at::Tensor tensor)
     return rtnmat;
 }
 
-void JobContext::Test(int64_t curEpoch) {
-  UNUSED(curEpoch);
-  double total = 0.0;
-  torch::Tensor correct = torch::zeros({1}).to(at::kLong).to(rtctx->c10dev);
+void JobContext::Test(int64_t curEpoch, bool do_stats) {
+  // UNUSED(curEpoch);
+  // double total = 0.0;
+  // torch::Tensor correct = torch::zeros({1}).to(at::kLong).to(rtctx->c10dev);
 
   eval_dataset_->Reset();
+  model->ResetAvgLoss();
 
   if (iters_before_graph_capture < totiters && rtctx->use_fg_graph)
     iters_before_graph_capture = totiters + 5;
@@ -239,25 +269,32 @@ void JobContext::Test(int64_t curEpoch) {
       continue;
 
     torch::Tensor input = batch["data"];
+    // torch::Tensor target = batch["target"];
+    // torch::Tensor weight = batch["weight"];
     auto bi = batch["idx"].item<int64_t>();
 
     if (input.defined()) input = input.to(rtctx->c10dev);
-    auto output = Infer(input).cpu().contiguous();
+    // if (target.defined()) target = target.to(rtctx->c10dev);
+    // if (weight.defined()) weight = weight.to(rtctx->c10dev);
+    auto [output, loss] = Infer(input, {}, {});
+    output = output.cpu().contiguous();
 
-    if (output.defined() && output.nbytes() > 0) {
-      auto pred = torch::softmax(output, 1).clone();
-      auto one_hot = torch::zeros_like(pred, c10::TensorOptions().dtype(torch::kFloat32)).scatter(
-                        1, 
-                        batch["target"].index({torch::indexing::Slice(torch::indexing::None),
-                                               torch::indexing::None,
-                                               torch::indexing::Slice(torch::indexing::None), 
-                                               torch::indexing::Slice(torch::indexing::None)}),
-                        1.0);
-      auto images = input.permute({0, 2, 3, 1}).cpu().detach().clone();
-      auto labels = one_hot.permute({0, 2, 3, 1}).cpu().detach().clone();
-      pred = pred.permute({0, 2, 3, 1}).cpu().detach();
+    if(do_stats){
+      if (output.defined() && output.nbytes() > 0) {
 
-      for (int64_t index = 0; index < images.sizes()[0]; index++){
+        auto pred = torch::softmax(output, 1).clone();
+        auto one_hot = torch::zeros_like(pred, c10::TensorOptions().dtype(torch::kFloat32)).scatter(
+                          1, 
+                          batch["target"].index({torch::indexing::Slice(torch::indexing::None),
+                                                torch::indexing::None,
+                                                torch::indexing::Slice(torch::indexing::None), 
+                                                torch::indexing::Slice(torch::indexing::None)}),
+                          1.0);
+        auto images = input.permute({0, 2, 3, 1}).cpu().detach().clone();
+        auto labels = one_hot.permute({0, 2, 3, 1}).cpu().detach().clone();
+        pred = pred.permute({0, 2, 3, 1}).cpu().detach();
+
+        for (int64_t index = 0; index < images.sizes()[0]; index++){
           std::map<std::string, at::Tensor> result({
             // {"iid", iid},
             // {"view", view[index]}, 
@@ -274,77 +311,77 @@ void JobContext::Test(int64_t curEpoch) {
           totals.index_put_({2}, totals.index({2}).item<int32_t>()+std::get<2>(res));
 
           if ((std::get<0>(res) > 0 || std::get<1>(res) > 0 || std::get<2>(res) > 0)){ // && curEpoch > 20) {
-              char buff[1024];
-              snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%d_iter%ld_index%ld_0.jpg", rtctx->rank, iters, index);
-              std::string buffAsStdStr = buff;
-              auto cvImg = tensorToCvImage(std::get<3>(res));
-              cv::imwrite(buffAsStdStr, cvImg);
+            char buff[1024];
+            snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%d_iter%ld_index%ld_0.jpg", rtctx->rank, iters, index);
+            std::string buffAsStdStr = buff;
+            auto cvImg = tensorToCvImage(std::get<3>(res));
+            cv::imwrite(buffAsStdStr, cvImg);
 
-              memset(buff, 0, 1024);
-              snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%d_iter%ld_index%ld_probability.jpg", rtctx->rank, iters, index);
-              buffAsStdStr = buff;
-              auto probability = result["pred"];
-              auto disp_sprob = torch::unsqueeze((255.999*probability/probability.max()), -1).to(torch::kUInt8).contiguous().clone();
-              cvImg = tensorToCvImage(disp_sprob);
-              cv::imwrite(buffAsStdStr, cvImg);
+            memset(buff, 0, 1024);
+            snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%d_iter%ld_index%ld_probability.jpg", rtctx->rank, iters, index);
+            buffAsStdStr = buff;
+            auto probability = result["pred"];
+            auto disp_sprob = torch::unsqueeze((255.999*probability/probability.max()), -1).to(torch::kUInt8).contiguous().clone();
+            cvImg = tensorToCvImage(disp_sprob);
+            cv::imwrite(buffAsStdStr, cvImg);
 
-#ifdef STATS_DEBUG
-              auto rawimage = result["image"];
-              rawimage -= rawimage.min();
-              rawimage /= rawimage.max();
-              if (rawimage.sizes()[2] == 1)
-                  rawimage = torch::cat({rawimage.clone(), rawimage.clone(), rawimage.clone()}, 2);
-              auto disp_raw_image = (255*rawimage).to(torch::kUInt8).contiguous().clone();
-              // std::cout << disp_image << std::endl;
-              auto rawtmp = tensorToCvImage(disp_raw_image);
-              snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%d_iter%ld_index%ld_rawimage.jpg", rtctx->rank, iters, index);
-              buffAsStdStr = buff;    
-              cv::imwrite(buffAsStdStr, rawtmp);
+            #ifdef STATS_DEBUG
+            auto rawimage = result["image"];
+            rawimage -= rawimage.min();
+            rawimage /= rawimage.max();
+            if (rawimage.sizes()[2] == 1)
+                rawimage = torch::cat({rawimage.clone(), rawimage.clone(), rawimage.clone()}, 2);
+            auto disp_raw_image = (255*rawimage).to(torch::kUInt8).contiguous().clone();
+            // std::cout << disp_image << std::endl;
+            auto rawtmp = tensorToCvImage(disp_raw_image);
+            snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%d_iter%ld_index%ld_rawimage.jpg", rtctx->rank, iters, index);
+            buffAsStdStr = buff;    
+            cv::imwrite(buffAsStdStr, rawtmp);
 
-              for (int label_index=0; label_index<result["labels"].sizes()[2]; label_index++){
-                if (label_index != 0){
-                  auto lbls = result["labels"].index({torch::indexing::Slice(), torch::indexing::Slice(), label_index});
-                  snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%d_iter%ld_index%ld_%s_label.jpg", rtctx->rank, iters, index, label_list[label_index].c_str());
-                  buffAsStdStr = buff;
-                  // std::cout << lbls << std::endl;
-                  lbls = torch::unsqueeze(lbls, -1);
-                  std::cout << lbls.sizes() << std::endl;
-                  if (lbls.sizes()[2] <= 1)
-                      lbls = torch::cat({lbls.clone(), lbls.clone(), lbls.clone()}, 2);
-                  std::cout << lbls.sizes() << std::endl;
-                  auto disp_image = (255.999*lbls/lbls.max()).to(torch::kUInt8).contiguous().clone();
-                  cv::imwrite(buffAsStdStr, tensorToCvImage(disp_image));
-
-
-                  auto predtmp = result["pred"].index({torch::indexing::Slice(), torch::indexing::Slice(), label_index});
-                  snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%d_iter%ld_index%ld_%s_pred.jpg", rtctx->rank, iters, index, label_list[label_index].c_str());
-                  buffAsStdStr = buff;
-                  predtmp = torch::unsqueeze(predtmp, -1);
-                  std::cout << pred.sizes() << std::endl;
-                  if (predtmp.sizes()[2] <= 1)
-                      predtmp = torch::cat({predtmp.clone(), predtmp.clone(), predtmp.clone()}, 2);
-                  std::cout << predtmp.sizes() << std::endl;
-                  auto disp_predtmp = (255.999*predtmp/predtmp.max()).to(torch::kUInt8).contiguous().clone();
-                  cv::imwrite(buffAsStdStr, tensorToCvImage(disp_predtmp));
+            for (int label_index=0; label_index<result["labels"].sizes()[2]; label_index++){
+              if (label_index != 0){
+                auto lbls = result["labels"].index({torch::indexing::Slice(), torch::indexing::Slice(), label_index});
+                snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%d_iter%ld_index%ld_%s_label.jpg", rtctx->rank, iters, index, label_list[label_index].c_str());
+                buffAsStdStr = buff;
+                // std::cout << lbls << std::endl;
+                lbls = torch::unsqueeze(lbls, -1);
+                std::cout << lbls.sizes() << std::endl;
+                if (lbls.sizes()[2] <= 1)
+                    lbls = torch::cat({lbls.clone(), lbls.clone(), lbls.clone()}, 2);
+                std::cout << lbls.sizes() << std::endl;
+                auto disp_image = (255.999*lbls/lbls.max()).to(torch::kUInt8).contiguous().clone();
+                cv::imwrite(buffAsStdStr, tensorToCvImage(disp_image));
 
 
-                }
+                auto predtmp = result["pred"].index({torch::indexing::Slice(), torch::indexing::Slice(), label_index});
+                snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%d_iter%ld_index%ld_%s_pred.jpg", rtctx->rank, iters, index, label_list[label_index].c_str());
+                buffAsStdStr = buff;
+                predtmp = torch::unsqueeze(predtmp, -1);
+                std::cout << pred.sizes() << std::endl;
+                if (predtmp.sizes()[2] <= 1)
+                    predtmp = torch::cat({predtmp.clone(), predtmp.clone(), predtmp.clone()}, 2);
+                std::cout << predtmp.sizes() << std::endl;
+                auto disp_predtmp = (255.999*predtmp/predtmp.max()).to(torch::kUInt8).contiguous().clone();
+                cv::imwrite(buffAsStdStr, tensorToCvImage(disp_predtmp));
+
+
               }
-#endif
-              // snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%ld_iter%ld_index%ld_labels.jpg", rtctx->rank, iters, index);
-              // std::string buffAsStdStr = buff;
+            }
+            #endif
+            // snprintf(buff, sizeof(buff), "/DeepPool/samples/rank%ld_iter%ld_index%ld_labels.jpg", rtctx->rank, iters, index);
+            // std::string buffAsStdStr = buff;
           }
-
+        }
       }
+              
+      printf("bi=%ld, i=%ld -> %dp - %dm - %df\n", bi, iters*64, totals.index({0}).item<int32_t>(), 
+              totals.index({1}).item<int32_t>(), totals.index({2}).item<int32_t>());
+      DP_LOG(DEBUG, "Evaluate iteration %lu/%lu\n", ++iters,
+            eval_dataset_->GetItersPerEpoch());
+      iters += 1;
     }
-            
-    printf("bi=%ld, i=%ld -> %dp - %dm - %df\n", bi, iters*64, totals.index({0}).item<int32_t>(), 
-            totals.index({1}).item<int32_t>(), totals.index({2}).item<int32_t>());
-    DP_LOG(DEBUG, "Evaluate iteration %lu/%lu\n", ++iters,
-           eval_dataset_->GetItersPerEpoch());
-    iters += 1;
   }
-  
+
   // stats.close_chip();
   iters_before_graph_capture = 0;
 
@@ -367,9 +404,7 @@ void JobContext::Test(int64_t curEpoch) {
         memcpy(((uint8_t*)resultsAsTensor.data_ptr())+offset, (void *)&res, sizeof(Result));
         offset += sizeof(Result);
       }
-    }
 
-    if(rtctx->rank != 0){
       resultsAsTensor = resultsAsTensor.to(rtctx->c10dev);
       rtctx->torch_stream.synchronize();  // sync before calling into NCCL
       commHandler->comm_start();
@@ -409,10 +444,19 @@ void JobContext::Test(int64_t curEpoch) {
   if(rtctx->rank == 0)
     stats.close_chip();
 
-  double corr = correct.item().toDouble();
-
-  DP_LOG(NOTICE, "Evaluate: Total: %.1f Correct: %.1f | Accuracy: %.3f", total,
-         corr, static_cast<double>(corr) / total);
+  // double loss = model->GetAvgLoss();
+  // auto loss_sync = torch::scalar_tensor(loss, at::TensorOptions().dtype(torch::kDouble)).to(rtctx->c10dev);
+  // if (nr_gpus_ > 1) {
+  //   rtctx->torch_stream.synchronize();  // sync before calling into NCCL
+  //   commHandler->comm_start();
+  //   commHandler->all_reduce(loss_sync, c10d::ReduceOp::SUM);
+  //   commHandler->comm_end();
+  //   commHandler->sync();
+  //   loss = loss_sync.item().toDouble() / nr_gpus_;
+  // }
+  // DP_LOG(NOTICE, "Validation done. Loss %.2f", loss);
+  // printf("Validation %ld/%ld done. Loss %.2f\n", curEpoch, epochsToTrain,loss);
+  // eval_dataset_->Reset();
 }
 #else
 void JobContext::Test(int64_t curEpoch) {
@@ -457,22 +501,79 @@ void JobContext::Test(int64_t curEpoch) {
 }
 #endif
 
-torch::Tensor JobContext::Infer(torch::Tensor input) {
+double JobContext::Validation(int64_t curEpoch, bool trackLoss) {
+  // UNUSED(curEpoch);
+  // validation_dataset_->Reset();
+  model->ResetAvgLoss();
+
+  // if (iters_before_graph_capture < totiters && rtctx->use_fg_graph)
+  iters_before_graph_capture = totiters + validation_dataset_->GetItersPerEpoch()+5;
+
+  int64_t frames = 1;
+  std::vector<std::string> label_list = {"background", "big_plane", "small_plane"};
+  auto stats = Stats(label_list, "background", frames, 0.01, 0.3, "chip", 0.8);
+  auto totals = torch::zeros({3}, torch::TensorOptions().dtype(torch::kInt32)).to(rtctx->c10dev).contiguous();
+
+  size_t iters = 0;
+  while (!validation_dataset_->IsDone()) {
+    auto batch = validation_dataset_->getNextThisRank();
+    if(batch.find("idx") == batch.end())
+      continue;
+
+    torch::Tensor input = batch["data"];
+    torch::Tensor target = batch["target"];
+    torch::Tensor weight = batch["weight"];
+    auto bi = batch["idx"].item<int64_t>();
+
+    if (input.defined()) input = input.to(rtctx->c10dev);
+    if (target.defined()) target = target.to(rtctx->c10dev);
+    if (weight.defined()) weight = weight.to(rtctx->c10dev);
+    auto [output, loss] = Infer(input, target, weight);
+    output = output.cpu().contiguous();
+
+  }
+  double loss = model->GetAvgLoss();
+  auto loss_sync = torch::scalar_tensor(loss, at::TensorOptions().dtype(torch::kDouble)).to(rtctx->c10dev);
+  if (nr_gpus_ > 1) {
+    rtctx->torch_stream.synchronize();  // sync before calling into NCCL
+    commHandler->comm_start();
+    commHandler->all_reduce(loss_sync, c10d::ReduceOp::SUM);
+    commHandler->comm_end();
+    commHandler->sync();
+    loss = loss_sync.item().toDouble() / nr_gpus_;
+  }
+
+  if(trackLoss)
+    val_loss_tracker_.push_back(loss);
+
+  DP_LOG(NOTICE, "Validation done. Loss %.2f", loss);
+  printf("Validation Epoch %ld done. Loss %.2f\n", curEpoch,loss);
+  validation_dataset_->Reset();
+  return loss;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> JobContext::Infer(torch::Tensor input, torch::Tensor target, torch::Tensor weights) {
   bool will_do_graph_capture = false;
   if(totiters == iters_before_graph_capture && !model->has_graph)
     will_do_graph_capture = true;
 
-  torch::NoGradGuard guard;
+  // torch::NoGradGuard guard;
   model->SetEval();
-  model->SetInputsTargets(input);
+  if(target.defined() && weights.defined())
+    model->SetInputsTargets(input, target, weights);
+  else
+    model->SetInputsTargets(input);
   FinishIteration();
 
   if(will_do_graph_capture){
     //model doesnt actuall run when the graph is captured
-    model->SetInputsTargets(input);
+    if(target.defined() && weights.defined())
+      model->SetInputsTargets(input, target, weights);
+    else
+      model->SetInputsTargets(input);
     FinishIteration();
   }
-  return model->getOutput();
+  return {model->getOutput(), model->getLossOutput()};
 }
 
 void JobContext::Train(torch::Tensor input, torch::Tensor target, torch::Tensor weights) {
@@ -491,10 +592,13 @@ void JobContext::Train(torch::Tensor input, torch::Tensor target, torch::Tensor 
   }
 }
 
-void JobContext::TrainOneEpoch(int64_t curEpochh) {
+void JobContext::TrainOneEpoch(int64_t curEpoch, bool trackLoss) {
   dataset_pipeline_->Reset();
   model->ResetAvgLoss();
   size_t i = 0;
+
+  // std::cout << "\n\n\n\nmodel->optimizer->param_groups()[0].params()[0][0][0] " << model->optimizer->param_groups()[0].params()[0][0][0] << "\n\n\n\nmodel->layers[2] " << model->layers[2]->module.dump_to_str(true, true, true) << std::endl;
+  std::cout << "Current LR = " << lrsched_->get_last_lr() << std::endl;
   if (iters_before_graph_capture < totiters && rtctx->use_fg_graph)
     iters_before_graph_capture = totiters + 5;
   while (!dataset_pipeline_->IsDone() && !job_done_) {
@@ -502,25 +606,57 @@ void JobContext::TrainOneEpoch(int64_t curEpochh) {
     if(batch.find("data") == batch.end())
       continue;
 
+    lr_tracker_.push_back(lrsched_->get_last_lr());
     Train(batch["data"], batch["target"], batch["weight"]);
     DP_LOG(DEBUG, "Training iteration %lu/%lu\n", ++i,
            dataset_pipeline_->GetItersPerEpoch());
+    
+    // if(rtctx->rank == 0){
+    //   lrsched->on_train_batch_end(train_loss);
+
+    //   if(mainJob->getNGpus() > 1){
+    //     mainJob->updateScalar(lrsched->getLR(), 0);
+    //   }
+    // }
+    // else if (mainJob->getNGpus() > 1){
+    //   double newLR = mainJob->updateScalar(lrsched->getLR(), 0);
+    //   lrsched->updateLR(newLR);
+    // }
            
     if (nr_gpus_ > 1) {
       rtctx->torch_stream.synchronize();  // sync before calling into NCCL
       commHandler->comm_start();
-      auto tmp_sync = torch::zeros({1}).to(rtctx->c10dev);;
-      commHandler->all_reduce(tmp_sync, c10d::ReduceOp::SUM);
+      // auto tmp_sync = torch::zeros({1}).to(rtctx->c10dev);
+      commHandler->all_reduce(model->last_loss_, c10d::ReduceOp::SUM);
       commHandler->comm_end();
       commHandler->sync();
+      lrsched_->on_train_batch_end(model->last_loss_.item().toDouble()/nr_gpus_);
     }
+    else
+      lrsched_->on_train_batch_end(model->last_loss_.item().toDouble());
   }
+  // std::cout << "\n\n\n\nmodel->optimizer->param_groups()[0].params()[0] " << model->optimizer->param_groups()[0].params()[0] << "\n\n\n\nmodel->layers[2] " << model->layers[2]->module.dump_to_str(true, true, true) << std::endl;
+  // std::cout << "Current LR = " << lrsched_->getLR() << std::endl;
 #ifdef ENABLE_STREAMING_DATASET
-  model->lrsched->step();
+  if(curEpoch >= lrsched_->get_warmup_steps())
+    lrsched_->step();
 #endif
   double loss = model->GetAvgLoss();
+  auto loss_sync = torch::scalar_tensor(loss, at::TensorOptions().dtype(torch::kDouble)).to(rtctx->c10dev);
+  if (nr_gpus_ > 1) {
+    rtctx->torch_stream.synchronize();  // sync before calling into NCCL
+    commHandler->comm_start();
+    commHandler->all_reduce(loss_sync, c10d::ReduceOp::SUM);
+    commHandler->comm_end();
+    commHandler->sync();
+    loss = loss_sync.item().toDouble() / nr_gpus_;
+  }
+
+  if(trackLoss)
+    train_loss_tracker_.push_back(loss);
+  
   DP_LOG(NOTICE, "Epoch done. Loss %.2f", loss);
-  printf("Epoch %ld/%ld done. Loss %.2f\n", curEpochh, epochsToTrain,loss);
+  printf("Epoch %ld/%ld done. Loss %.2f\n", curEpoch, epochsToTrain,loss);
   iters_before_graph_capture = 0;
   rtctx->torch_stream.synchronize();
   end = std::chrono::steady_clock::now();
@@ -546,3 +682,85 @@ void JobContext::FinishIteration() {
 size_t JobContext::getTrainItersPerEpoch(){
   return train_dataset_->GetItersPerEpoch();
 };
+
+
+// AutoLRSClient JobContext::startAutoLRS(){
+//   return AutoLRSClient(model, model->optimizer, this, "/DeepPool/checkpoints/", "localhost", 22334);
+// }
+
+double JobContext::updateScalar(double val, uint32_t root){
+  double rtn = 0;
+  auto syncTensor = torch::scalar_tensor(val, at::TensorOptions().dtype(torch::kDouble)).to(rtctx->c10dev);
+  if (nr_gpus_ > 1) {
+    rtctx->torch_stream.synchronize();  // sync before calling into NCCL
+    commHandler->comm_start();
+    if(rtctx->rank == root){
+      for (int i=0; i<nr_gpus_; i++)
+        if(i != rtctx->rank)
+          commHandler->send(syncTensor, 0, i);
+    }
+    else{
+      commHandler->recv(syncTensor, 0, root);
+    }
+    commHandler->comm_end();
+    commHandler->sync();
+    rtn = syncTensor.item().toDouble();
+  }
+  return rtn;
+}
+
+
+void JobContext::graphLossResults(){
+    auto f = matplot::figure(true);
+    matplot::semilogy(train_loss_tracker_);
+    matplot::hold(matplot::on);
+    matplot::semilogy(val_loss_tracker_);
+    matplot::hold(matplot::off);
+    matplot::legend({"Train Loss", "Val Loss"});
+    matplot::grid(true);
+
+    matplot::xlabel("Epoch");
+    matplot::ylabel("Loss");
+    matplot::title("Train and Validation Loss");
+
+    std::string path = "/DeepPool/stat_outputs/loss_tracker.png";
+    if (std::filesystem::exists(path))
+      std::filesystem::remove(path);
+    f->save(path);
+}
+
+
+void JobContext::graphLearningRateResults(){
+    auto f = matplot::figure(true);
+    auto p1 = matplot::semilogy(lr_tracker_);
+    matplot::legend({p1}, {"Learning Rate"});
+    matplot::grid(true);
+
+    matplot::xlabel("Step");
+    matplot::ylabel("Learning Rate");
+    matplot::title("Learning Rate vs Step");
+
+    std::string path = "/DeepPool/stat_outputs/lr_tracker.png";
+    if (std::filesystem::exists(path))
+        std::filesystem::remove(path);
+    f->save(path);
+}
+
+
+
+  bool JobContext::shouldEarlyStop(double valLoss){
+    if (earlyRetries <= 0){
+      return true;
+    }
+    return false;
+  }
+
+  bool JobContext::isLowerLoss(double valLoss){
+    if (valLoss < lowestLossSeen){
+      lowestLossSeen = valLoss;
+      earlyRetries = earlyRetriesSet;
+      return true;
+    }
+    earlyRetries--;
+    return false;
+  }

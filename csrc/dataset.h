@@ -51,8 +51,8 @@ class Dataset {
   // }
 
  protected:
-  long globalBatchSize_;
   size_t rank_;
+  long globalBatchSize_;
   std::vector<long> initialBatchSizes_;
   std::vector<long> sampleIndices_;
 };

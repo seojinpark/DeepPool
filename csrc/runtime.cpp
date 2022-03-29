@@ -24,6 +24,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <filesystem>
 
 #include "BeTask.h"
 #include "JobContext.h"
@@ -171,36 +172,84 @@ int RuntimeContext::poll() {
 
   auto warmupIters = mainJob->getWarmupIters();
   const auto &timers = mainJob->model->GetTimers();
+
   CpuTimer trainEpochTimer("epochTimer");
+  CpuTimer validationTimer("validationTimer");
+  CpuTimer totalTimer("totalTimer");
   bool skipTest = false;
+  auto bestPath = std::filesystem::path(mainJob->getCheckpointDir()).append("best");
+  if (!std::filesystem::exists(bestPath))
+    std::filesystem::create_directory(bestPath);
+  
+  bestPath = bestPath.append(std::to_string(rtctx->rank));
+  if (!std::filesystem::exists(bestPath))
+    std::filesystem::create_directory(bestPath);
+
+  // size_t lastSaveEpoch = 0;
   // if (mainJob->ShouldRunTest()) mainJob->Test(1000);
+  totalTimer.start();
   for (size_t i = 0; i < mainJob->GetEpochsToTrain(); i++) {
     if(i >= 10) trainEpochTimer.start();
-    mainJob->TrainOneEpoch(i);
+    mainJob->TrainOneEpoch(i, true);
     if(i >= 10) trainEpochTimer.stop();
-    // if (mainJob->ShouldRunTest()) mainJob->Test();
-    printf(
-      " AverageTiming (ms) => fp:%.4f, "
-      "bp:%.4f, opt: %.4f, Total Epoch: %.4f (%.4f per batch), "
-      " P50 (ms) => fp:%.4f, loss:%.4f, bp:%.4f\n",
-      timers.GetAvg("forward", warmupIters),
-      timers.GetAvg("backward", warmupIters),
-      timers.GetAvg("step", warmupIters),
-      trainEpochTimer.avgMs(),
-      trainEpochTimer.avgMs()/mainJob->getTrainItersPerEpoch(),
-      timers.GetP50("forward", warmupIters),
-      timers.GetP50("loss", warmupIters),
-      timers.GetP50("backward", warmupIters));
 
-    if (std::isnan(mainJob->model->GetAvgLoss())){
-      printf("GetAvgLoss is NaN, ending training");
+    double train_loss = mainJob->model->GetAvgLoss();
+    if (std::isnan(train_loss)){
+      // printf("GetAvgLoss is NaN, reload checkpoint\n");
+      // mainJob->restoreModel();
       skipTest = true;
       break;
     }
+    // else if(i%10 == 0){
+    //   mainJob->saveModel();
+    // }
+
+    if(i >= 10) validationTimer.start();
+    if (mainJob->ShouldRunTest()) mainJob->Validation(i, true);
+    if(i >= 10) validationTimer.stop();
+
+    printf(
+      "\t\t fp:%.4f, "
+      "bp:%.4f, opt: %.4f, Total Train Epoch: %.4f (%.4f per batch), "
+      " Total Validation Epoch: %.4f (%.4f per batch), \n",
+      timers.GetAvg("forward", warmupIters),
+      timers.GetAvg("backward", warmupIters),
+      timers.GetAvg("step", warmupIters),
+      trainEpochTimer.avgMils(),
+      trainEpochTimer.avgMils()/mainJob->getTrainItersPerEpoch(),
+      validationTimer.avgMils(),
+      validationTimer.avgMils()/64.0
+    );
+
+    if(i > 20 && mainJob->isLowerLoss(mainJob->getLastValLoss())){
+      // lastSaveEpoch = i;
+      mainJob->saveModel(bestPath.string());
+      // mainJob->restoreModel();
+    }
+
+    if(mainJob->shouldEarlyStop(mainJob->getLastValLoss())){
+      printf("Validation Loss hasnt improved in 10 steps. Stopping Early!\n");
+      break;
+    }
   }
-  if (mainJob->ShouldRunTest() && !skipTest) mainJob->Test(mainJob->GetEpochsToTrain());
+  totalTimer.stop();
+  printf(
+      "\n\n\nTotal Training Time = %.2fs.   Total Train Epoch: %.4f (%.4f per batch), "
+      " Total Validation Epoch: %.4f (%.4f per batch)\n\n\n",
+      totalTimer.avgSec(),
+      trainEpochTimer.avgMils(),
+      trainEpochTimer.avgMils()/mainJob->getTrainItersPerEpoch(),
+      validationTimer.avgMils(),
+      validationTimer.avgMils()/64.0
+  );
+  mainJob->graphLossResults();
+  mainJob->graphLearningRateResults();
+  // mainJob->saveModel();
+  mainJob->restoreModel(bestPath.string());
+  if (mainJob->ShouldRunTest() && !skipTest) mainJob->Test(mainJob->GetEpochsToTrain(), true);
 
   torch_stream.synchronize();
+  // mainJob->saveModel();
   mainJob->printJobStatistics();
   jobList.erase(jobList.begin());
   DP_LOG(NOTICE, "Removed the completed job. Remaining: %lu", jobList.size());

@@ -120,13 +120,14 @@ std::shared_ptr<Dataset> Dataset::fromName(std::string name, size_t rank, long g
                            size_t fake_train_iters_per_epoch,
                            size_t worldSize) {
   bool eval = name.find("eval") != std::string::npos;
+  bool validation = name.find("validation") != std::string::npos;
   if (name.find("cifar") != std::string::npos)
     return std::make_shared<CifarDataset>(rank, globalBatchSize, initialBatchSizes,
                             sampleIndices, eval);
 #ifdef ENABLE_STREAMING_DATASET
   else if (name.find("anvil") != std::string::npos)
     return std::make_shared<StreamingDataset>(rank, globalBatchSize, initialBatchSizes,
-                            sampleIndices, eval, worldSize);
+                            sampleIndices, eval, worldSize, validation);
 #endif
 
   long fake_images = globalBatchSize * fake_train_iters_per_epoch;

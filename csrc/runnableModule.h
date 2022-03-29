@@ -94,19 +94,22 @@ enum class SpecialModuleTypes { NOTSPECIAL = 0, CONCAT };
  */
 struct Layer {
   Layer(torch::jit::Module module, SpecialModuleTypes specialModule, int id,
-        bool active, bool doLocalGradSync)
+        bool active, bool doLocalGradSync, std::string checkpointDir="checkpoints")
       : module(module),
         specialModule(specialModule),
         id(id),
         active(active),
-        doLocalGradSync(doLocalGradSync) {
+        doLocalGradSync(doLocalGradSync),
+        checkpointDir(checkpointDir) {
     std::stringstream ss;
     ss << "LAYER_" << id;
     timerkey = ss.str();
   }
 
   torch::Tensor DoForward(bool captureLayer);
-  void DoBackward(bool captureLayer, torch::Tensor& fpOutput);
+  void DoBackward(bool captureLayer, torch::Tensor& lossOutput);
+  void saveModule(std::string savePath){module.save(savePath);};
+  void loadModule(std::string loadPath){module = torch::jit::load(loadPath);};
 
   /* stores inputs on forward pass, gradients on backward pass */
   std::map<size_t, torch::Tensor> tensors_in;
@@ -139,6 +142,7 @@ struct Layer {
   long layerLocalBatch;
   std::vector<int64_t> emptyOutSizes;
   std::string moduleName;  // Used to output profiled runtimes.
+  std::string checkpointDir;
 };
 
 enum JobStatus { IN_PROGRESS = 0, COMPLETED, YIELD };
@@ -149,6 +153,12 @@ enum class LossFunctions {
 #ifdef ENABLE_STREAMING_DATASET
   AnvilLoss
 #endif
+};
+
+enum class RunMode {
+  train = 0,
+  test,
+  infrence
 };
 
 enum class JobState {
@@ -180,15 +190,16 @@ class RunnableModule {
 
   void SetTrain() {
     assert(state == JobState::INIT);
-    SetMode(true);
+    SetMode(RunMode::train);
   }
 
   void SetEval() {
     assert(state == JobState::INIT);
-    SetMode(false);
+    SetMode(RunMode::test);
   }
 
   torch::Tensor getOutput() { return fpOutput; }
+  torch::Tensor getLossOutput() { return fpLossOutput; }
 
   void SetInputsTargets(torch::Tensor input, torch::Tensor target = {}, torch::Tensor weights = {});
 
@@ -208,13 +219,14 @@ class RunnableModule {
  private:
   friend struct Layer;
   friend class JobContext;
+  friend class AutoLRSClient;
 
   CudaTimerChain timers;
   CudaTimerChain layerts_fwd, layerts_bwd;
 
-  bool isTrain_{true};
+  RunMode runMode_{RunMode::train};
 
-  void SetMode(bool train);
+  void SetMode(RunMode mode);
 
   long globalBatchSize;
   std::vector<long> sampleIndices;
@@ -239,7 +251,9 @@ class RunnableModule {
   JobStatus backwardAStep(bool captureLayer);
   void loss();
   void resetTimers();
-  void SetupOptimizer();
+  void SetupOptimizer(std::string loadPath="");
+  void saveOptimizer(std::string savePath){torch::save(*optimizer.get(), savePath);};
+  // void loadOptimizer(std::string loadPath){torch::load(*optimizer.get(), loadPath);};
 
   ////////////////////////////////////////////
   // Internal data structure.
@@ -251,7 +265,7 @@ class RunnableModule {
   std::vector<torch::Tensor> parameters;
 #ifdef ENABLE_STREAMING_DATASET
   std::shared_ptr<torch::optim::RMSprop> optimizer;
-  std::unique_ptr<torch::optim::StepLR> lrsched;
+  // std::unique_ptr<torch::optim::StepLR> lrsched;
 #else
   std::unique_ptr<torch::optim::SGD> optimizer;
 #endif
@@ -270,10 +284,11 @@ class RunnableModule {
   torch::Tensor fpTargets;
   torch::Tensor fpWeights;
   torch::Tensor fpOutput;
-  torch::Tensor fpLossResult;
+  torch::Tensor fpLossOutput;
   LossFunctions lossfn_;
 
   torch::Tensor loss_tracker_;
+  torch::Tensor last_loss_;
   size_t nr_iters_{0};
 
   JobState state{JobState::INIT};

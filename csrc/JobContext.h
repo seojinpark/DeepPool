@@ -30,6 +30,7 @@ class RunnableModule;
 class CommunicationHandler;
 class Dataset;
 class DatasetPipelineWrapper;
+class AutoLRSClient;
 
 /**
  * Context holding data for each training task.
@@ -46,7 +47,9 @@ class JobContext {
   bool ShouldRunTest() const { return runTestRoutine_; }
 
   /* Run a sample through the NN */
-  torch::Tensor Infer(torch::Tensor input);
+  std::tuple<torch::Tensor, torch::Tensor> Infer(torch::Tensor input, 
+                                                  torch::Tensor target = {}, 
+                                                  torch::Tensor weights = {});
 
   /* Run one training iteration with this input/target */
   void Train(torch::Tensor input,
@@ -54,7 +57,10 @@ class JobContext {
              torch::Tensor weights = {});
 
   /* Test the model on the test dataset */
-  void Test(int64_t curEpoch = -1);
+  void Test(int64_t curEpoch = -1, bool do_stats = false);
+
+  /* Test the model on the test dataset */
+  double Validation(int64_t curEpoch = -1, bool trackLoss=false);
 
   /* Advance one step through the the model */
   void StepOne(bool *iter_done);
@@ -63,9 +69,13 @@ class JobContext {
   void FinishIteration();
 
   /* Train one full epoch */
-  void TrainOneEpoch(int64_t curEpoch = -1);
+  void TrainOneEpoch(int64_t curEpoch = -1, bool trackLoss=false);
 
   void printJobStatistics();
+  void graphLossResults();
+  void graphLearningRateResults();
+
+  double updateScalar(double val, uint32_t root);
 
   std::shared_ptr<RunnableModule> model;
   std::string name;
@@ -74,7 +84,14 @@ class JobContext {
   uint64_t be_img_start, be_img_end;
 
   size_t getTrainItersPerEpoch();
+  bool shouldEarlyStop(double valLoss);
+  bool isLowerLoss(double valLoss);
+  void saveModel(std::string inpath="");
+  void restoreModel(std::string inpath="");
   size_t getWarmupIters(){return warmupIters;};
+  std::string getCheckpointDir(){return checkpointDir;}
+  size_t getNGpus(){return nr_gpus_;}
+  double getLastValLoss(){return val_loss_tracker_.back();}
 
  private:
   // Params
@@ -87,16 +104,27 @@ class JobContext {
   size_t profile_iter_start{3};
   size_t niter_to_profile{5};
   bool autocast_{false};
-  bool early_stopping{false};
-  double early_min_improvement{0.03};
-  size_t early_retries{10};
-  std::deque<size_t> early_loss_log;
+  bool earlyStopping{true};
+  double earlyMinImprovement{0.03};
+  size_t earlyRetriesSet{32};
+  size_t earlyRetries{earlyRetriesSet};
+  size_t earlyWindowSize{16};
+  std::deque<double> earlyLossLog;
+  std::string checkpointDir;
+  double lowestLossSeen{std::numeric_limits<double>::infinity()};
 
   bool job_done_{false};
 
   std::shared_ptr<Dataset> train_dataset_;
   std::shared_ptr<Dataset> eval_dataset_;
+  std::shared_ptr<Dataset> validation_dataset_;
   std::shared_ptr<DatasetPipelineWrapper> dataset_pipeline_;
+
+  std::shared_ptr<AutoLRSClient> lrsched_;
+  // std::shared_ptr<torch::optim::StepLR> lrsched_;
+  std::vector<double> train_loss_tracker_;
+  std::vector<double> val_loss_tracker_;
+  std::vector<double> lr_tracker_;
 
   bool iter_in_progress{false};
   size_t totiters{0};                     // total iters executed

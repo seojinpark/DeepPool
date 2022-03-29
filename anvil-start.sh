@@ -7,6 +7,7 @@ pkill -9 -f debugpy
 pkill -9 -f run_planes_meters_
 pkill -9 -f OpenDebug
 rm /dev/shm/batches/*
+rm /dev/shm/val-batches/*
 rm /dev/shm/eval-batches/*
 rm samples/rank0*
 rm samples/rank1*
@@ -19,3 +20,4 @@ conda activate base
 cd ../anvil
 python run_planes_meters_server.py &
 python run_planes_meters_test_server.py &
+python run_planes_meters_test_server.py validation &

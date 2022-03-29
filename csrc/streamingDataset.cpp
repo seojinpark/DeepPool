@@ -356,11 +356,12 @@ void *create_shared_memory(size_t size)
     return mmap(NULL, size, protection, visibility, -1, 0);
 }
 
-int get_batch_filename(void *buffer, int rank = -1, int worldSize = -1, 
+int get_batch_filename(void *buffer, std::string dir_path, int rank = -1, int worldSize = -1, 
                        std::set<batchPath> *hdf5_file_vec = NULL,
                        bool is_eval = false, int64_t lastIdx=-1)
 {
-    std::string path = (is_eval) ? "/dev/shm/eval-batches" : "/dev/shm/batches";
+    // std::string path = (is_eval) ? "/dev/shm/eval-batches" : "/dev/shm/batches";
+    std::string path(dir_path);
     int64_t minBatchIndex = -1;
     std::string minBatchFile;
     std::filesystem::path lockPathExt = std::filesystem::path(".lock");
@@ -487,10 +488,18 @@ sharedBuffers::~sharedBuffers()
 StreamingDataset::StreamingDataset(size_t rank, long globalBatchSize,
                            std::vector<long> initialBatchSizes,
                            std::vector<long> sampleIndices, bool is_eval, 
-                           size_t worldSize)
-    : Dataset(rank, globalBatchSize, initialBatchSizes, sampleIndices), is_eval_(is_eval), worldSize_(worldSize)
+                           size_t worldSize, bool is_validation)
+    : Dataset(rank, globalBatchSize, initialBatchSizes, sampleIndices), is_eval_(is_eval),
+      worldSize_(worldSize), is_validation_(is_validation)
 {
-    std::cout << "StreamingDataset Constructor - eval = " << is_eval_ << " is being created (" << this << ")\n";
+    if (is_eval_ || is_validation_)
+        assert(is_eval_ ^ is_validation_);
+    if (is_eval_)
+        std::cout << "StreamingDataset Constructor - eval is being created (" << this << ")\n";
+    else if (is_validation_)
+        std::cout << "StreamingDataset Constructor - validation is being created (" << this << ")\n";
+    else
+        std::cout << "StreamingDataset Constructor - training is being created (" << this << ")\n";
 
 // }
 // StreamingDataset::StreamingDataset(int rank, int worldSize)
@@ -500,7 +509,7 @@ StreamingDataset::StreamingDataset(size_t rank, long globalBatchSize,
 
     int mutex_fd;
     int mode = S_IRWXU | S_IRWXG;
-    sprintf(mutexID_, (is_eval_) ? "/main-mutex-eval" : "/main-mutex");
+    sprintf(mutexID_, (is_eval_) ? "/main-mutex-eval" : (is_validation_) ? "/main-mutex-validation" : "/main-mutex");
 
     mutex_fd = shm_open(mutexID_, O_CREAT | O_RDWR, mode);
 
@@ -533,21 +542,24 @@ StreamingDataset::StreamingDataset(size_t rank, long globalBatchSize,
     uint64_t BUFFERSIZE = 1024;
     char buffer[BUFFERSIZE];
 
+    std::string path = (is_eval_) ? "/dev/shm/eval-batches" : (is_validation_) ? "/dev/shm/val-batches" : "/dev/shm/batches";
+
     for (uint64_t w = 0; w < numWorkers_; w++)
     {
         sharedBuffers *newBufs = (sharedBuffers *)create_shared_memory(sizeof(sharedBuffers));
 
         memset(buffer, 0, BUFFERSIZE);
-        get_batch_filename(buffer, (rank * numWorkers_) + w, worldSize_ * numWorkers_, NULL, is_eval_);
+        get_batch_filename(buffer, path, (rank * numWorkers_) + w, worldSize_ * numWorkers_, NULL, is_eval_);
         init_sharedBuffers(newBufs, buffer);
         datasetSize_ = newBufs->datasetSize;
-        if (!is_eval_)
-            epochLen_ = (int64_t)(std::ceil(datasetSize_/worldSize_/500));
-        else
+        if (is_eval_)
             epochLen_ = (int64_t)(std::ceil(datasetSize_/worldSize_));
-            // epochLen_ = 100;
+        else if(is_validation_)
+            epochLen_ = 64;
+        else
+            epochLen_ = (int64_t)(std::ceil(datasetSize_/worldSize_/500));
 
-        sprintf(newBufs->mutexID, (is_eval_) ? "/mutex-eval-%ld" : "/mutex-%ld", w);
+        sprintf(newBufs->mutexID, (is_eval_) ? "/mutex-eval-%ld" : (is_validation_) ? "/mutex-validation-%ld" : "/mutex-%ld", w);
         init_shared_mutex(newBufs);
 
         // newBufs->ready = true;
@@ -586,11 +598,11 @@ StreamingDataset::StreamingDataset(size_t rank, long globalBatchSize,
 StreamingDataset::~StreamingDataset()
 {
     if (moved_from_) {
-      std::cout << "StreamingDataset Destructor - eval = " << is_eval_ << " is being moved (" << this << ")\n";
+      std::cout << "StreamingDataset Destructor - eval = " << is_eval_ << " validation = " << is_validation_ << " is being moved (" << this << ")\n";
       return;
     }
     else
-      std::cout << "StreamingDataset Destructor - eval = " << is_eval_ << " is being deleted (" << this << ")\n";
+      std::cout << "StreamingDataset Destructor - eval = " << is_eval_ << " validation = " << is_validation_ << " is being deleted (" << this << ")\n";
     
     stopDataset_ = 1;
     for (auto sbufs : sharedWorkerBuffs_)
@@ -620,10 +632,12 @@ void StreamingDataset::worker_RunMain(void)
     int64_t lastIdx = -1;
 
     // const char * name = "it_worked";
-    printf("RM-eval-%d id %ld starting\n", is_eval_, workerID_);
-    sprintf(buffer, "RM-eval-%d-%ld", is_eval_, workerID_);
+    printf("RM-%d%d id %ld starting\n", is_eval_, is_validation_, workerID_);
+    sprintf(buffer, "RM-%d%d-%ld", is_eval_, is_validation_, workerID_);
     if (prctl(PR_SET_NAME, buffer) < 0)
-        printf("RM-eval-%d id %ld: error setting process name\n", is_eval_, workerID_);
+        printf("RM-%d%d id %ld: error setting process name\n", is_eval_, is_validation_, workerID_);
+    
+    std::string path = (is_eval_) ? "/dev/shm/eval-batches" : (is_validation_) ? "/dev/shm/val-batches" : "/dev/shm/batches";
 
     while (!sbufs->stopWorker)
     {
@@ -631,7 +645,7 @@ void StreamingDataset::worker_RunMain(void)
 
         memset(buffer, 0, BUFFERSIZE);
         // if (hdf5_file_vec.size() == 0)
-        get_batch_filename(buffer, (rank_ * numWorkers_) + workerID_, worldSize_ * numWorkers_, NULL, is_eval_, lastIdx);
+        get_batch_filename(buffer, path, (rank_ * numWorkers_) + workerID_, worldSize_ * numWorkers_, NULL, is_eval_, lastIdx);
 
         // std::cout << rank_ << ' ' << numWorkers_ << ' ' << workerID_ << ' ' << is_eval_ << " myset contains:";
         // for (auto it=hdf5_file_vec.begin(); it!=hdf5_file_vec.end(); ++it)
@@ -692,10 +706,10 @@ void StreamingDataset::worker_BlobToTensorsThread(int wID)
 
     uint64_t BUFFERSIZE = 1024;
     char buffer[BUFFERSIZE] = {0};
-    printf("BtTT-eval-%d id %d starting\n", is_eval_, wID);
-    sprintf(buffer, "BtTT-eval-%d-%d", is_eval_, wID);
+    printf("BtTT-%d%d id %d starting\n", is_eval_, is_validation_, wID);
+    sprintf(buffer, "BtTT-%d%d-%d", is_eval_, is_validation_, wID);
     if (prctl(PR_SET_NAME, buffer) < 0)
-        printf("BtTT-eval-%d id %d: error setting process name\n", is_eval_, wID);
+        printf("BtTT-%d%d id %d: error setting process name\n", is_eval_, is_validation_, wID);
 
     while (!stopDataset_)
     {
@@ -768,8 +782,8 @@ torch::optional<batchData> StreamingDataset::read_batch()
         }
         else{
             local_mutex_.unlock();
-            std::string path = (is_eval_) ? "/dev/shm/eval-batches/done.lock" : "/dev/shm/batches/done.lock";
-            std::string dirpath = (is_eval_) ? "/dev/shm/eval-batches" : "/dev/shm/batches";
+            std::string path = (is_eval_) ? "/dev/shm/eval-batches/done.lock" : (is_validation_) ? "/dev/shm/val-batches/done.lock" : "/dev/shm/batches/done.lock";
+            std::string dirpath = (is_eval_) ? "/dev/shm/eval-batches" : (is_validation_) ? "/dev/shm/val-batches" : "/dev/shm/batches";
             uint64_t numfiles = 0;
             for (const auto & entry : std::filesystem::directory_iterator(dirpath))
                 numfiles += 1;
@@ -833,6 +847,20 @@ std::map<std::string, at::Tensor> StreamingDataset::getNextThisRank() {
 //   }
     
   return getNext();
+}
+
+
+void StreamingDataset::Reset(){
+    counter_ = 0;
+    done_=false;
+    if(is_eval_){
+        std::string path = "/dev/shm/eval-batches/done.lock";
+        remove(path.c_str());
+    }
+    else if(is_validation_){
+        std::string path = "/dev/shm/val-batches/done.lock";
+        remove(path.c_str());
+    }
 }
 
 int64_t StreamingDataset::test(void)

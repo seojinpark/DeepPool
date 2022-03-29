@@ -130,7 +130,7 @@ if(${BUILD_ANVIL})
     "communication.cpp" "rpcService.cpp" "GraphPieces.cpp" "BeTask.cpp" 
     "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" "cifar10.cpp" 
     "dataset.cpp" "GradSync.cpp" "CUDAGraph.cpp"
-    "streamingDataset.cpp" "stats.cpp"
+    "streamingDataset.cpp" "stats.cpp" "AutoLRSClient.cpp"
   )
   target_link_libraries(runtime
     dp_grpc_proto

@@ -270,8 +270,10 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
             "nr_gpus": gpusUsed,
             "cifar_training": "cifar" in jobName,
             "lossfn": lfn,
-            "epochsToTrain": 500,
-            "autocast": True
+            "epochs_to_train": 500,
+            "autocast": True,
+            "checkpointDir":"/DeepPool/checkpoints/"+jobName,
+            "auto_lrs": False
         }
 
         jobParamsInJson = json.dumps(jobParams)
