@@ -228,7 +228,7 @@ int RuntimeContext::poll() {
     }
 
     if(mainJob->shouldEarlyStop(mainJob->getLastValLoss())){
-      printf("Validation Loss hasnt improved in 10 steps. Stopping Early!\n");
+      printf("Validation Loss hasnt improved in %d steps. Stopping Early!\n", mainJob->earlyMaxRetries());
       break;
     }
   }

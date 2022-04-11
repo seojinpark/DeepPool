@@ -130,6 +130,7 @@ void parse_HDF5_str_dataset(hid_t h5FileID, const char *datasetName, void *buf, 
      */
     if (H5Dread(dset, memtype, H5S_ALL, H5S_ALL, H5P_DEFAULT, buf) < 0)
     {
+        printf("%d %s\n", h5FileID, datasetName);
         throw std::runtime_error("Error reading hdf5 file\n");
     }
 
@@ -247,6 +248,7 @@ uint64_t parse_HDF5_llong_dataset(hid_t h5FileID, const char *datasetName, void 
      */
     if (H5Dread(dset, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT, buf) < 0)
     {
+        printf("%d %s\n", h5FileID, datasetName);
         throw std::runtime_error("Error reading hdf5 file\n");
     }
 
@@ -279,6 +281,7 @@ void parse_HDF5_llong_scalar_dataset(hid_t h5FileID, const char *datasetName, in
      */
     if (H5Dread(dset, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT, buf) < 0)
     {
+        printf("%d %s\n", h5FileID, datasetName);
         throw std::runtime_error("Error reading hdf5 file\n");
     }
 
@@ -329,6 +332,7 @@ uint64_t parse_HDF5_float_dataset(hid_t h5FileID, const char *datasetName, void 
      */
     if (H5Dread(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, buf) < 0)
     {
+        printf("%d %s\n", h5FileID, datasetName);
         throw std::runtime_error("Error reading hdf5 file\n");
     }
 
@@ -743,6 +747,7 @@ void StreamingDataset::worker_BlobToTensorsThread(int wID)
         at::IntArrayRef labelsDimsArr((int64_t *)sbufs->labelsDims, (int64_t *)sbufs->labelsDims + sbufs->labelsNDims);
         // batch.labels = torch::from_blob((void *)sbufs->labels, labelsDimsArr, longOptions).to(torch::device({torch::kCUDA, this->rank_}));
         batch.labels = torch::from_blob((void *)sbufs->labels, labelsDimsArr, longOptions).clone();
+        // batch.labels = batch.labels.clone();
 
         // pthread_mutex_unlock(sbufs->mp_mutex);
         local_mutex_.lock();

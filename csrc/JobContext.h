@@ -92,6 +92,7 @@ class JobContext {
   std::string getCheckpointDir(){return checkpointDir;}
   size_t getNGpus(){return nr_gpus_;}
   double getLastValLoss(){return val_loss_tracker_.back();}
+  size_t earlyMaxRetries(){return earlyRetriesSet;}
 
  private:
   // Params
@@ -105,10 +106,10 @@ class JobContext {
   size_t niter_to_profile{5};
   bool autocast_{false};
   bool earlyStopping{true};
-  double earlyMinImprovement{0.03};
+  // double earlyMinImprovement{0.03};
   size_t earlyRetriesSet{32};
   size_t earlyRetries{earlyRetriesSet};
-  size_t earlyWindowSize{16};
+  // size_t earlyWindowSize{16};
   std::deque<double> earlyLossLog;
   std::string checkpointDir;
   double lowestLossSeen{std::numeric_limits<double>::infinity()};
