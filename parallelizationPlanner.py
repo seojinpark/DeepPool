@@ -532,6 +532,31 @@ class CostSim:
         
         return module
     
+    def EmbeddingBag(self, num_embeddings, embedding_dim, mode: str = "sum", sparse: bool = True, custom_previous_layers: list = None):
+        module = nn.EmbeddingBag(int(num_embeddings), embedding_dim, mode=mode, sparse=sparse)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "EmbeddingBag",
+                            {"num_embeddings": int(num_embeddings), "embedding_dim": embedding_dim, "mode": mode, "sparse": sparse},
+                            prevLayers = custom_previous_layers)
+        # layer.must_trace = True
+        self.layers.append(layer)
+        
+        return module
+
+    def Identity(self, custom_previous_layers: list = None):
+        module = nn.Identity()
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "Identity",
+                            {},
+                            prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+        
+        return module
+
     def ReLU(self, inplace: bool = False, custom_previous_layers: list = None):
         module = nn.ReLU(inplace=inplace)
 
@@ -548,6 +573,16 @@ class CostSim:
         
         return module
     
+    def Sigmoid(self, inplace: bool = False, custom_previous_layers: list = None):
+        module = nn.Sigmoid()
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        name = "Sigmoid"
+        layer = Layer(module, name, {}, prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+        return module
+
     def Flatten(self, custom_previous_layers: list = None):
         module = nn.Flatten(start_dim=1)
 
@@ -556,7 +591,50 @@ class CostSim:
         layer = Layer(module, "flatten", {"kernel_size": 1}, prevLayers = custom_previous_layers)
         self.layers.append(layer)
         return
-    
+
+    class DLRMDotModule(nn.Module):
+        def __init__(self, arch_interaction_itself: bool = False):
+            super(CostSim.DLRMDotModule, self).__init__()
+            self.arch_interaction_itself = arch_interaction_itself
+
+        def forward(self, *inputList: List[torch.Tensor]):
+            inputs = []
+            for i in range(len(inputList)):
+                inputs.append(torch.squeeze(inputList[i]))
+            x=inputs[0]
+            ly=inputs[1:]
+            (batch_size, d) = x.shape
+            T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+            # perform a dot product
+            Z = torch.bmm(T, torch.transpose(T, 1, 2))
+            # append dense feature with the interactions (into a row vector)
+            # approach 1: all
+            # Zflat = Z.view((batch_size, -1))
+            # approach 2: unique
+            _, ni, nj = Z.shape
+            # approach 1: tril_indices
+            # offset = 0 if self.arch_interaction_itself else -1
+            # li, lj = torch.tril_indices(ni, nj, offset=offset)
+            # approach 2: custom
+            offset = 1 if self.arch_interaction_itself else 0
+            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
+            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+            Zflat = Z[:, li, lj]
+            # concatenate dense features and interactions
+            R = torch.cat([x] + [Zflat], dim=1)
+
+            return R
+
+    def DLRMDot(self, arch_interaction_itself: bool, custom_previous_layers: list = None): # concatenates tensors on channel dimension only.
+        module = CostSim.DLRMDotModule(arch_interaction_itself=arch_interaction_itself)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "dlrm_dot", {"arch_interaction_itself": arch_interaction_itself}, prevLayers = custom_previous_layers)
+        layer.must_trace = True
+        self.layers.append(layer)
+        return
+
     class ConcatInputs(nn.Module):
         def __init__(self, dim: int = 1):
             super(CostSim.ConcatInputs, self).__init__()

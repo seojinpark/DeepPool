@@ -87,8 +87,17 @@ class Layer:
         if hasattr(self, "outputShape"):
             return self.outputShape
 
-        output = self.scriptModule()(*self.getRandomInputs(1))
-        self.outputShape = TensorProperties(output[0])
+        # output = self.scriptModule()(*self.getRandomInputs(1))
+        # self.outputShape = TensorProperties(output[0])
+        if isinstance(self.module, torch.nn.EmbeddingBag):
+            fakeInput = self.getRandomInputs(1)
+            fakeInput[0] = torch.squeeze(fakeInput[0])
+            fakeInput[1] = torch.squeeze(fakeInput[1])
+            output = self.scriptModule()(*fakeInput)
+            self.outputShape = TensorProperties(output)
+        else:
+            output = self.scriptModule()(*self.getRandomInputs(1))
+            self.outputShape = TensorProperties(output[0])
 
         # set inputDim and outputDim for backwards compatibility
         self.inputDim = self.getInputShapes()[0].tensor_shape()
@@ -129,12 +138,25 @@ class Layer:
             return self.jit_module
 
         fakeInput = self.getRandomInputs(1, "cpu")
+        # if self.must_trace:
+        #     print("jit tracing...", self.name)
+        #     traced = torch.jit.trace(self.module, fakeInput)
+        # else:
+        #     print("jit scripting...", self.name)
+        #     traced = torch.jit.script(self.module, fakeInput)
         if self.must_trace:
             print("jit tracing...", self.name)
             traced = torch.jit.trace(self.module, fakeInput)
         else:
             print("jit scripting...", self.name)
-            traced = torch.jit.script(self.module, fakeInput)
+            if isinstance(self.module, torch.nn.EmbeddingBag):
+                # fakeInput.append(float('inf'))
+                fakeInput[0] = torch.squeeze(fakeInput[0])
+                fakeInput[1] = torch.squeeze(fakeInput[1])
+                traced = torch.jit.script(self.module, fakeInput)
+            else:
+                traced = torch.jit.script(self.module, fakeInput)
+
         # saveLocation = "modules/scriptmodule_%d.pt"%self.id
         torch.jit.save(traced, self.moduleSavedLocation)
         self.jit_module = torch.jit.load(self.moduleSavedLocation).to("cuda")
