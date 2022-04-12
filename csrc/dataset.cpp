@@ -111,7 +111,8 @@ void CifarDataset::Reset() { cur_iter = loader->begin(); }
 Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
                            std::vector<long> initialBatchSizes,
                            std::vector<long> sampleIndices,
-                           size_t fake_train_iters_per_epoch, long npixel) {
+                           size_t fake_train_iters_per_epoch,
+                           std::vector<long> indim) {
   bool eval = name.find("eval") != std::string::npos;
   if (name.find("cifar") != std::string::npos)
     return new CifarDataset(rank, globalBatchSize, initialBatchSizes,
@@ -136,12 +137,11 @@ Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
   }
 
   DP_LOG(DEBUG, "Using fake dataset");
-  if (!npixel)
-    npixel = name.find("inception") != std::string::npos ? 299 : 224;
+  indim[0] = globalBatchSize;
   auto targetOpts =
       torch::TensorOptions().dtype(torch::kInt64).requires_grad(false);
   auto gen = [=] {
-    auto data = torch::randn({globalBatchSize, 3, npixel, npixel});
+    auto data = torch::randn(indim);
     auto target =
         torch::randint(/*low=*/0, /*high=*/1000, {globalBatchSize}, targetOpts);
     return torch::data::Example<>(data, target);

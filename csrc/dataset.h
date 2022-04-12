@@ -16,7 +16,8 @@ class Dataset {
   static Dataset *fromName(std::string name, size_t rank, long globalBatchSize,
                            std::vector<long> initialBatchSizes,
                            std::vector<long> sampleIndices,
-                           size_t fake_train_iters_per_epoch, long npixel = 0);
+                           size_t fake_train_iters_per_epoch,
+                           std::vector<long> indim);
 
   torch::data::Example<> getNextThisRank() {
     auto ex = getNext();
