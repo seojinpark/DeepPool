@@ -1827,7 +1827,7 @@ def run(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fals
         #     device = torch.device("cuda", ext_dist.my_local_rank)
         # else:
         if True:
-            ngpus = torch.cuda.device_count()
+            ngpus = 1 #torch.cuda.device_count()
             device = torch.device("cuda", 0)
         print("Using {} GPU(s)...".format(ngpus))
     else:
@@ -2025,7 +2025,8 @@ def run(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fals
     X, lS_o, lS_i, T, W, CBPP = unpack_batch(exampleBatch)
     
     global ndevices
-    ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
+    # ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
+    ndevices = 1
     
     ### construct the neural network specified above ###
     # WARNING: to obtain exactly the same initialization for
