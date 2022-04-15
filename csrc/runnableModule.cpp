@@ -535,6 +535,8 @@ void RunnableModule::loss() {
     fpOutput = loss_fct(fpOutput, fpTargets.view({-1}));
   } else {
     assert(lossfn_ == LossFunctions::NLLLoss);
+    std::cout << tsrSizeToStr(fpOutput).c_str() << std::endl;
+    std::cout << tsrSizeToStr(fpTargets).c_str() << std::endl;
     fpOutput = torch::nll_loss(fpOutput.log_softmax(1), fpTargets);
   }
 

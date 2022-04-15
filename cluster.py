@@ -562,8 +562,8 @@ def main():
     locations = []
 #    for serverConfig in clusterConfig["serverList"]:
 #        print("Found %s" % str(serverConfig))
-    port = 11250
-    gpus = discover_gpu_numa()
+    port = 11270
+    gpus = discover_gpu_numa()[:4]
     for i, node in enumerate(gpus):
         rankToIpMap[str(len(locations))] = f"127.0.0.1:{port}"
         commGrpRanksWorld.append(len(locations))

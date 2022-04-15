@@ -152,3 +152,12 @@ runtime/*
 csrc/_deps/*
 csrc/CMakeFiles/*
 *.jit
+*.pt
+*.png
+*.jpg
+*.hdf5
+*.pth
+cuda-fix*
+*.patch
+*.data
+*A100V2.txt
