@@ -22,6 +22,7 @@ from typing import Optional, IO, List, Any
 from collections import defaultdict
 import copy
 import sys
+import hashlib
 
 class TensorProperties:
     def __init__(self, tensor: torch.Tensor = None):
@@ -52,7 +53,7 @@ class TensorProperties:
         return torch.zeros(iSize, dtype=self.dtype()).to(device)
 
 class Layer:
-    def __init__(self, module, name: str, params: tuple, prevLayers: list):
+    def __init__(self, module, name: str, params: tuple, prevLayers: list, device: int = None):
         self.id = None      # Assigned later by calling printAllLayers.
         self.name = name
         self.params = params
@@ -64,6 +65,7 @@ class Layer:
         self.jit_module = None
         self.moduleSavedLocation = None
         self.losslayer = ""
+        self.device = device
 
         # self.inputDim = (0, 0, 0)   # (Channel, Width, Height) for 2d convolution
         # self.outputDim = (0, 0, 0)  # (Channel, Width, Height)
@@ -88,8 +90,17 @@ class Layer:
         if hasattr(self, "outputShape"):
             return self.outputShape
 
-        output = self.scriptModule()(*self.getRandomInputs(1))
-        self.outputShape = TensorProperties(output[0] if output.size() else output)
+        # output = self.scriptModule()(*self.getRandomInputs(1))
+        # self.outputShape = TensorProperties(output[0])
+        if isinstance(self.module, torch.nn.EmbeddingBag) or 'EmbeddingBag' in self.name:
+            fakeInput = self.getRandomInputs(1)
+            fakeInput[0] = torch.squeeze(fakeInput[0])
+            fakeInput[1] = torch.squeeze(fakeInput[1])
+            output = self.scriptModule()(*fakeInput)
+            self.outputShape = TensorProperties(output)
+        else:
+            output = self.scriptModule()(*self.getRandomInputs(1))
+            self.outputShape = TensorProperties(output[0] if output.size() else output)
 
         # set inputDim and outputDim for backwards compatibility
         self.inputDim = self.getInputShapes()[0].tensor_shape()
@@ -107,12 +118,14 @@ class Layer:
         return [shape.genRand(batchsize, device) for shape in self.getInputShapes()]
 
     def getModuleId(self):
-        import hashlib
-        m = hashlib.sha256()
-        m.update(json.dumps([str(a) for a in self.getInputShapes()], separators=('_', '-')).encode("utf-8"))
-        return self.name +\
-            json.dumps(self.params, sort_keys=True, separators=('_', '-')) +\
-            m.hexdigest()
+        if hasattr(self.module, 'weight'):
+            h = hashlib.md5()
+            h.update(self.module.weight.cpu().detach().numpy())
+            return self.name +\
+                json.dumps(self.params, sort_keys=True, separators=('_', '-'))+str(h.hexdigest())
+        else:
+            return self.name +\
+                json.dumps(self.params, sort_keys=True, separators=('_', '-'))
 
     def scriptModule(self):
         if not self.moduleSavedLocation:
@@ -121,16 +134,29 @@ class Layer:
             self.moduleSavedLocation = saveLocation
         if exists(self.moduleSavedLocation): # Skip if module file is already there.
             if not self.jit_module:
-                return torch.jit.load(self.moduleSavedLocation).to("cuda")
+                self.jit_module = torch.jit.load(self.moduleSavedLocation).to("cuda")
             return self.jit_module
 
         fakeInput = self.getRandomInputs(1, "cpu")
+        # if self.must_trace:
+        #     print("jit tracing...", self.name)
+        #     traced = torch.jit.trace(self.module, fakeInput)
+        # else:
+        #     print("jit scripting...", self.name)
+        #     traced = torch.jit.script(self.module, fakeInput)
         if self.must_trace:
             print("jit tracing...", self.name)
             traced = torch.jit.trace(self.module, fakeInput)
         else:
             print("jit scripting...", self.name)
-            traced = torch.jit.script(self.module, fakeInput)
+            if isinstance(self.module, torch.nn.EmbeddingBag):
+                # fakeInput.append(float('inf'))
+                fakeInput[0] = torch.squeeze(fakeInput[0])
+                fakeInput[1] = torch.squeeze(fakeInput[1])
+                traced = torch.jit.script(self.module, fakeInput)
+            else:
+                traced = torch.jit.script(self.module, fakeInput)
+
         # saveLocation = "modules/scriptmodule_%d.pt"%self.id
         torch.jit.save(traced, self.moduleSavedLocation)
         self.jit_module = torch.jit.load(self.moduleSavedLocation).to("cuda")
@@ -139,7 +165,9 @@ class Layer:
     def getInitialConfig(self, globalBatch: int):
         inputDim = self.getInputShapes()[0].tensor_shape()
         outputDim = self.getOutputShape().tensor_shape()
-        if self.name in ["conv2d"]:
+        if self.device is not None:
+            initCfg = (globalBatch, *inputDim)
+        elif self.name in ["conv2d"]:
             initCfg = (globalBatch, inputDim[1], inputDim[2], inputDim[0], outputDim[2]) # (batch, width, height, channel, filter)
         elif self.name in ["linear", "ReLU1d"]:
             initCfg = (globalBatch, *inputDim, *outputDim)
@@ -287,8 +315,11 @@ class TrainingJob:
 
             l.byGpu = defaultdict(list)
             l.bySample = {}
+            if not isinstance(l.gpuAssignment, list):
+                l.gpuAssignmen = [l.gpuAssignmen]
 
             if not l.prevLayers: # 1st layer.
+                totalSamples = 0
                 for i in range(self.getGpusUsed()):
                     if i not in l.gpuAssignment: continue
                     for _ in range(l.bestCfg[0]):

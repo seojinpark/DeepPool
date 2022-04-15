@@ -380,6 +380,44 @@ class CostSim:
 
         return module
 
+    # num_features, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True, device=None, dtype=None
+    def BatchNorm2d(self, num_features: int, eps: float = 1e-05, momentum: float = 0.1,
+            affine: bool = True, track_running_stats: bool = True,
+            custom_previous_layers: list = None):
+        module = nn.BatchNorm2d(num_features, eps=eps, momentum=momentum, affine=affine, 
+                    track_running_stats=track_running_stats)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "batchNorm2d",
+                            {"num_features": num_features, "eps": eps, "momentum": momentum},
+                            prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+
+        return module
+
+    # torch.nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=1, padding=0, output_padding=0, groups=1, 
+    # bias=True, dilation=1, padding_mode='zeros', device=None, dtype=None)
+    def ConvTranspose2d(self, in_channels: int, out_channels: int, kernel_size: int,
+            stride: int = 1, padding: int = 0, output_padding: int = 0, groups: int = 1,
+            bias: bool = True, dilation: int = 1, padding_mode='zeros',
+            custom_previous_layers: list = None):
+        print(bias, stride, padding, dilation, groups)
+        # print(self.bias, self.stride, 1, self.dilation, self.groups))
+        module = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride,
+                    padding=padding, output_padding=output_padding, groups=groups, bias=bias,
+                    dilation=dilation, padding_mode=padding_mode)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "convTranspose2d",
+                            {"in_channels": in_channels, "out_channels": out_channels, "kernel_size": kernel_size,
+                             "stride": stride, "bias": bias},
+                            prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+
+        return module
+
     def Linear(self, in_features: int, out_features: int, bias: bool = True, custom_previous_layers: list = None):
         module = nn.Linear(in_features, out_features, bias)
 
@@ -392,6 +430,33 @@ class CostSim:
         
         return module
     
+    def EmbeddingBag(self, num_embeddings, embedding_dim, mode: str = "sum", sparse: bool = True, custom_previous_layers: list = None, device: int = None):
+        module = nn.EmbeddingBag(int(num_embeddings), embedding_dim, mode=mode, sparse=sparse)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "EmbeddingBag",
+                            {"num_embeddings": int(num_embeddings), "embedding_dim": embedding_dim, "mode": mode, "sparse": sparse, "device": device},
+                            prevLayers = custom_previous_layers,
+                            device=device
+                )
+        # layer.must_trace = True
+        self.layers.append(layer)
+        
+        return module
+
+    def Identity(self, custom_previous_layers: list = None):
+        module = nn.Identity()
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "Identity",
+                            {},
+                            prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+        
+        return module
+
     def ReLU(self, inplace: bool = False, custom_previous_layers: list = None):
         module = nn.ReLU(inplace=inplace)
 
@@ -408,6 +473,16 @@ class CostSim:
         
         return module
     
+    def Sigmoid(self, inplace: bool = False, custom_previous_layers: list = None):
+        module = nn.Sigmoid()
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        name = "Sigmoid"
+        layer = Layer(module, name, {}, prevLayers = custom_previous_layers)
+        self.layers.append(layer)
+        return module
+
     def Flatten(self, custom_previous_layers: list = None):
         module = nn.Flatten(start_dim=1)
 
@@ -415,8 +490,51 @@ class CostSim:
             custom_previous_layers = [self.layers[-1]]
         layer = Layer(module, "flatten", {"kernel_size": 1}, prevLayers = custom_previous_layers)
         self.layers.append(layer)
-        return module
-    
+        return
+
+    class DLRMDotModule(nn.Module):
+        def __init__(self, arch_interaction_itself: bool = False):
+            super(CostSim.DLRMDotModule, self).__init__()
+            self.arch_interaction_itself = arch_interaction_itself
+
+        def forward(self, *inputList: List[torch.Tensor]):
+            inputs = []
+            for i in range(len(inputList)):
+                inputs.append(torch.squeeze(inputList[i]))
+            x=inputs[0]
+            ly=inputs[1:]
+            (batch_size, d) = x.shape
+            T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+            # perform a dot product
+            Z = torch.bmm(T, torch.transpose(T, 1, 2))
+            # append dense feature with the interactions (into a row vector)
+            # approach 1: all
+            # Zflat = Z.view((batch_size, -1))
+            # approach 2: unique
+            _, ni, nj = Z.shape
+            # approach 1: tril_indices
+            # offset = 0 if self.arch_interaction_itself else -1
+            # li, lj = torch.tril_indices(ni, nj, offset=offset)
+            # approach 2: custom
+            offset = 1 if self.arch_interaction_itself else 0
+            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
+            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+            Zflat = Z[:, li, lj]
+            # concatenate dense features and interactions
+            R = torch.cat([x] + [Zflat], dim=1)
+
+            return R
+
+    def DLRMDot(self, arch_interaction_itself: bool, custom_previous_layers: list = None): # concatenates tensors on channel dimension only.
+        module = CostSim.DLRMDotModule(arch_interaction_itself=arch_interaction_itself)
+
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, "dlrm_dot", {"arch_interaction_itself": arch_interaction_itself}, prevLayers = custom_previous_layers)
+        layer.must_trace = True
+        self.layers.append(layer)
+        return
+
     class ConcatInputs(nn.Module):
         def __init__(self, dim: int = 1):
             super(CostSim.ConcatInputs, self).__init__()
@@ -453,16 +571,7 @@ class CostSim:
         layer = Layer(module, "layerNorm", {"dim": dim}, prevLayers = custom_previous_layers)
         self.layers.append(layer)
         return module
-
-    def BatchNorm2d(self, out_channels, eps=0.001, custom_previous_layers: list = None):
-        module = nn.BatchNorm2d(out_channels, eps=0.001)
-
-        if custom_previous_layers == None and len(self.layers) > 0:
-            custom_previous_layers = [self.layers[-1]]
-        layer = Layer(module, "BatchNorm2d", {"out_channels": out_channels, "eps": 0.001}, prevLayers = custom_previous_layers)
-        self.layers.append(layer)
-        return module
-
+    
     def GeneralLayer(self, module, name, params, custom_previous_layers: list = None, mustTrace=False):
         if custom_previous_layers == None and len(self.layers) > 0:
             custom_previous_layers = [self.layers[-1]]
@@ -479,8 +588,11 @@ class CostSim:
 
         # generate config candidates.
         sampleSplitOptions = range(totalSplits + 1) if sampleSplit else [0]
-        if dataParallelBaseline:
-            sampleSplitOptions = [totalSplits]
+        if dataParallelBaseline or layer.device is not None:
+            if layer.device is not None:
+                sampleSplitOptions = [0]
+            else:
+                sampleSplitOptions = [totalSplits]
         if layer.name in ["conv2d"]:
             configCandidates = [(int(initCfg[0] / 2**bs), math.ceil(initCfg[1] / 2**int(whs/2)), math.ceil(initCfg[1] / 2**int(whs/2+0.5)), initCfg[3], math.ceil(initCfg[4] / 2**fs) )
                                 for bs in sampleSplitOptions \
@@ -1585,7 +1697,7 @@ class CostSim:
     def to_dot(self, name, globalBatch, justdag = False):
         dot = graphviz.Digraph(name = name)
         for layer in self.layers:
-            gpusUsed = self.calcGpusNeeded(layer, layer.bestCfg, globalBatch) if not justdag else 0
+            # gpusUsed = self.calcGpusNeeded(layer, layer.bestCfg, globalBatch) if not justdag else 0
             comment = ""
             # comment = "\n" + str(layer.bestCfg)
             # if hasattr(layer, 'gpuLocalAssignmentDict'):
@@ -1709,7 +1821,9 @@ class CostSim:
             layer.t[config] = (newTime, layerTime, None, timeComposition, 0)
 
             nrGpus = globalBatch // config[0]
-            if len(lastAssign) == nrGpus:
+            if layer.device is not None:
+                layer.gpuAssignment = [layer.device]
+            elif len(lastAssign) == nrGpus:
                 layer.gpuAssignment = lastAssign
             else:
                 activeGPUs = set()
