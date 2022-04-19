@@ -84,6 +84,25 @@ RunnableModule::RunnableModule(
   // to another address.. (layer's are pointing each other with raw pointer.)
   layers.reserve(layersInJson.size());
 
+  if (!spec.contains("losslayer")) {
+    // TODO: make this an error in the future
+    DP_LOG(NOTICE, "Missing loss layer");
+  } else {
+    auto& ll = spec["losslayer"];
+    std::string name = ll["name"].get<std::string>();
+    long layerLocalBatch = ll["config"][0].get<long>();
+    bool layerIsActive = layerLocalBatch > 0;
+    torch::jit::Module module;
+    if (layerIsActive) {
+      module = torch::jit::load(ll["moduleSavedLocation"].get<std::string>());
+      module.to(rtctx->c10dev);
+      module.train();
+    }
+    auto layer = std::make_shared<Layer>(module, SpecialModuleTypes::NOTSPECIAL,
+                                         -1, layerIsActive, false, name);
+    lossLayer = layer;
+  }
+
   for (auto& ldsc : layersInJson) {
     int id = ldsc["id"].get<int>();
     std::string name = ldsc["name"].get<std::string>();
@@ -530,7 +549,13 @@ JobStatus RunnableModule::forwardAStep(bool captureLayer) {
 void RunnableModule::loss() {
   if (!fpOutput.defined()) return;
 
-  if (lossfn_ == LossFunctions::CrossEntropyLoss) {
+
+  if (lossLayer) {
+    std::vector<c10::IValue> iVec;
+    iVec.emplace_back(fpOutput);
+    iVec.emplace_back(fpTargets);
+    fpOutput = lossLayer->module.forward(iVec).toTensor();
+  } else if (lossfn_ == LossFunctions::CrossEntropyLoss) {
     auto loss_fct = torch::nn::CrossEntropyLoss();
     fpOutput = loss_fct(fpOutput, fpTargets.view({-1}));
   } else {

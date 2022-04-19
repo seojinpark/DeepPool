@@ -239,6 +239,7 @@ class RunnableModule {
   GradientSyncManager sync_manager_;
   // Topologically sorted list of layers.
   std::vector<std::shared_ptr<Layer>> layers;
+  std::shared_ptr<Layer> lossLayer;
   std::unique_ptr<torch::optim::SGD> optimizer;
   ////////////////////////////////////////////
   // Context for tracking partial progress.

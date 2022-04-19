@@ -152,3 +152,4 @@ runtime/*
 csrc/_deps/*
 csrc/CMakeFiles/*
 *.jit
+runtimeResult.data

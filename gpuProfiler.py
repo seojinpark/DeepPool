@@ -35,18 +35,17 @@ class GpuProfiler:
         key = f"{cfg}{layer.losslayer} || {autocast} || {jitmodule.inlined_graph}"
 
         self.__loadProfile()
-
         if key in self.cache:
             return self.cache[key]
 
         fwTime, bwTime = deeppool_bench.benchmodule(jitmodule._c, inputs, autocast)
 
         if layer.losslayer:
-            output = jitmodule.forward(*inputs).detach()
-            targets = torch.zeros(output.size()[0], dtype=torch.int64).cuda()
-            bwTime += deeppool_bench.benchloss(output,
-                                               targets, layer.losslayer, autocast)
+            ft, bt = self.queryFwBwTime(layer.losslayer, config, autocast)
+            fwTime += ft
+            bwTime += bt
 
+        self.__loadProfile() # reload in case of nested call
         self.cache[key] = (fwTime, bwTime)
         self.__saveProfile()
         return (fwTime, bwTime)

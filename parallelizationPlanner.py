@@ -31,7 +31,7 @@ import graphviz
 from array import array
 from typing import Optional, IO, List, Any
 from gpuProfiler import GpuProfiler
-from jobDescription import TrainingJob
+from jobDescription import TrainingJob, TensorProperties
 from jobDescription import Layer
 
 import torch.cuda.profiler as profiler
@@ -68,12 +68,29 @@ class CostSim:
         # self.NET_LATENCY = 400 #40
         self.verbose = verbose
         self.autocast = True
+        self.losslayer = None
 
     def setAutocast(self, autocast):
         self.autocast = autocast
 
     def setLossFunction(self, lossfn):
-        self.layers[-1].losslayer = lossfn
+        if lossfn == "CrossEntropyLoss":
+            lossfn = lambda output, target: torch.nn.functional.cross_entropy(output, torch.flatten(target))
+        elif lossfn == "NLLLoss":
+            lossfn = lambda output, target: torch.nn.functional.nll_loss(output.log_softmax(1), target)
+
+        class LossModule(torch.nn.Module):
+            def __init__(self, fn):
+                super(LossModule, self).__init__()
+                self.fn = fn
+            def forward(self, output, target):
+                return self.fn(output, target)
+        l = Layer(LossModule(lossfn), "loss", {}, [])
+        l.must_trace = True
+        l.setInputShapes([torch.zeros(self.layers[-1].getOutputShape().tensor_shape()), torch.zeros((0,), dtype=torch.int64)])
+        l.getOutputShape()
+        self.losslayer = l
+        self.layers[-1].losslayer = l
 
     def queryLayerProfileCache(self, layer, config: tuple):
         return sum(self.queryFwBwTime(layer, config))
@@ -96,7 +113,10 @@ class CostSim:
         # print("gpuTimeSum: ", gpuTimeSum)
         # profiler.stop()
 
-        return TrainingJob("test", self.layers, layerConfigs, globalBatch, maxGpuUsed, "na")
+        job = TrainingJob("test", self.layers, layerConfigs, globalBatch, maxGpuUsed, "na")
+        if self.losslayer:
+            job.losslayer = self.losslayer
+        return job
         
         # job.dumpSingleRunnableModule(15)
 
@@ -1656,6 +1676,8 @@ class CostSim:
 
     """ Generate a simple DP only plan, or use randomMode to randomly distribute layers """
     def JustDoDP(self, totalGpus: int, globalBatch: int, per_layer_rand_prob: float = 0.0):
+        if not self.losslayer:
+            self.setLossFunction("NLLLoss")
         randomMode = per_layer_rand_prob > 0.0
         if randomMode: random.seed(0)
         lastCfg = 0
@@ -1718,12 +1740,19 @@ class CostSim:
             gpuTime = 1
             finalTime = max(cumulativeTime, finalTime)
         moduleDesc = TrainingJob("test", self.layers, [layer.bestCfg for layer in self.layers], globalBatch, totalGpus, "na")
+        if self.losslayer:
+            moduleDesc.losslayer = self.losslayer
         return (moduleDesc, dpTime / 1000., 0 / 1000., totalGpus)
 
     def searchBestSplitsV3(self, totalGpus: int, globalBatch: int = 16, amplificationLimit: float = 2.0, dataParallelBaseline = False, sampleSplit=True, spatialSplit=False, filterSplit=False):
         """ Parallelization strategy findiing for DeepPool. """
+
+
         if dataParallelBaseline:
             return self.JustDoDP(totalGpus, globalBatch, 0.0)
+
+        if not self.losslayer:
+            self.setLossFunction("NLLLoss")
 
         ctx = SearchContext(totalGpus, globalBatch, amplificationLimit, dataParallelBaseline, sampleSplit=sampleSplit, spatialSplit=spatialSplit, filterSplit=filterSplit)
         ctx.doNotBench = totalGpus == 1
@@ -1944,6 +1973,8 @@ class CostSim:
 
         # moduleDesc = self.generateModuleDescription([layer.bestCfg for layer in self.layers], ctx.globalBatch)
         moduleDesc = TrainingJob("test", self.layers, [layer.bestCfg for layer in self.layers], ctx.globalBatch, maxGpusUsed, "na")
+        if self.losslayer:
+            moduleDesc.losslayer = self.losslayer
         # moduleDesc = None
         if ctx.dataParallelBaseline:
             return (moduleDesc, dpTime / 1000., gpuUsecSum / 1000., ctx.totalGpus)

@@ -38,44 +38,6 @@ static double benchFn(std::function<void()> fn) {
   return duration_cast<usec>(end - start).count() / CAPTURE_REPLAYS;
 }
 
-static double benchLossTime(torch::Tensor output, torch::Tensor target,
-                            std::string kind, bool autocast) {
-  pybind11::gil_scoped_release no_gil;
-
-  c10::cuda::CUDACachingAllocator::emptyCache();
-  at::autocast::set_enabled(autocast);
-
-  output = output.cuda().detach().requires_grad_(true);
-  /* use non-default stream for capturing */
-  auto stream = c10::cuda::getStreamFromPool();
-  auto origstream = c10::cuda::getCurrentCUDAStream();
-  c10::cuda::setCurrentCUDAStream(stream);
-
-  std::function<void()> fn;
-
-  if (kind == "CrossEntropyLoss") {
-    fn = [&] {
-      auto loss = torch::nn::CrossEntropyLoss()(output, target.view({-1}));
-      loss.backward({}, true);
-    };
-  } else if (kind == "NLLLoss") {
-    fn = [&] {
-      auto loss = torch::nll_loss(output.log_softmax(1), target);
-      loss.backward({}, true);
-    };
-  } else {
-    assert(false && "Missing/bad loss kind");
-  }
-
-  fn();
-  output.mutable_grad() = torch::Tensor();
-  double tm = benchFn(fn);
-  c10::cuda::setCurrentCUDAStream(origstream);
-  at::autocast::set_enabled(false);
-  if (autocast) at::autocast::clear_cache();
-  return tm;
-}
-
 static std::pair<double, double> benchModule(torch::jit::script::Module module,
                                              std::vector<torch::Tensor> inputs,
                                              bool autocast) {
@@ -137,5 +99,4 @@ static std::pair<double, double> benchModule(torch::jit::script::Module module,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("benchmodule", &benchModule, "Benchmark jit module");
-  m.def("benchloss", &benchLossTime, "Benchmark loss time");
 }

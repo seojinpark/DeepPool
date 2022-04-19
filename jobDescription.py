@@ -46,7 +46,9 @@ class TensorProperties:
         return eval(self.props["dtype"])
 
     def genRand(self, batchsize, device):
-        iSize = (batchsize,) + self.tensor_shape()
+        iSize = (batchsize,)
+        if self.tensor_shape() != (0,):
+            iSize += self.tensor_shape()
         return torch.zeros(iSize, dtype=self.dtype()).to(device)
 
 class Layer:
@@ -87,7 +89,7 @@ class Layer:
             return self.outputShape
 
         output = self.scriptModule()(*self.getRandomInputs(1))
-        self.outputShape = TensorProperties(output[0])
+        self.outputShape = TensorProperties(output[0] if output.size() else output)
 
         # set inputDim and outputDim for backwards compatibility
         self.inputDim = self.getInputShapes()[0].tensor_shape()
@@ -102,10 +104,7 @@ class Layer:
         pass
 
     def getRandomInputs(self, batchsize, device="cuda"):
-        fakeInputs = []
-        for shape in self.getInputShapes():
-            fakeInputs.append(shape.genRand(batchsize, device))
-        return fakeInputs
+        return [shape.genRand(batchsize, device) for shape in self.getInputShapes()]
 
     def getModuleId(self):
         import hashlib
@@ -158,7 +157,7 @@ class Layer:
         prop["id"] = self.id
         prop["name"] = self.name
         prop["params"] = self.params
-        prop["gpuTime"] = self.gpuTime
+        prop["gpuTime"] = getattr(self, "gpuTime", (1,1))
         prop["prevLayers"] = []
         if self.prevLayers != None:
             for prevLayer in self.prevLayers:
@@ -198,6 +197,7 @@ class TrainingJob:
         self.initialBatchSizes = None
         self.sampleIndicesList = None
         self.perRankConfigCache = []
+        self.losslayer = None
     
     def loadJSON(self, jobInJson: str):
         job = json.loads(jobInJson)
@@ -205,7 +205,7 @@ class TrainingJob:
         self.maxGpusUsed = job["maxGpusUsed"]
         self.layers = []
         self.layerConfigs = []
-        for ldsc in job["layers"]:
+        def loadlayer(ldsc):
             # print(ldsc)
             prevLayers = [self.layers[prevLayerId] for prevLayerId in ldsc["prevLayers"]]
             l = Layer(None, ldsc["name"], ldsc["params"], prevLayers)
@@ -225,19 +225,18 @@ class TrainingJob:
                 prop = TensorProperties()
                 prop.fromStr(inputdesc)
                 l.initial_inputs.append(prop)
-
+            return l
+        for ldsc in job["layers"]:
+            l = loadlayer(ldsc)
             config = ldsc["config"]
             self.layers.append(l)
             self.layerConfigs.append(config)
     
+        if job.get("losslayer"):
+            self.losslayer = loadlayer(job["losslayer"])
+
     def getGpusUsed(self):
         return self.maxGpusUsed
-        # maxGpusUsed = 0
-        # for l, config in zip(self.layers, self.layerConfigs):
-        #     destGpus = self.calcGpusNeeded(l, config, self.globalBatchSize)
-        #     maxGpusUsed = max(maxGpusUsed, destGpus)
-        #     # print("[getGpusUsed] layer: %d, destGpus: %d, maxGpusUsed: %d, config: %s" % (l.id, destGpus, maxGpusUsed, str(config)))
-        # return maxGpusUsed
 
     def dumpInJSON(self, layers: List[Layer] = None, layerConfigs: list = None):
         if layers is None:
@@ -251,6 +250,11 @@ class TrainingJob:
             prop["config"] = config
             allProps.append(prop)
         fullDesc = {"globalBatchSize": self.globalBatchSize, "maxGpusUsed": self.maxGpusUsed, "layers": allProps}
+        if self.losslayer is not None:
+            self.losslayer.id = -1
+            prop = self.losslayer.dumpForJSON()
+            prop["config"] = config # reuse last config
+            fullDesc["losslayer"] = prop
         # return json.dumps(fullDesc, indent=1, sort_keys=False)
         return json.dumps(fullDesc, sort_keys=False)
 
@@ -413,6 +417,13 @@ class TrainingJob:
                     "maxGpusUsed": self.maxGpusUsed,
                     "globalBatchSize": self.globalBatchSize,
                     "layers": allProps}
+        if self.losslayer:
+            lastlayer = self.layers[-1]
+            cfg = list(lastlayer.bestCfg)
+            if targetRank not in lastlayer.gpuAssignment:
+                cfg[0] = 0
+            fullDesc["losslayer"] = self.losslayer.dumpForJSON()
+            fullDesc["losslayer"]["config"] = cfg
         return fullDesc
 
     def calcGpusNeeded(self, layer: Layer, config: tuple, globalBatch: int):
