@@ -31,7 +31,7 @@ import graphviz
 from array import array
 from typing import Optional, IO, List, Any
 from gpuProfiler import GpuProfiler
-from jobDescription import TrainingJob, TensorProperties
+from jobDescription import TrainingJob
 from jobDescription import Layer
 
 import torch.cuda.profiler as profiler
@@ -73,7 +73,7 @@ class CostSim:
     def setAutocast(self, autocast):
         self.autocast = autocast
 
-    def setLossFunction(self, lossfn):
+    def setLossFunction(self, lossfn, name="", exampleTarget=None):
         if lossfn == "CrossEntropyLoss":
             lossfn = lambda output, target: torch.nn.functional.cross_entropy(output, torch.flatten(target))
         elif lossfn == "NLLLoss":
@@ -85,9 +85,10 @@ class CostSim:
                 self.fn = fn
             def forward(self, output, target):
                 return self.fn(output, target)
-        l = Layer(LossModule(lossfn), "loss", {}, [])
+        l = Layer(LossModule(lossfn), "loss" + name, {}, [])
         l.must_trace = True
-        l.setInputShapes([torch.zeros(self.layers[-1].getOutputShape().tensor_shape()), torch.zeros((0,), dtype=torch.int64)])
+        l.addInputShape(self.layers[-1].getOutputShape().genRand(1, "cpu"))
+        l.addInputShape(exampleTarget or torch.zeros((1,), dtype=torch.int64))
         l.getOutputShape()
         self.losslayer = l
         self.layers[-1].losslayer = l
@@ -138,7 +139,7 @@ class CostSim:
                 print("%3d %12s %20s %20s  %s" % (i, layer.name, str(prevLayerIds), str(nextLayerIds), str(layer.params)) )
     
     def computeInputDimensions(self, inputDim, dtype=torch.float32):
-        self.layers[0].setInputShapes([torch.zeros(inputDim, dtype=dtype)])
+        self.layers[0].addInputShape(torch.zeros([0] + list(inputDim), dtype=dtype))
         for l in self.layers:
             l.getOutputShape()
 

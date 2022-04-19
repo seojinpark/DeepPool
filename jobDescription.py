@@ -25,11 +25,12 @@ import sys
 import hashlib
 
 class TensorProperties:
-    def __init__(self, tensor: torch.Tensor = None):
+    def __init__(self, tensor: torch.Tensor = None, batch_dim=0):
         self.props = {}
         if tensor is not None:
             self.props["tensor_shape"] = tuple(tensor.shape)
             self.props["dtype"] = str(tensor.dtype)
+            self.props["batch_dim"] = batch_dim
 
     def __repr__(self):
         return json.dumps(self.props, sort_keys=True)
@@ -43,14 +44,20 @@ class TensorProperties:
     def tensor_shape(self):
         return tuple(self.props["tensor_shape"])
 
+    def tensor_shape_nobatch(self):
+        assert self.batch_dim() == 0
+        return self.tensor_shape()[1:]
+
+    def batch_dim(self):
+        return self.props["batch_dim"]
+
     def dtype(self):
         return eval(self.props["dtype"])
 
     def genRand(self, batchsize, device):
-        iSize = (batchsize,)
-        if self.tensor_shape() != (0,):
-            iSize += self.tensor_shape()
-        return torch.zeros(iSize, dtype=self.dtype()).to(device)
+        shape = list(self.tensor_shape())
+        shape = shape[:self.batch_dim()] + [batchsize] + shape[self.batch_dim() + 1:]
+        return torch.zeros(shape, dtype=self.dtype()).to(device)
 
 class Layer:
     def __init__(self, module, name: str, params: tuple, prevLayers: list, device: int = None):
@@ -66,16 +73,15 @@ class Layer:
         self.moduleSavedLocation = None
         self.losslayer = ""
         self.device = device
+        self.initial_inputs = []
 
         # self.inputDim = (0, 0, 0)   # (Channel, Width, Height) for 2d convolution
         # self.outputDim = (0, 0, 0)  # (Channel, Width, Height)
         self.must_trace = False
 
-    def setInputShapes(self, list_of_tensors: List[torch.Tensor]):
-        self.initial_inputs = []
+    def addInputShape(self, example_tensor_with_batch: torch.Tensor, batch_dim: int = 0):
         assert not self.prevLayers
-        for t in list_of_tensors:
-            self.initial_inputs.append(TensorProperties(t))
+        self.initial_inputs.append(TensorProperties(example_tensor_with_batch, batch_dim))
 
     def getInputShapes(self) -> List[TensorProperties]:
         if not self.prevLayers:
@@ -86,27 +92,27 @@ class Layer:
             shapes.append(layer.getOutputShape())
         return shapes
 
-    def getOutputShape(self) -> TensorProperties:
+    def getOutputShape(self, device="cuda") -> TensorProperties:
         if hasattr(self, "outputShape"):
             return self.outputShape
 
         # output = self.scriptModule()(*self.getRandomInputs(1))
         # self.outputShape = TensorProperties(output[0])
         if isinstance(self.module, torch.nn.EmbeddingBag) or 'EmbeddingBag' in self.name:
-            fakeInput = self.getRandomInputs(1)
+            fakeInput = self.getRandomInputs(1, device)
             fakeInput[0] = torch.squeeze(fakeInput[0])
             fakeInput[1] = torch.squeeze(fakeInput[1])
             output = self.scriptModule()(*fakeInput)
             self.outputShape = TensorProperties(output)
         else:
-            output = self.scriptModule()(*self.getRandomInputs(1))
-            self.outputShape = TensorProperties(output[0] if output.size() else output)
+            output = self.scriptModule()(*self.getRandomInputs(1, device))
+            self.outputShape = TensorProperties(output)
 
         # set inputDim and outputDim for backwards compatibility
-        self.inputDim = self.getInputShapes()[0].tensor_shape()
+        self.inputDim = self.getInputShapes()[0].tensor_shape_nobatch()
         if len(self.inputDim) == 1:
             self.inputDim = self.inputDim[0]
-        self.outputDim = self.outputShape.tensor_shape()
+        self.outputDim = self.outputShape.tensor_shape_nobatch()
         if len(self.outputDim) == 1:
             self.outputDim = self.outputDim[0]
         return self.outputShape
@@ -163,8 +169,8 @@ class Layer:
         return self.jit_module
 
     def getInitialConfig(self, globalBatch: int):
-        inputDim = self.getInputShapes()[0].tensor_shape()
-        outputDim = self.getOutputShape().tensor_shape()
+        inputDim = self.getInputShapes()[0].tensor_shape_nobatch()
+        outputDim = self.getOutputShape().tensor_shape_nobatch()
         if self.device is not None:
             initCfg = (globalBatch, *inputDim)
         elif self.name in ["conv2d"]:
@@ -249,7 +255,6 @@ class TrainingJob:
             if 'moduleSavedLocation' in ldsc:
                 l.moduleSavedLocation = ldsc["moduleSavedLocation"]
             for inputdesc in ldsc.get('initial_inputs', []):
-                if not hasattr(l, "initial_inputs"): l.initial_inputs = []
                 prop = TensorProperties()
                 prop.fromStr(inputdesc)
                 l.initial_inputs.append(prop)
