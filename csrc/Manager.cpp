@@ -185,6 +185,8 @@ void GpuTask::ExecuteTasks() {
 void GpuTask::Reset() {
   FinishCompletion();
   tasks_.clear();
+  head_ptr = 0;
+  tail_ptr = 0;
   waiting_recv = false;
 }
 
