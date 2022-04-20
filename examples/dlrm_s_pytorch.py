@@ -550,7 +550,7 @@ class DLRMDotModule(nn.Module):
 
     def forward(self, *inputList):
         x=inputList[0]
-        ly=inputList[1:]
+        ly=list(inputList[1:])
         (batch_size, d) = x.shape
         T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
         # perform a dot product
