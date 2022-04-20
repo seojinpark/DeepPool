@@ -64,7 +64,7 @@ enum class LayerStatus {
   PENDING_BP       // pending backward pass (last done job was forward).
 };
 
-enum class SpecialModuleTypes { NOTSPECIAL = 0, CONCAT };
+enum class SpecialModuleTypes { NOTSPECIAL = 0, CONCAT, DISTRIBUTE };
 
 /**
  * Description / context of a layer for training.
@@ -90,6 +90,8 @@ struct Layer {
 
   /* stores result of forward pass for backward */
   torch::Tensor output;
+  /* stores outputs for distribute nodes */
+  std::map<size_t, torch::Tensor> dist_outputs;
 
   std::vector<Xfer> xfers;
   size_t nr_nccl_recv{0}, nr_nccl_send{0};
@@ -164,7 +166,7 @@ class RunnableModule {
 
   void printLayerInGraphTimes();
 
-  void ExecuteXfers(Layer *layer, bool backward = false);
+  void ExecuteXfers(std::shared_ptr<Layer> &layer, bool backward = false);
 
   void SetTrain() {
     assert(state == JobState::INIT);
@@ -244,7 +246,7 @@ class RunnableModule {
   ////////////////////////////////////////////
   // Context for tracking partial progress.
   ////////////////////////////////////////////
-  std::deque<Layer *> layerQ;
+  std::deque<std::shared_ptr<Layer>> layerQ;
   torch::Tensor fpTargets;
   torch::Tensor fpOutput;
   LossFunctions lossfn_;

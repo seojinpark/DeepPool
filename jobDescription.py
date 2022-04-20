@@ -74,14 +74,15 @@ class Layer:
         self.losslayer = ""
         self.device = device
         self.initial_inputs = []
+        self.distribute = False
 
         # self.inputDim = (0, 0, 0)   # (Channel, Width, Height) for 2d convolution
         # self.outputDim = (0, 0, 0)  # (Channel, Width, Height)
         self.must_trace = False
 
-    def addInputShape(self, example_tensor_with_batch: torch.Tensor, batch_dim: int = 0):
+    def addInputShape(self, example_tensor_with_batch: torch.Tensor, *args, **kwargs):
         assert not self.prevLayers
-        self.initial_inputs.append(TensorProperties(example_tensor_with_batch, batch_dim))
+        self.initial_inputs.append(TensorProperties(example_tensor_with_batch, *args, **kwargs))
 
     def getInputShapes(self) -> List[TensorProperties]:
         if not self.prevLayers:
@@ -89,33 +90,42 @@ class Layer:
 
         shapes = []
         for layer in self.prevLayers:
-            shapes.append(layer.getOutputShape())
+            if layer.distribute:
+                assert self.id is not None and layer.id is not None
+                nextlayerids = sorted([l.id for l in layer.nextLayers])
+                idx = nextlayerids.index(self.id)
+                tothisI = layer.getOutputShapes()[idx]
+                if type(tothisI) in [list, tuple]:
+                    shapes += list(tothisI)
+                else:
+                    shapes.append(tothisI)
+                continue
+            shapes += layer.getOutputShapes()
         return shapes
 
-    def getOutputShape(self, device="cuda") -> TensorProperties:
-        if hasattr(self, "outputShape"):
-            return self.outputShape
+    def getOutputShapes(self, device="cuda") -> List[TensorProperties]:
+        if hasattr(self, "outputShapes"):
+            return self.outputShapes
 
-        # output = self.scriptModule()(*self.getRandomInputs(1))
-        # self.outputShape = TensorProperties(output[0])
-        if isinstance(self.module, torch.nn.EmbeddingBag) or 'EmbeddingBag' in self.name:
-            fakeInput = self.getRandomInputs(1, device)
-            fakeInput[0] = torch.squeeze(fakeInput[0])
-            fakeInput[1] = torch.squeeze(fakeInput[1])
-            output = self.scriptModule()(*fakeInput)
-            self.outputShape = TensorProperties(output)
+        out = self.scriptModule()(*self.getRandomInputs(1, device))
+        if type(out) in [tuple, list]:
+            self.outputShapes = [TensorProperties(t) for t in out]
         else:
-            output = self.scriptModule()(*self.getRandomInputs(1, device))
-            self.outputShape = TensorProperties(output)
+            self.outputShapes = [TensorProperties(out)]
 
         # set inputDim and outputDim for backwards compatibility
         self.inputDim = self.getInputShapes()[0].tensor_shape_nobatch()
         if len(self.inputDim) == 1:
             self.inputDim = self.inputDim[0]
-        self.outputDim = self.outputShape.tensor_shape_nobatch()
+        self.outputDim = self.outputShapes[0].tensor_shape_nobatch()
         if len(self.outputDim) == 1:
             self.outputDim = self.outputDim[0]
-        return self.outputShape
+        return self.outputShapes
+
+    def getOutputShape(self, *args, **kwargs) -> TensorProperties:
+        ret = self.getOutputShapes(*args, **kwargs)
+        assert len(ret) == 1
+        return ret[0]
 
     def getParameters(self):
         pass
@@ -140,28 +150,16 @@ class Layer:
             self.moduleSavedLocation = saveLocation
         if exists(self.moduleSavedLocation): # Skip if module file is already there.
             if not self.jit_module:
-                self.jit_module = torch.jit.load(self.moduleSavedLocation).to("cuda")
+                return torch.jit.load(self.moduleSavedLocation).to("cuda")
             return self.jit_module
 
         fakeInput = self.getRandomInputs(1, "cpu")
-        # if self.must_trace:
-        #     print("jit tracing...", self.name)
-        #     traced = torch.jit.trace(self.module, fakeInput)
-        # else:
-        #     print("jit scripting...", self.name)
-        #     traced = torch.jit.script(self.module, fakeInput)
         if self.must_trace:
             print("jit tracing...", self.name)
-            traced = torch.jit.trace(self.module, fakeInput)
+            traced = torch.jit.trace(self.module.to("cpu"), fakeInput)
         else:
             print("jit scripting...", self.name)
-            if isinstance(self.module, torch.nn.EmbeddingBag):
-                # fakeInput.append(float('inf'))
-                fakeInput[0] = torch.squeeze(fakeInput[0])
-                fakeInput[1] = torch.squeeze(fakeInput[1])
-                traced = torch.jit.script(self.module, fakeInput)
-            else:
-                traced = torch.jit.script(self.module, fakeInput)
+            traced = torch.jit.script(self.module, fakeInput)
 
         # saveLocation = "modules/scriptmodule_%d.pt"%self.id
         torch.jit.save(traced, self.moduleSavedLocation)
@@ -170,12 +168,13 @@ class Layer:
 
     def getInitialConfig(self, globalBatch: int):
         inputDim = self.getInputShapes()[0].tensor_shape_nobatch()
-        outputDim = self.getOutputShape().tensor_shape_nobatch()
         if self.device is not None:
             initCfg = (globalBatch, *inputDim)
         elif self.name in ["conv2d"]:
+            outputDim = self.getOutputShape().tensor_shape_nobatch()
             initCfg = (globalBatch, inputDim[1], inputDim[2], inputDim[0], outputDim[2]) # (batch, width, height, channel, filter)
         elif self.name in ["linear", "ReLU1d"]:
+            outputDim = self.getOutputShape().tensor_shape_nobatch()
             initCfg = (globalBatch, *inputDim, *outputDim)
         elif self.name in ["flatten", "maxPool2d", "avgPool2d", "adAvgPool2d", "ReLU2d", "concat"]:
             initCfg = (globalBatch, inputDim[1], inputDim[2], inputDim[0]) # (batch, width, height, channel, filter)
@@ -216,6 +215,7 @@ class Layer:
         if not self.prevLayers:
             prop["initial_inputs"] = [str(a) for a in self.initial_inputs]
 
+        prop["distribute"] = self.distribute
         return prop
 
 
@@ -258,6 +258,8 @@ class TrainingJob:
                 prop = TensorProperties()
                 prop.fromStr(inputdesc)
                 l.initial_inputs.append(prop)
+            if "distribute" in ldsc:
+                l.distribute = ldsc["distribute"]
             return l
         for ldsc in job["layers"]:
             l = loadlayer(ldsc)

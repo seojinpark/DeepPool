@@ -43,6 +43,19 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+"""
+Hack to add an ID to a layer each time it is appending
+to a CostSim's layer list without changing every call
+site. Fix in the future by adding a function in the
+CostSim that wraps the append.
+"""
+class CountingLayerList(list):
+    def __init__(self):
+        super(CountingLayerList, self).__init__()
+
+    def append(self, layer):
+        layer.id = len(self)
+        super().append(layer)
 
 class SearchContext:
     def __init__(self, totalGpus: int, globalBatch: int, amplificationLimit: float = 2.0,
@@ -62,7 +75,7 @@ class SearchContext:
 class CostSim:
     def __init__(self, profiler: GpuProfiler = None, netBw = 2.66E5, verbose=False, gpuProfileLoc=None, gpuProfileLocSub=None):
         self.profiler = profiler
-        self.layers: List[Layer] = []
+        self.layers: CountingLayerList = CountingLayerList()
         self.NET_BANDWIDTH = netBw
         self.NET_LATENCY = 40
         # self.NET_LATENCY = 400 #40
@@ -88,7 +101,7 @@ class CostSim:
         l = Layer(LossModule(lossfn), "loss" + name, {}, [])
         l.must_trace = True
         l.addInputShape(self.layers[-1].getOutputShape().genRand(1, "cpu"))
-        l.addInputShape(exampleTarget or torch.zeros((1,), dtype=torch.int64))
+        l.addInputShape(exampleTarget if exampleTarget is not None else torch.zeros((1,), dtype=torch.int64))
         l.getOutputShape()
         self.losslayer = l
         self.layers[-1].losslayer = l
@@ -123,11 +136,7 @@ class CostSim:
 
     def printAllLayers(self, silent=False):
         #TODO: topological sort of layers. Right now, assume it's sorted.
-        for i in range(len(self.layers)):
-            self.layers[i].id = i
-        for i in range(len(self.layers)):
-            layer = self.layers[i]
-            # layer.id = i
+        for i, layer in enumerate(self.layers):
             prevLayerIds = []
             if layer.prevLayers != None:
                 for prevLayer in layer.prevLayers:
@@ -493,48 +502,7 @@ class CostSim:
         self.layers.append(layer)
         return
 
-    class DLRMDotModule(nn.Module):
-        def __init__(self, arch_interaction_itself: bool = False):
-            super(CostSim.DLRMDotModule, self).__init__()
-            self.arch_interaction_itself = arch_interaction_itself
 
-        def forward(self, *inputList: List[torch.Tensor]):
-            inputs = []
-            for i in range(len(inputList)):
-                inputs.append(torch.squeeze(inputList[i]))
-            x=inputs[0]
-            ly=inputs[1:]
-            (batch_size, d) = x.shape
-            T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
-            # perform a dot product
-            Z = torch.bmm(T, torch.transpose(T, 1, 2))
-            # append dense feature with the interactions (into a row vector)
-            # approach 1: all
-            # Zflat = Z.view((batch_size, -1))
-            # approach 2: unique
-            _, ni, nj = Z.shape
-            # approach 1: tril_indices
-            # offset = 0 if self.arch_interaction_itself else -1
-            # li, lj = torch.tril_indices(ni, nj, offset=offset)
-            # approach 2: custom
-            offset = 1 if self.arch_interaction_itself else 0
-            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
-            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
-            Zflat = Z[:, li, lj]
-            # concatenate dense features and interactions
-            R = torch.cat([x] + [Zflat], dim=1)
-
-            return R
-
-    def DLRMDot(self, arch_interaction_itself: bool, custom_previous_layers: list = None): # concatenates tensors on channel dimension only.
-        module = CostSim.DLRMDotModule(arch_interaction_itself=arch_interaction_itself)
-
-        if custom_previous_layers == None and len(self.layers) > 0:
-            custom_previous_layers = [self.layers[-1]]
-        layer = Layer(module, "dlrm_dot", {"arch_interaction_itself": arch_interaction_itself}, prevLayers = custom_previous_layers)
-        layer.must_trace = True
-        self.layers.append(layer)
-        return
 
     class ConcatInputs(nn.Module):
         def __init__(self, dim: int = 1):
@@ -581,7 +549,14 @@ class CostSim:
         self.layers.append(layer)
         return layer
 
-
+    def GeneralDistributionLayer(self, module, name, custom_previous_layers: list = None, mustTrace=True):
+        if custom_previous_layers == None and len(self.layers) > 0:
+            custom_previous_layers = [self.layers[-1]]
+        layer = Layer(module, name, {}, prevLayers = custom_previous_layers)
+        layer.must_trace = mustTrace
+        layer.distribute = True
+        self.layers.append(layer)
+        return layer
 
     def listConfigOptions(self, layer, globalBatch: int, totalGpus: int, samplePo2=True, sampleSplit=True, spatialSplit=True, filterSplit=False, pruneHeuristics=False, dataParallelBaseline=False):
         initCfg = layer.getInitialConfig(globalBatch)

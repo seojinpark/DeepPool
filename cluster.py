@@ -16,6 +16,7 @@ import time
 import signal
 import sys, os
 import subprocess
+import traceback
 import json
 import xmlrpc.server
 import xmlrpc.client
@@ -253,10 +254,19 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         return 'Returned from poke at %s' % self.myAddr
 
     def export_scheduleTraining(self, jobName: str, trainingJobInJSON: str, runbe):
+        try:
+            return self.scheduleTraining_wrap(jobName, trainingJobInJSON, runbe)
+        except:
+            traceback.print_exc()
+            sys.stdout.flush()
+            raise
+
+
+    def scheduleTraining_wrap(self, jobName: str, trainingJobInJSON: str, runbe):
         job = TrainingJob("test", None, None, 0, 0, "")
         job.loadJSON(trainingJobInJSON)
         print("received job")
-        
+
         gpusUsed = job.getGpusUsed()
         moduleDescList = [job.dumpSingleRunnableModule(rank) for rank in range(gpusUsed)]
         tensorTags = self.buildCommTensorTags(moduleDescList)
@@ -282,7 +292,8 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
             "nr_gpus": gpusUsed,
             "cifar_training": "cifar" in jobName,
             "lossfn": "CrossEntropyLoss" if "gpt2" in jobName else "NLL",
-            "autocast": True,
+            "autocast": "dlrm" not in jobName.lower(), # TODO: investigate autocast + DLRM
+            "dset": "dlrm" if "dlrm" in jobName.lower() else "random",
         }
 
         jobParamsInJson = json.dumps(jobParams)

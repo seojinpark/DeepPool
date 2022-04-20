@@ -112,9 +112,11 @@ RunnableModule::RunnableModule(
 
     SpecialModuleTypes specialModule = SpecialModuleTypes::NOTSPECIAL;
     if (name == "concat") specialModule = SpecialModuleTypes::CONCAT;
+    if (ldsc.contains("distribute") && ldsc["distribute"].get<bool>())
+      specialModule = SpecialModuleTypes::DISTRIBUTE;
 
     DP_LOG(DEBUG, " layer's module is loaded.");
-    DP_LOG(DEBUG, " layer is%s concat.", name == "concat" ? "" : " not");
+    DP_LOG(DEBUG, " layer special type is %d", static_cast<int>(specialModule));
 
     DP_LOG(DEBUG, " layer's module is moved to device and set for train mode.");
 
@@ -334,17 +336,36 @@ torch::Tensor Layer::DoForward(RunnableModule* model, bool captureLayer) {
 
   ScopedGraphRecorder graph(model, TASK_FLAGS_COMPUTE, "forward_" + layername);
 
-  output = module.forward(iVec).toTensor();
-  /* verify output shape is as expected per job description */
-  for (size_t i = 1; i < emptyOutSizes.size(); i++)
-    assert(emptyOutSizes[i] == output.sizes().vec()[i]);
-  assert(emptyOutSizes.size() == output.sizes().vec().size());
+  auto out = module.forward(iVec);
+
+  if (out.isTensor()) {
+    output = out.toTensor();
+    /* verify output shape is as expected per job description */
+    for (size_t i = 1; i < emptyOutSizes.size(); i++)
+      assert(emptyOutSizes[i] == output.sizes().vec()[i]);
+    assert(emptyOutSizes.size() == output.sizes().vec().size());
+  } else {
+    assert(out.isList());
+    assert(specialModule == SpecialModuleTypes::DISTRIBUTE);
+  }
 
   if (captureLayer) fwUsec = fwdtimer.EndCaptureAndTime();
 
-  for (auto& nl : nextLayers)
-    nl->tensors_in[id] =
-        output.detach().requires_grad_(output.is_floating_point());
+  if (specialModule != SpecialModuleTypes::DISTRIBUTE) {
+    for (auto& nl : nextLayers)
+      nl->tensors_in[id] =
+          output.detach().requires_grad_(output.is_floating_point());
+  } else {
+    size_t done = 0;
+    for (auto outIt : out.toListRef()) {
+      auto outT = outIt.toTensor();
+      assert(done < nextLayers.size());
+      auto& nl = nextLayers.at(done++);
+      dist_outputs[nl->id] = outT;
+      nl->tensors_in[id] =
+          outT.detach().requires_grad_(outT.is_floating_point());
+    }
+  }
 
   return output;
 }
@@ -355,7 +376,7 @@ void Layer::DoBackward(RunnableModule* model, bool captureLayer) {
     return;
   }
 
-  if (!output.requires_grad()) {
+  if (!output.requires_grad() && dist_outputs.size() == 0) {
     DP_LOG(DEBUG, "Layer %d does not require grad", id);
     return;
   }
@@ -380,7 +401,13 @@ void Layer::DoBackward(RunnableModule* model, bool captureLayer) {
     auto& grad = nl->tensors_in[id];
     DP_LOG(DEBUG, "Backward on output:%s grad(%d):%s",
            tsrSizeToStr(output).c_str(), nl->id, tsrSizeToStr(grad).c_str());
-    output.backward(grad, nli < nextLayers.size() - 1);
+    if (specialModule == SpecialModuleTypes::DISTRIBUTE) {
+      auto &t = dist_outputs[nl->id];
+      if (t.requires_grad()) t.backward(grad);
+      t.reset();
+    } else {
+      output.backward(grad, nli < nextLayers.size() - 1);
+    }
     nl->tensors_in[id].reset();
   }
 
@@ -393,6 +420,7 @@ void Layer::DoBackward(RunnableModule* model, bool captureLayer) {
   }
 
   output.reset();
+  dist_outputs.clear();
 }
 
 // TODO maybe some cleaner way to do in code, but this shouldn't impact
@@ -408,7 +436,8 @@ static torch::Tensor getSampleSlice(torch::Tensor& in, ssize_t offset,
 }
 
 /* Prepapre samples needed to process this layer */
-void RunnableModule::ExecuteXfers(Layer* layer, bool backward) {
+void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
+                                  bool backward) {
   if (!layer->xfers.size() && !layer->xfers_local.size()) return;
 
   DP_LOG(DEBUG, "Executing xfers for layer %d", layer->id);
@@ -508,7 +537,7 @@ void RunnableModule::ExecuteXfers(Layer* layer, bool backward) {
  */
 JobStatus RunnableModule::forwardAStep(bool captureLayer) {
   assert(layerQ.size() > 0);
-  Layer* layer = layerQ.front();
+  std::shared_ptr<Layer> layer = layerQ.front();
   layerQ.pop_front();
 
   assert(layer->nr_current_depedencies == 0);
@@ -523,7 +552,7 @@ JobStatus RunnableModule::forwardAStep(bool captureLayer) {
 
   for (auto& nl : layer->nextLayers) {
     assert(nl->nr_current_depedencies > 0);
-    if (--nl->nr_current_depedencies == 0) layerQ.push_back(nl.get());
+    if (--nl->nr_current_depedencies == 0) layerQ.push_back(nl);
   }
 
   if (!isTrain_) {
@@ -549,7 +578,6 @@ JobStatus RunnableModule::forwardAStep(bool captureLayer) {
 void RunnableModule::loss() {
   if (!fpOutput.defined()) return;
 
-
   if (lossLayer) {
     std::vector<c10::IValue> iVec;
     iVec.emplace_back(fpOutput);
@@ -560,8 +588,6 @@ void RunnableModule::loss() {
     fpOutput = loss_fct(fpOutput, fpTargets.view({-1}));
   } else {
     assert(lossfn_ == LossFunctions::NLLLoss);
-    std::cout << tsrSizeToStr(fpOutput).c_str() << std::endl;
-    std::cout << tsrSizeToStr(fpTargets).c_str() << std::endl;
     fpOutput = torch::nll_loss(fpOutput.log_softmax(1), fpTargets);
   }
 
@@ -575,7 +601,7 @@ void RunnableModule::loss() {
  */
 JobStatus RunnableModule::backwardAStep(bool captureLayer) {
   assert(layerQ.size() > 0);
-  Layer* layer = layerQ.front();
+  std::shared_ptr<Layer> layer = layerQ.front();
   layerQ.pop_front();
 
   assert(layer->nr_current_depedencies == 0);
@@ -597,7 +623,7 @@ JobStatus RunnableModule::backwardAStep(bool captureLayer) {
 
   for (auto& pl : layer->prevLayers) {
     assert(pl->nr_current_depedencies > 0);
-    if (--pl->nr_current_depedencies == 0) layerQ.push_back(pl.get());
+    if (--pl->nr_current_depedencies == 0) layerQ.push_back(pl);
   }
 
   assert(!layer->layername.empty());
@@ -629,7 +655,7 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     TimerRecordStage("start");
 
     layerQ.clear();
-    layerQ.push_back(layers[0].get());
+    layerQ.push_back(layers.at(0));
 
     nr_iters_++;
 
@@ -692,7 +718,7 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     TimerRecordStage("loss");
     TimerRecordLayer("start", true);
     assert(layerQ.empty());
-    layerQ.push_back(layers.back().get());
+    layerQ.push_back(layers.back());
     DP_LOG(DEBUG, "Moving to backward pass.");
     state = JobState::BACKWARD;
   } else if (state == JobState::BACKWARD) {

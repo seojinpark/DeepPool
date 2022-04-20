@@ -136,8 +136,22 @@ Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
                            sampleIndices, gen, eval ? 1000 : fake_images);
   }
 
-  DP_LOG(DEBUG, "Using fake dataset");
   indim[0] = globalBatchSize;
+
+  if (name.find("dlrm") != std::string::npos) {
+    DP_LOG(DEBUG, "Using dlrm fake dataset");
+    auto targetOpts = torch::TensorOptions().requires_grad(false);
+    // TODO: recreate the random dataset generator from the FB python impl
+    auto gen = [=] {
+      auto data = torch::zeros(indim);
+      auto target = torch::zeros({globalBatchSize, 1}, targetOpts);
+      return torch::data::Example<>(data, target);
+    };
+    return new FakeDataset(rank, globalBatchSize, initialBatchSizes,
+                           sampleIndices, gen, eval ? 1000 : fake_images);
+  }
+
+  DP_LOG(DEBUG, "Using fake dataset");
   auto targetOpts =
       torch::TensorOptions().dtype(torch::kInt64).requires_grad(false);
   auto gen = [=] {

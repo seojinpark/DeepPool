@@ -125,7 +125,7 @@ from jobDescription import TrainingJob
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 
-do_embed_layer_mp = True
+do_embed_layer_mp = False #True
 bbn_max_gpus = None
 
 
@@ -443,6 +443,16 @@ def loss_fn_wrap(Z, T, use_gpu, device):
             loss_sc_ = loss_ws_ * loss_fn_
             return loss_sc_.mean()
 
+def loss_fn_wrap_nodevice(Z, T):
+    with record_function("DLRM loss compute"):
+        if args.loss_function == "mse" or args.loss_function == "bce":
+            return dlrm.loss_fn(Z, T)
+        elif args.loss_function == "wbce":
+            loss_ws_ = dlrm.loss_ws[T.data.view(-1).long()].view_as(T)
+            loss_fn_ = dlrm.loss_fn(Z, T)
+            loss_sc_ = loss_ws_ * loss_fn_
+            return loss_sc_.mean()
+
 
 # The following function is a wrapper to avoid checking this multiple times in th
 # loop below.
@@ -487,6 +497,81 @@ class LRPolicyScheduler(_LRScheduler):
                 lr = self.base_lrs
         return lr
 
+"""
+This super hacky module helps get fake data into the right place in the runtime.
+Currently the runtime supports a single data Tensor as input to the model, and
+only supports a single "first" node. The runtime's dataset generator generates
+the dense features, and embedding indexes/offsets in a single tensor per sample;
+this input node unpacks the data and forwards the relevant parts to the relevant
+operators.
+"""
+
+class FakeDataDistributionNode(nn.Module):
+    def __init__(self, dense_features, nl_bags, average_lS_i_len):
+        super(FakeDataDistributionNode, self).__init__()
+        self.dense_features = dense_features
+        self.nl_bags = nl_bags
+        self.average_lS_i_len = average_lS_i_len
+
+    def forward(self, input_data):
+        # [Batch Dim, DATA]
+        # DATA := [nr_dense_features] + [nr_bags] + [nr_bags * average_lS_i_len]
+        dense_x = input_data[:, :self.dense_features]
+        offsets_by_batch = input_data[:, self.dense_features:self.dense_features + self.nl_bags]
+        offsets = torch.transpose(offsets_by_batch, 0, 1).contiguous().unsqueeze(2).to(torch.int32)
+
+        idx = input_data[:, self.dense_features + self.nl_bags:]
+        idx = idx.view(-1, self.nl_bags, self.average_lS_i_len)
+        idx = torch.transpose(idx, 0, 1).contiguous().to(torch.int32) # TODO: should these be int64
+
+        tempcat = torch.cat([offsets, idx], 2)
+
+        return [dense_x] + list(tempcat.split([1] * self.nl_bags))
+
+"""
+This class unpacks the offsets and indexes for each sample for the embedding bag
+"""
+class EmbeddingRepackWrap(nn.Module):
+    def __init__(self, bag):
+        super(EmbeddingRepackWrap, self).__init__()
+        self.bag = bag
+
+    def forward(self, input_data):
+        # [1, Batch, [offset, indexes]]
+        idata = input_data.squeeze(0)
+        offsets = torch.flatten(idata[:, :1])
+        indexes = torch.flatten(idata[:, 1:])
+        return self.bag(indexes, offsets)
+
+class DLRMDotModule(nn.Module):
+    def __init__(self, arch_interaction_itself: bool = False):
+        super(DLRMDotModule, self).__init__()
+        self.arch_interaction_itself = arch_interaction_itself
+
+    def forward(self, *inputList):
+        x=inputList[0]
+        ly=inputList[1:]
+        (batch_size, d) = x.shape
+        T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+        # perform a dot product
+        Z = torch.bmm(T, torch.transpose(T, 1, 2))
+        # append dense feature with the interactions (into a row vector)
+        # approach 1: all
+        # Zflat = Z.view((batch_size, -1))
+        # approach 2: unique
+        _, ni, nj = Z.shape
+        # approach 1: tril_indices
+        # offset = 0 if self.arch_interaction_itself else -1
+        # li, lj = torch.tril_indices(ni, nj, offset=offset)
+        # approach 2: custom
+        offset = 1 if self.arch_interaction_itself else 0
+        li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
+        lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+        Zflat = Z[:, li, lj]
+        # concatenate dense features and interactions
+        R = torch.cat([x] + [Zflat], dim=1)
+
+        return R
 
 ### define dlrm in PyTorch ###
 class DLRM_Net(nn.Module):
@@ -502,10 +587,6 @@ class DLRM_Net(nn.Module):
                 LL = cs.Linear(int(n), int(m), bias=True, custom_previous_layers=custom_previous_layers)
             else:
                 LL = cs.Linear(int(n), int(m), bias=True)
-
-            if i == 0 and mlp_in_shape is not None:
-                cs.layers[-1].setInputShapes([torch.zeros(mlp_in_shape, dtype=torch.float32)])
-            cs.layers[-1].getOutputShape()
 
             # initialize the weights
             # with torch.no_grad():
@@ -537,7 +618,7 @@ class DLRM_Net(nn.Module):
         # approach 2: use Sequential container to wrap all layers
         return torch.nn.Sequential(*layers)
 
-    def create_emb(self, m, ln, weighted_pooling=None, lS_i_shape=None, lS_o_shape=None):
+    def create_emb(self, m, ln, weighted_pooling=None):
         emb_l = nn.ModuleList()
         v_W_l = []
         for i in range(0, ln.size):
@@ -572,14 +653,10 @@ class DLRM_Net(nn.Module):
                     ngpus = bbn_max_gpus
                     EE = cs.EmbeddingBag(n, m, mode="sum", sparse=True, custom_previous_layers=[], device=i%ngpus)
                 else:
-                    EE = cs.EmbeddingBag(n, m, mode="sum", sparse=True, custom_previous_layers=[])
-                if lS_i_shape is not None and lS_o_shape is not None:
-                    # cs.layers[-1].setInputShapes([torch.zeros(lS_i_shape, dtype=torch.int64), torch.zeros(lS_i_shape, dtype=torch.int64)])
-                    cs.layers[-1].setInputShapes([
-                        torch.arange(0, lS_i_shape-1, step=1, dtype=torch.int64), 
-                        torch.arange(0, lS_i_shape-1, step=lS_i_shape//lS_o_shape[1],  dtype=torch.int64)[:lS_o_shape[1]]
-                    ])
-                    cs.layers[-1].getOutputShape()
+                    EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
+                    mod = EmbeddingRepackWrap(EE)
+                    cs.GeneralLayer(mod, "EmbeddingBag", {}, custom_previous_layers=[self.distlayer], mustTrace=True)
+
                 self.merge_layers.append(cs.layers[-1])
                 # initialize embeddings
                 # nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
@@ -676,18 +753,23 @@ class DLRM_Net(nn.Module):
             #     self.local_emb_slice = ext_dist.get_my_slice(n_emb)
             #     self.local_emb_indices = list(range(n_emb))[self.local_emb_slice]
 
+            distmod = FakeDataDistributionNode(mlp_in_shape[1], len(ln_emb), lS_i_shape)
+            self.distlayer = cs.GeneralDistributionLayer(distmod, "inputsplit")
+            self.distlayer.addInputShape(torch.zeros(1,  mlp_in_shape[1] + len(ln_emb) + len(ln_emb) * lS_i_shape))
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot, mlp_in_shape).to(device=0)
             self.merge_layers.append(cs.layers[-1])
             # create operators
             if ndevices <= 1:
-                self.emb_l, w_list = self.create_emb(m_spa, ln_emb, weighted_pooling, lS_i_shape, lS_o_shape)
+                self.emb_l, w_list = self.create_emb(m_spa, ln_emb, weighted_pooling)
                 if self.weighted_pooling == "learned":
                     self.v_W_l = nn.ParameterList()
                     for w in w_list:
                         self.v_W_l.append(Parameter(w))
                 else:
                     self.v_W_l = w_list
-            cs.DLRMDot(self.arch_interaction_itself, self.merge_layers)
+            mod = DLRMDotModule(self.arch_interaction_itself)
+            layer = cs.GeneralLayer(mod, "dlrm_dot", {"arch_interaction_itself": arch_interaction_itself}, custom_previous_layers = self.merge_layers)
+            layer.must_trace = True
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
 
             # quantization
@@ -2032,7 +2114,7 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
             # print([S_i.detach().cpu() for S_i in lS_i])
             # print(T.detach().cpu())
             # break
-    average_lS_i_len //= 10
+    average_lS_i_len //= j + 1
     X, lS_o, lS_i, T, W, CBPP = unpack_batch(exampleBatch)
     
     global ndevices
@@ -2091,15 +2173,14 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
 
     cs.printAllLayers()
     # cs.computeInputDimensions((2,240,240))
-    # cs.to_dot("Digraph", globalBatch, justdag=True)
+    cs.to_dot("Digraph", globalBatch, justdag=True)
 
     # job, iterMs, gpuMs, maxGpusUsed = cs.JustDoDP(gpuCount, globalBatch)
     # print("  %2d    %2d   %4.1f  %4.1f\n" % (globalBatch, maxGpusUsed, iterMs, gpuMs))
 
     # jobInJson = job.dumpInJSON()
 
-
-    
+    cs.setLossFunction(lambda a,b: loss_fn_wrap_nodevice(a, b), "dlrmwrap2", torch.zeros((1,1)))
     job, iterMs, gpuMs, maxGpusUsed = cs.searchBestSplitsV3(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
     print("  %2d    %2d   %4.1f  %4.1f\n" % (globalBatch, maxGpusUsed, iterMs, gpuMs))
     cs.to_dot("Digraph", globalBatch)

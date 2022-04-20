@@ -43,6 +43,9 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
   nr_gpus_ = job_params["nr_gpus"].get<size_t>();
 
   std::string dset = "random";
+  if (job_params.contains("dset"))
+    dset = job_params["dset"].get<std::string>();
+
   if (job_params.contains("cifar_training") &&
       job_params["cifar_training"].get<bool>()) {
     dset = "cifar";
