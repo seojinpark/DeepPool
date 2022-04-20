@@ -616,7 +616,8 @@ JobStatus RunnableModule::backwardAStep(bool captureLayer) {
 
   if (layer->doLocalGradSync) {
     for (const auto& param : layer->module.parameters()) {
-      if (param.mutable_grad().defined())
+      if (param.mutable_grad().defined() &&
+          !param.mutable_grad().is_sparse())  // TODO fix
         sync_manager_.AddGradient(param.mutable_grad(), layer->commGroupKey);
     }
   }
