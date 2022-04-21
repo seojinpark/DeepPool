@@ -69,12 +69,12 @@ class Layer:
             prevLayer.nextLayers.append(self)
         self.nextLayers = []
         self.module = module
-        self.jit_module = None
         self.moduleSavedLocation = None
         self.losslayer = ""
         self.device = device
         self.initial_inputs = []
         self.distribute = False
+        self.traced_once = False
 
         # self.inputDim = (0, 0, 0)   # (Channel, Width, Height) for 2d convolution
         # self.outputDim = (0, 0, 0)  # (Channel, Width, Height)
@@ -148,10 +148,10 @@ class Layer:
             moduleId = self.getModuleId()
             saveLocation = os.getcwd() + f"/modules/scriptmodule_{moduleId}.pt"
             self.moduleSavedLocation = saveLocation
-        if exists(self.moduleSavedLocation): # Skip if module file is already there.
-            if not self.jit_module:
-                return torch.jit.load(self.moduleSavedLocation).to("cuda")
-            return self.jit_module
+        if not self.module or self.traced_once:
+            return torch.jit.load(self.moduleSavedLocation).to("cuda")
+
+        self.traced_once = True
 
         fakeInput = self.getRandomInputs(1, "cpu")
         if self.must_trace:
@@ -163,8 +163,7 @@ class Layer:
 
         # saveLocation = "modules/scriptmodule_%d.pt"%self.id
         torch.jit.save(traced, self.moduleSavedLocation)
-        self.jit_module = torch.jit.load(self.moduleSavedLocation).to("cuda")
-        return self.jit_module
+        return torch.load(self.moduleSavedLocation).to("cuda")
 
     def getInitialConfig(self, globalBatch: int):
         inputDim = self.getInputShapes()[0].tensor_shape_nobatch()
