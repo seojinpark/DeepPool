@@ -544,9 +544,17 @@ class EmbeddingRepackWrap(nn.Module):
         return self.bag(indexes, offsets)
 
 class DLRMDotModule(nn.Module):
-    def __init__(self, arch_interaction_itself: bool = False):
+    def __init__(self, arch_interaction_itself: bool = False, nr_emb: int = 1):
         super(DLRMDotModule, self).__init__()
         self.arch_interaction_itself = arch_interaction_itself
+
+        # cache the tensors used for the index below on the device
+        ni, nj = nr_emb + 1, nr_emb + 1
+        offset = 1 if self.arch_interaction_itself else 0
+        li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
+        lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+        self.register_buffer("li", li)
+        self.register_buffer("lj", lj)
 
     def forward(self, *inputList):
         x=inputList[0]
@@ -559,14 +567,14 @@ class DLRMDotModule(nn.Module):
         # approach 1: all
         # Zflat = Z.view((batch_size, -1))
         # approach 2: unique
-        _, ni, nj = Z.shape
+        # _, ni, nj = Z.shape
         # approach 1: tril_indices
         # offset = 0 if self.arch_interaction_itself else -1
         # li, lj = torch.tril_indices(ni, nj, offset=offset)
         # approach 2: custom
-        offset = 1 if self.arch_interaction_itself else 0
-        li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
-        lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+        # offset = 1 if self.arch_interaction_itself else 0
+        li = self.get_buffer("li")
+        lj = self.get_buffer("lj")
         Zflat = Z[:, li, lj]
         # concatenate dense features and interactions
         R = torch.cat([x] + [Zflat], dim=1)
@@ -767,7 +775,7 @@ class DLRM_Net(nn.Module):
                         self.v_W_l.append(Parameter(w))
                 else:
                     self.v_W_l = w_list
-            mod = DLRMDotModule(self.arch_interaction_itself)
+            mod = DLRMDotModule(self.arch_interaction_itself, len(ln_emb))
             layer = cs.GeneralLayer(mod, "dlrm_dot", {"arch_interaction_itself": arch_interaction_itself}, custom_previous_layers = self.merge_layers)
             layer.must_trace = True
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
@@ -2180,7 +2188,7 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
 
     # jobInJson = job.dumpInJSON()
 
-    cs.setLossFunction(lambda a,b: loss_fn_wrap_nodevice(a, b), "dlrmwrap2", torch.zeros((1,1)))
+    cs.setLossFunction(lambda a,b: loss_fn_wrap_nodevice(a, b), "dlrm_loss", torch.zeros((1,1)))
     job, iterMs, gpuMs, maxGpusUsed = cs.searchBestSplitsV3(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
     print("  %2d    %2d   %4.1f  %4.1f\n" % (globalBatch, maxGpusUsed, iterMs, gpuMs))
     cs.to_dot("Digraph", globalBatch)
