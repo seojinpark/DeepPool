@@ -7,6 +7,8 @@
 #include "runtime.h"
 #include "utils.h"
 
+using namespace torch::indexing;
+
 class Dataset {
  public:
   virtual torch::data::Example<> getNext() = 0;
@@ -26,15 +28,11 @@ class Dataset {
     if (initialBatchSizes_.at(rank_))
       data = ex.data.split_with_sizes(initialBatchSizes_)[rank_];
 
-    if (sampleIndices_.size()) {
-      std::vector<long> spl(globalBatchSize_, 1);
-      auto splitsamples =
-          ex.target.split_with_sizes(spl);  // TODO make this clean....
-      std::vector<torch::Tensor> samplesOrdered;
-      for (auto &s : sampleIndices_)
-        samplesOrdered.push_back(splitsamples.at(s));
-      target = torch::cat(samplesOrdered);
-    }
+    std::vector<torch::Tensor> samplesOrdered;
+    for (auto &slice : slices_)
+      samplesOrdered.push_back(ex.target.index({slice}));
+    if (samplesOrdered.size()) target = torch::cat(samplesOrdered);
+
     return {data, target};
   }
 
@@ -44,13 +42,27 @@ class Dataset {
           std::vector<long> initialBatchSizes, std::vector<long> sampleIndices)
       : globalBatchSize_(globalBatchSize),
         rank_(rank),
-        initialBatchSizes_(initialBatchSizes),
-        sampleIndices_(sampleIndices){};
+        initialBatchSizes_(initialBatchSizes) {
+    if (sampleIndices.size() == 0) return;
+    long start_sample = sampleIndices[0];
+    long last_sample = start_sample;
+
+    /* find and record ranges of consecutive samples indices */
+    for (size_t i = 1; i < sampleIndices.size(); i++) {
+      auto sidx = sampleIndices[i];
+      if (sidx != last_sample + 1) {
+        slices_.emplace_back(start_sample, last_sample + 1);
+        start_sample = sidx;
+      }
+      last_sample = sidx;
+    }
+    slices_.emplace_back(start_sample, last_sample + 1);
+  }
 
  private:
   size_t rank_;
+  std::vector<Slice> slices_;
   std::vector<long> initialBatchSizes_;
-  std::vector<long> sampleIndices_;
 };
 
 class TensorPipeline {
@@ -70,7 +82,6 @@ class TensorPipeline {
     auto origstream = c10::cuda::getCurrentCUDAStream();
     c10::cuda::setCurrentCUDAStream(rtctx->xfer_stream);
     next_up_ = next.to(rtctx->c10dev, /*non_blocking*/ true, /*copy*/ false);
-    xfer_ev_.record();
     c10::cuda::setCurrentCUDAStream(origstream);
   }
 
@@ -81,6 +92,7 @@ class TensorPipeline {
     if (!tensorbytes) return torch::Tensor();
 
     /* current stream must wait for xfer before using returned tsr */
+    xfer_ev_.record(rtctx->xfer_stream);
     xfer_ev_.block(c10::cuda::getCurrentCUDAStream());
 
     next_up_ = {};
