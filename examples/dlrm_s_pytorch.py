@@ -507,41 +507,21 @@ operators.
 """
 
 class FakeDataDistributionNode(nn.Module):
-    def __init__(self, dense_features, nl_bags, average_lS_i_len):
+    def __init__(self, dense_features, nl_bags, num_indices_per_lookup):
         super(FakeDataDistributionNode, self).__init__()
         self.dense_features = dense_features
         self.nl_bags = nl_bags
-        self.average_lS_i_len = average_lS_i_len
+        self.num_indices_per_lookup = num_indices_per_lookup
 
     def forward(self, input_data):
         # [Batch Dim, DATA]
-        # DATA := [nr_dense_features] + [nr_bags] + [nr_bags * average_lS_i_len]
+        # DATA := [nr_dense_features] + [nr_bags * num_indices_per_lookup]
         dense_x = input_data[:, :self.dense_features]
-        offsets_by_batch = input_data[:, self.dense_features:self.dense_features + self.nl_bags]
-        offsets = torch.transpose(offsets_by_batch, 0, 1).contiguous().unsqueeze(2).to(torch.int32)
-
-        idx = input_data[:, self.dense_features + self.nl_bags:]
-        idx = idx.view(-1, self.nl_bags, self.average_lS_i_len)
+        idx = input_data[:, self.dense_features:]
+        idx = idx.view(-1, self.nl_bags, self.num_indices_per_lookup)
         idx = torch.transpose(idx, 0, 1).contiguous().to(torch.int32) # TODO: should these be int64
 
-        tempcat = torch.cat([offsets, idx], 2)
-
-        return [dense_x] + list(tempcat.split([1] * self.nl_bags))
-
-"""
-This class unpacks the offsets and indexes for each sample for the embedding bag
-"""
-class EmbeddingRepackWrap(nn.Module):
-    def __init__(self, bag):
-        super(EmbeddingRepackWrap, self).__init__()
-        self.bag = bag
-
-    def forward(self, input_data):
-        # [1, Batch, [offset, indexes]]
-        idata = input_data.squeeze(0)
-        offsets = torch.flatten(idata[:, :1])
-        indexes = torch.flatten(idata[:, 1:])
-        return self.bag(indexes, offsets)
+        return [dense_x] + list(i.squeeze(0) for i in idx.split([1] * self.nl_bags))
 
 class DLRMDotModule(nn.Module):
     def __init__(self, arch_interaction_itself: bool = False, nr_emb: int = 1):
@@ -659,11 +639,10 @@ class DLRM_Net(nn.Module):
                 if do_embed_layer_mp:
                     global bbn_max_gpus
                     ngpus = bbn_max_gpus
-                    EE = cs.EmbeddingBag(n, m, mode="sum", sparse=True, custom_previous_layers=[], device=i%ngpus)
+                    EE = cs.EmbeddingBag(int(n), int(m), mode="sum", sparse=True, custom_previous_layers=[], device=i%ngpus)
                 else:
-                    EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
-                    mod = EmbeddingRepackWrap(EE)
-                    cs.GeneralLayer(mod, "EmbeddingBag", {}, custom_previous_layers=[self.distlayer], mustTrace=True)
+                    EE = nn.EmbeddingBag(int(n), int(m), mode="sum", sparse=True)
+                    cs.GeneralLayer(EE, "EmbeddingBag", {}, custom_previous_layers=[self.distlayer], mustTrace=False)
 
                 self.merge_layers.append(cs.layers[-1])
                 # initialize embeddings
@@ -706,8 +685,7 @@ class DLRM_Net(nn.Module):
         weighted_pooling=None,
         loss_function="bce",
         mlp_in_shape = None,
-        lS_o_shape = None,
-        lS_i_shape = None
+        args=None,
     ):
         super(DLRM_Net, self).__init__()
 
@@ -761,9 +739,9 @@ class DLRM_Net(nn.Module):
             #     self.local_emb_slice = ext_dist.get_my_slice(n_emb)
             #     self.local_emb_indices = list(range(n_emb))[self.local_emb_slice]
 
-            distmod = FakeDataDistributionNode(mlp_in_shape[1], len(ln_emb), lS_i_shape)
+            distmod = FakeDataDistributionNode(mlp_in_shape[1], len(ln_emb), args.num_indices_per_lookup)
             self.distlayer = cs.GeneralDistributionLayer(distmod, "inputsplit")
-            self.distlayer.addInputShape(torch.zeros(1,  mlp_in_shape[1] + len(ln_emb) + len(ln_emb) * lS_i_shape))
+            self.distlayer.addInputShape(torch.zeros(1,  mlp_in_shape[1] + len(ln_emb) * args.num_indices_per_lookup))
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot, mlp_in_shape).to(device=0)
             self.merge_layers.append(cs.layers[-1])
             # create operators
@@ -2155,8 +2133,7 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
         weighted_pooling=args.weighted_pooling,
         loss_function=args.loss_function,
         mlp_in_shape=X.shape,
-        lS_o_shape = lS_o.shape,
-        lS_i_shape = (average_lS_i_len)
+        args = args,
     )
     
     # Z = dlrm_wrap(
@@ -2859,8 +2836,13 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
 if __name__ == "__main__":
 
     print(len(sys.argv))
+    try:
+        ngpu = int(sys.argv[1])
+        del sys.argv[1]
+    except:
+        ngpu = 4
     # if len(sys.argv) == 3:
-    run(4, dataParallelBaseline=True)
+    run(ngpu, dataParallelBaseline=True)
     # elif len(sys.argv) >= 4:
     #     use_be = len(sys.argv) > 4 and int(sys.argv[4]) == 1
     #     if sys.argv[3] == "DP":

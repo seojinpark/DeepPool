@@ -143,7 +143,19 @@ Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
     auto targetOpts = torch::TensorOptions().requires_grad(false);
     // TODO: recreate the random dataset generator from the FB python impl
     auto gen = [=] {
-      auto data = torch::zeros(indim);
+      // TODO: make dynamic
+      constexpr int64_t m_den = 128;
+      constexpr int64_t emb_size = 80000;
+      constexpr int64_t nr_emb = 4;
+      constexpr int64_t indices_per_lookup = 10;
+      auto dense = torch::randn({globalBatchSize, m_den});
+      auto indices = torch::randint(
+          0, emb_size, {globalBatchSize, nr_emb * indices_per_lookup});
+      std::vector<torch::Tensor> l;
+      l.push_back(dense);
+      l.push_back(indices);
+
+      auto data = torch::cat(l, 1);
       auto target = torch::zeros({globalBatchSize, 1}, targetOpts);
       return torch::data::Example<>(data, target);
     };
