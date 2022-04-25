@@ -63,10 +63,10 @@ def discover_gpu_numa():
         return [-1] * len(gpus)
 
     nodes = []
-    for g in gpus:
+    for idx, g in enumerate(gpus):
         gid = g.split("\"")[1][4:].lower()
         node = check_output(f"cat /sys/bus/pci/devices/{gid}/numa_node", shell=True).decode("utf-8").strip()
-        nodes.append(int(node))
+        nodes.append((idx, int(node)))
     return nodes
 
 class CppRuntimeProxy:
@@ -575,10 +575,10 @@ def main():
 #        print("Found %s" % str(serverConfig))
     port = 11270
     gpus = discover_gpu_numa()[:4]
-    for i, node in enumerate(gpus):
+    for idx, node in gpus:
         rankToIpMap[str(len(locations))] = f"127.0.0.1:{port}"
         commGrpRanksWorld.append(len(locations))
-        loc = Location("127.0.0.1", port, i, None, None, args.cpp)
+        loc = Location("127.0.0.1", port, idx, None, None, args.cpp)
         loc.numa_node = node
         locations.append(loc)
         port += 1
