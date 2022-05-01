@@ -51,6 +51,7 @@ struct Xfer {
   std::pair<size_t, size_t> dst; /* rank and offset */
   size_t nr_samples;
   size_t src_lid;
+  bool skip_backward;
   Tag tag;
 };
 
@@ -117,9 +118,13 @@ struct Layer {
   LayerStatus status{LayerStatus::PENDING_FP};
   size_t nr_current_depedencies{0};
   long layerLocalBatch;
-  std::vector<int64_t> emptyOutSizes;
-  std::vector<int64_t> emptyInSizes;
+  std::vector<std::vector<int64_t>> emptyOutSizes;
+  std::vector<std::vector<int64_t>> emptyInSizes;
+  std::vector<c10::ScalarType> inOpts;
+  std::vector<c10::ScalarType> outOpts;
   std::string moduleName;  // Used to output profiled runtimes.
+
+  size_t localRank;
 
   Layer(const Layer &) = delete;
   Layer &operator=(const Layer &) = delete;
@@ -180,7 +185,8 @@ class RunnableModule {
 
   torch::Tensor getOutput() { return fpOutput; }
 
-  void SetInputsTargets(torch::Tensor input, torch::Tensor target = {});
+  void SetInputsTargets(std::vector<torch::Tensor> inputs,
+                        torch::Tensor target = {});
 
   const auto &GetTimers() { return timers; }
 
@@ -189,6 +195,8 @@ class RunnableModule {
   double GetAvgLoss() {
     return loss_tracker_.item().toDouble() / static_cast<double>(nr_iters_);
   }
+
+  bool isTrain() const { return isTrain_; }
 
   RunnableModule(const RunnableModule &) = delete;
   RunnableModule &operator=(const RunnableModule &) = delete;
@@ -211,7 +219,6 @@ class RunnableModule {
 
   long globalBatchSize;
   std::vector<long> sampleIndices;
-  std::vector<long> initialBatchSizes;
 
   inline void TimerRecordLayer(std::string name, bool backwards) {
     if (!rtctx->profile_layer_times_timers || has_graph || graph_recording)
@@ -241,6 +248,7 @@ class RunnableModule {
   GradientSyncManager sync_manager_;
   // Topologically sorted list of layers.
   std::vector<std::shared_ptr<Layer>> layers;
+  std::vector<std::shared_ptr<Layer>> input_layers;
   std::shared_ptr<Layer> lossLayer;
   std::unique_ptr<torch::optim::SGD> optimizer;
   ////////////////////////////////////////////
@@ -259,7 +267,8 @@ class RunnableModule {
   bool backwards_did_sync{false};
   bool has_graph{false};
   bool graph_recording{false};
-  torch::Tensor input_buf, target_buf;
+  torch::Tensor target_buf;
+  std::vector<torch::Tensor> input_bufs;
 
   at::cuda::MempoolId_t graph_mempool;
 

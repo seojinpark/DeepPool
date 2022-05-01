@@ -46,10 +46,10 @@ class JobContext {
   bool ShouldRunTest() const { return runTestRoutine_; }
 
   /* Run a sample through the NN */
-  torch::Tensor Infer(torch::Tensor input);
+  torch::Tensor Infer(std::vector<torch::Tensor> inputs);
 
   /* Run one training iteration with this input/target */
-  void Train(torch::Tensor input, torch::Tensor target);
+  void Train(std::vector<torch::Tensor> inputs, torch::Tensor target);
 
   /* Test the model on the test dataset */
   void Test();

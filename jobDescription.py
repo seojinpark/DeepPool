@@ -38,6 +38,15 @@ class TensorProperties:
     def __str__(self):
         return self.__repr__()
 
+    def asDict(self):
+        return self.props.copy()
+
+    @staticmethod
+    def fromDict(d):
+        t = TensorProperties()
+        t.props = d
+        return t
+
     def fromStr(self, jstr):
         self.props = json.loads(jstr)
 
@@ -76,8 +85,6 @@ class Layer:
         self.distribute = False
         self.traced_once = False
 
-        # self.inputDim = (0, 0, 0)   # (Channel, Width, Height) for 2d convolution
-        # self.outputDim = (0, 0, 0)  # (Channel, Width, Height)
         self.must_trace = False
 
     def addInputShape(self, example_tensor_with_batch: torch.Tensor, *args, **kwargs):
@@ -113,13 +120,6 @@ class Layer:
         else:
             self.outputShapes = [TensorProperties(out)]
 
-        # set inputDim and outputDim for backwards compatibility
-        self.inputDim = self.getInputShapes()[0].tensor_shape_nobatch()
-        if len(self.inputDim) == 1:
-            self.inputDim = self.inputDim[0]
-        self.outputDim = self.outputShapes[0].tensor_shape_nobatch()
-        if len(self.outputDim) == 1:
-            self.outputDim = self.outputDim[0]
         return self.outputShapes
 
     def getOutputShape(self, *args, **kwargs) -> TensorProperties:
@@ -134,14 +134,23 @@ class Layer:
         return [shape.genRand(batchsize, device) for shape in self.getInputShapes()]
 
     def getModuleId(self):
-        if hasattr(self.module, 'weight'):
-            h = hashlib.md5()
-            h.update(self.module.weight.cpu().detach().numpy())
-            return self.name +\
-                json.dumps(self.params, sort_keys=True, separators=('_', '-'))+str(h.hexdigest())
-        else:
-            return self.name +\
+        h = hashlib.md5()
+        hasWeight = False
+
+        def update_hash(module):
+            nonlocal h, hasWeight
+            if hasattr(module, "weight"):
+                h.update(module.weight.cpu().detach().numpy())
+                hasWeight = True
+
+        self.module.apply(update_hash)
+
+        moduleId = self.name +\
                 json.dumps(self.params, sort_keys=True, separators=('_', '-'))
+        if hasWeight:
+            moduleId += str(h.hexdigest())
+
+        return moduleId
 
     def scriptModule(self):
         if not self.moduleSavedLocation:
@@ -153,15 +162,14 @@ class Layer:
 
         self.traced_once = True
 
-        fakeInput = self.getRandomInputs(1, "cpu")
+        fakeInput = self.getRandomInputs(1, "cuda")
         if self.must_trace:
             print("jit tracing...", self.name)
-            traced = torch.jit.trace(self.module.to("cpu"), fakeInput)
+            traced = torch.jit.trace(self.module.cuda(), fakeInput)
         else:
             print("jit scripting...", self.name)
-            traced = torch.jit.script(self.module, fakeInput)
+            traced = torch.jit.script(self.module.cuda(), fakeInput)
 
-        # saveLocation = "modules/scriptmodule_%d.pt"%self.id
         torch.jit.save(traced, self.moduleSavedLocation)
         return torch.load(self.moduleSavedLocation).to("cuda")
 
@@ -200,8 +208,8 @@ class Layer:
             for nextLayer in self.nextLayers:
                 prop["nextLayers"].append(nextLayer.id)
         prop["nextLayers"] = sorted(prop["nextLayers"])
-        prop["inputDim"] = self.inputDim
-        prop["outputDim"] = self.outputDim
+        prop["inputs"] = [i.asDict() for i in self.getInputShapes()]
+        prop["outputs"] = [i.asDict() for i in self.getOutputShapes()]
         if hasattr(self, 'gpuAssignment'):
             prop["gpuAssignment"] = self.gpuAssignment
 
@@ -212,7 +220,7 @@ class Layer:
             prop["moduleSavedLocation"] = saveLocation
 
         if not self.prevLayers:
-            prop["initial_inputs"] = [str(a) for a in self.initial_inputs]
+            prop["initial_inputs"] = [a.asDict() for a in self.initial_inputs]
 
         prop["distribute"] = self.distribute
         return prop
@@ -227,11 +235,10 @@ class TrainingJob:
         self.maxGpusUsed = maxGpusUsed
         self.datasetDir = datasetDir
         self.bytesPerParam = 4
-        self.initialBatchSizes = None
         self.sampleIndicesList = None
         self.perRankConfigCache = []
         self.losslayer = None
-    
+
     def loadJSON(self, jobInJson: str):
         job = json.loads(jobInJson)
         self.globalBatchSize = job["globalBatchSize"]
@@ -245,18 +252,14 @@ class TrainingJob:
             if 'gpuTime' in ldsc:
                 l.gpuTime = ldsc["gpuTime"]
             l.id = ldsc["id"]
-            # l.nextLayers = ldsc["nextLayers"]
-            l.inputDim = ldsc["inputDim"]
-            l.outputDim = ldsc["outputDim"]
+
             if 'gpuAssignment' in ldsc:
                 l.gpuAssignment = ldsc["gpuAssignment"]
             l.bestCfg = ldsc["config"]
             if 'moduleSavedLocation' in ldsc:
                 l.moduleSavedLocation = ldsc["moduleSavedLocation"]
             for inputdesc in ldsc.get('initial_inputs', []):
-                prop = TensorProperties()
-                prop.fromStr(inputdesc)
-                l.initial_inputs.append(prop)
+                l.initial_inputs.append(TensorProperties.fromDict(inputdesc))
             if "distribute" in ldsc:
                 l.distribute = ldsc["distribute"]
             return l
@@ -296,7 +299,6 @@ class TrainingJob:
         if len(self.perRankConfigCache) == 0:
             self.perRankConfigCache = [self.dumpSingleRunnableModuleHelper(rank) for rank in range(self.getGpusUsed())]
         fullDesc = self.perRankConfigCache[targetRank]
-        fullDesc["initialBatchSizes"] = self.initialBatchSizes
         fullDesc["sampleIndices"] = self.sampleIndicesList[targetRank]
         dumpedStr = json.dumps(fullDesc, sort_keys=False)
         return dumpedStr
@@ -310,7 +312,6 @@ class TrainingJob:
 
         initBSize = self.layers[0].bestCfg[0]
         initAssigned = self.layers[0].gpuAssignment
-        self.initialBatchSizes = [initBSize if g in initAssigned else 0 for g in range(self.getGpusUsed())]
 
         totalSamples = 0
         xferCounter = 0
@@ -321,8 +322,6 @@ class TrainingJob:
 
             l.byGpu = defaultdict(list)
             l.bySample = {}
-            if not isinstance(l.gpuAssignment, list):
-                l.gpuAssignmen = [l.gpuAssignmen]
 
             if not l.prevLayers: # 1st layer.
                 totalSamples = 0
@@ -400,6 +399,15 @@ class TrainingJob:
                         for sample_start, nr_sample in samples:
                             assert sorted(prevLayer.byGpu[src]) == prevLayer.byGpu[src]
                             assert sorted(l.byGpu[src]) == l.byGpu[src]
+
+                            srcLayerOutIdxToDst = -1
+                            for i in range(len(prevLayer.nextLayers)):
+                                if prevLayer.nextLayers[i] == l:
+                                    srcLayerOutIdxToDst = i
+                                    break
+                            assert srcLayerOutIdxToDst >= 0
+                            skipBackward = prevLayer.getOutputShapes()[srcLayerOutIdxToDst].dtype() in [torch.int32, torch.int16, torch.int64]
+
                             rxOffset = l.byGpu[receiver].index(sample_start)
                             txOffset = prevLayer.byGpu[src].index(sample_start)
                             xfer = {
@@ -410,6 +418,7 @@ class TrainingJob:
                                     "xferSamples": nr_sample,
                                     "prevLayerId": prevLayer.id,
                                     "nextLayerId": l.id,
+                                    "skipBackward": skipBackward,
                                 },
                                 "dest": receiver,
                                 "src": src,

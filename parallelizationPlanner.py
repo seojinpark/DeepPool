@@ -195,9 +195,13 @@ class CostSim:
         bytesPerParam = 4
 
         # Compute output dimension of previous and current layer.
+        srcIdim = srcLayer.getInputShapes()[0].tensor_shape_nobatch()
+        srcOdim = srcLayer.getOutputShape().tensor_shape_nobatch()
+        dstIdim = destLayer.getInputShapes()[0].tensor_shape_nobatch()
+
         srcS = srcConfig[0]
-        srcW = srcConfig[1] * srcLayer.outputDim[1] // srcLayer.inputDim[1] # Adjusts based on input/output ratio. 
-        srcH = srcConfig[2] * srcLayer.outputDim[2] // srcLayer.inputDim[2] # It's necessary for pool or conv2d with stride > 1
+        srcW = srcConfig[1] * srcOdim[1] // srcIdim[1] # Adjusts based on input/output ratio.
+        srcH = srcConfig[2] * srcOdim[2] // srcIdim[2] # It's necessary for pool or conv2d with stride > 1
         srcOutChannel = srcConfig[4] if len(srcConfig) >= 5 else srcConfig[3] # non-convolutional 2d layers don't have filter.
         destS = destConfig[0]
         destW = destConfig[1]
@@ -242,8 +246,8 @@ class CostSim:
         else:
             haloW = 0
             haloH = 0
-        haloPixels = 2 * haloW * ((destH + haloH) if destW != destLayer.inputDim[1] else 0)\
-                     + 2 * haloH * ((destW + haloW) if destH != destLayer.inputDim[2] else 0)
+        haloPixels = 2 * haloW * ((destH + haloH) if destW != dstIdim[1] else 0)\
+                     + 2 * haloH * ((destW + haloW) if destH != dstIdim[2] else 0)
         haloSize = bytesPerParam * min(srcS, destS) * haloPixels * min(srcOutChannel, destInChannel)
 
         # compute times
@@ -264,20 +268,25 @@ class CostSim:
         
     def calcLinearActivationTime(self, srcLayer: Layer, destLayer: Layer, srcConfig: tuple, destConfig: tuple, noGpuOverlap: bool):
         bytesPerParam = 4
+
+        srcIdim = srcLayer.getInputShapes()[0].tensor_shape_nobatch()
+        srcOdim = srcLayer.getOutputShape().tensor_shape_nobatch()
+
         # Prepare variables.
         prevOutFeatures = 0
         if len(srcConfig) >= 4: # prev layer was conv2d.
             # print("%s to %s" % (srcLayer.name, destLayer.name))
             srcS = srcConfig[0]
-            srcW = srcConfig[1] * 1 if srcLayer.name == "flatten" else (srcLayer.outputDim[1] // srcLayer.inputDim[1]) # Adjusts based on input/output ratio. 
-            srcH = srcConfig[2] * 1 if srcLayer.name == "flatten" else (srcLayer.outputDim[2] // srcLayer.inputDim[2]) # It's necessary for pool or conv2d with stride > 1
+            srcW = srcConfig[1] * 1 if srcLayer.name == "flatten" else (srcOdim[1] // srcIdim[1]) # Adjusts based on input/output ratio. 
+            srcH = srcConfig[2] * 1 if srcLayer.name == "flatten" else (srcOdim[2] // srcIdim[2]) # It's necessary for pool or conv2d with stride > 1
             srcOutChannel = srcConfig[4] if len(srcConfig) >= 5 else srcConfig[3] # non-convolutional 2d layers don't have filter.
             srcOutFeatures = srcW * srcH * srcOutChannel
             splitFactor = 1
         elif len(srcConfig) == 3:
             srcS = srcConfig[0]
             srcOutFeatures = srcConfig[2]
-            splitFactor = srcLayer.inputDim / srcConfig[1] # This much output must be added up to get the final output.
+            assert len(srcIdim) == 1
+            splitFactor = srcIdim[0] / srcConfig[1] # This much output must be added up to get the final output.
         else:
             print("[calcLinearActivationTime] error! srcConfig dimensions is not correct.")
         destS = destConfig[0]
@@ -301,9 +310,9 @@ class CostSim:
         bytesPerParam = 4
         # Prepare variables.
         srcS = srcConfig[0]
-        srcOutFeatures = numpy.prod(srcLayer.outputDim)
+        srcOutFeatures = numpy.prod(srcLayer.getOutputShape().tensor_shape_nobatch())
         destS = destConfig[0]
-        destInFeatures = numpy.prod(destLayer.inputDim)
+        destInFeatures = numpy.prod(destLayer.getInputShapes()[0].tensor_shape_nobatch())
         splitFactor = 1
 
         commonSize = bytesPerParam * min(srcS, destS) * min(srcOutFeatures, destInFeatures)
@@ -541,10 +550,10 @@ class CostSim:
         self.layers.append(layer)
         return module
     
-    def GeneralLayer(self, module, name, params, custom_previous_layers: list = None, mustTrace=False):
+    def GeneralLayer(self, module, name, params, custom_previous_layers: list = None, mustTrace=False, device=None):
         if custom_previous_layers == None and len(self.layers) > 0:
             custom_previous_layers = [self.layers[-1]]
-        layer = Layer(module, name, params, prevLayers = custom_previous_layers)
+        layer = Layer(module, name, params, prevLayers = custom_previous_layers,device=device)
         layer.must_trace = mustTrace
         self.layers.append(layer)
         return layer

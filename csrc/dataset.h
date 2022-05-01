@@ -4,29 +4,48 @@
 #include <ATen/cuda/CUDAEvent.h>
 #include <torch/torch.h>
 
+#include "runnableModule.h"
 #include "runtime.h"
 #include "utils.h"
 
 using namespace torch::indexing;
 
+struct Example {
+  Example(torch::Tensor d, torch::Tensor target) : target(target) {
+    data.push_back(d);
+  }
+  Example(std::vector<torch::Tensor> data, torch::Tensor target)
+      : data(data), target(target) {}
+  std::vector<torch::Tensor> data;
+  torch::Tensor target;
+};
+
 class Dataset {
  public:
-  virtual torch::data::Example<> getNext() = 0;
+  virtual Example getNext() = 0;
   virtual size_t GetItersPerEpoch() = 0;
   virtual bool IsDone() = 0;
   virtual void Reset() = 0;
   static Dataset *fromName(std::string name, size_t rank, long globalBatchSize,
-                           std::vector<long> initialBatchSizes,
+                           std::vector<std::shared_ptr<Layer>> input_layers,
                            std::vector<long> sampleIndices,
-                           size_t fake_train_iters_per_epoch,
-                           std::vector<long> indim);
+                           size_t fake_train_iters_per_epoch);
 
-  torch::data::Example<> getNextThisRank() {
-    auto ex = getNext();
+  Example globalToPerRankExample(Example ex) {
+    std::vector<torch::Tensor> data;
+    torch::Tensor target;
 
-    torch::Tensor data, target;
-    if (initialBatchSizes_.at(rank_))
-      data = ex.data.split_with_sizes(initialBatchSizes_)[rank_];
+    assert(ex.data.size() == input_layers.size());
+    for (size_t i = 0; i < input_layers.size(); i++) {
+      auto &iLayer = input_layers[i];
+      if (!iLayer->active) {
+        data.emplace_back();
+        continue;
+      }
+      size_t sample_start = iLayer->layerLocalBatch * iLayer->localRank;
+      size_t sample_end = sample_start + iLayer->layerLocalBatch;
+      data.push_back(ex.data[i].index({Slice(sample_start, sample_end)}));
+    }
 
     std::vector<torch::Tensor> samplesOrdered;
     for (auto &slice : slices_)
@@ -39,10 +58,11 @@ class Dataset {
  protected:
   long globalBatchSize_;
   Dataset(size_t rank, long globalBatchSize,
-          std::vector<long> initialBatchSizes, std::vector<long> sampleIndices)
+          std::vector<std::shared_ptr<Layer>> input_layers,
+          std::vector<long> sampleIndices)
       : globalBatchSize_(globalBatchSize),
         rank_(rank),
-        initialBatchSizes_(initialBatchSizes) {
+        input_layers(input_layers) {
     if (sampleIndices.size() == 0) return;
     long start_sample = sampleIndices[0];
     long last_sample = start_sample;
@@ -62,56 +82,50 @@ class Dataset {
  private:
   size_t rank_;
   std::vector<Slice> slices_;
-  std::vector<long> initialBatchSizes_;
+  std::vector<std::shared_ptr<Layer>> input_layers;
 };
 
 class TensorPipeline {
  public:
-  TensorPipeline(torch::Tensor next) {
-    tensorbytes = next.defined() ? next.nbytes() : 0;
-    SupplyNext(next);
-  }
+  TensorPipeline(std::vector<torch::Tensor> next) { SupplyNext(next); }
 
-  void SupplyNext(torch::Tensor next) {
-    if (!tensorbytes) {
-      next_up_ = next;
-      return;
-    }
-
+  void SupplyNext(std::vector<torch::Tensor> next) {
     /* run next HtoD transfer */
     auto origstream = c10::cuda::getCurrentCUDAStream();
     c10::cuda::setCurrentCUDAStream(rtctx->xfer_stream);
-    next_up_ = next.to(rtctx->c10dev, /*non_blocking*/ true, /*copy*/ false);
+    next_up_.clear();
+    for (auto &n : next) {
+      if (n.defined() && n.nbytes())
+        next_up_.push_back(
+            n.to(rtctx->c10dev, /*non_blocking*/ true, /*copy*/ false));
+      else
+        next_up_.push_back(n);
+    }
     c10::cuda::setCurrentCUDAStream(origstream);
   }
 
-  torch::Tensor GetNext(c10::optional<torch::Tensor> next) {
-    assert(next_up_);
-    auto &tsr = next_up_.value();
-
-    if (!tensorbytes) return torch::Tensor();
-
+  std::vector<torch::Tensor> GetNext(std::vector<torch::Tensor> next) {
     /* current stream must wait for xfer before using returned tsr */
     xfer_ev_.record(rtctx->xfer_stream);
     xfer_ev_.block(c10::cuda::getCurrentCUDAStream());
 
-    next_up_ = {};
-    if (next) SupplyNext(next.value());
-    return tsr;
+    auto out = next_up_;
+    next_up_.clear();
+    if (next.size()) SupplyNext(next);
+    return out;
   }
 
  private:
-  size_t tensorbytes;
-  c10::optional<torch::Tensor> next_up_;
+  std::vector<torch::Tensor> next_up_;
   at::cuda::CUDAEvent xfer_ev_;
 };
 
 class DatasetPipelineWrapper {
  public:
   DatasetPipelineWrapper(std::shared_ptr<Dataset> dataset) : dataset_(dataset) {
-    auto next_sample = dataset_->getNextThisRank();
+    auto next_sample = dataset_->getNext();
     data_pipeline_.reset(new TensorPipeline(next_sample.data));
-    target_pipeline_.reset(new TensorPipeline(next_sample.target));
+    target_pipeline_.reset(new TensorPipeline({next_sample.target}));
   }
 
   bool IsDone() { return is_done_; }
@@ -121,23 +135,24 @@ class DatasetPipelineWrapper {
   void Reset() {
     dataset_->Reset();
     is_done_ = false;
-    auto next_sample = dataset_->getNextThisRank();
+    auto next_sample = dataset_->getNext();
     data_pipeline_->SupplyNext(next_sample.data);
-    target_pipeline_->SupplyNext(next_sample.target);
+    target_pipeline_->SupplyNext({next_sample.target});
   }
 
-  torch::data::Example<> getNextThisRank() {
+  Example getNext() {
     assert(!is_done_);
     if (dataset_->IsDone()) {
       auto data = data_pipeline_->GetNext({});
       auto target = target_pipeline_->GetNext({});
       is_done_ = true;
-      return {data, target};
+      return {data, target.at(0)};
     }
-    auto next_sample = dataset_->getNextThisRank();
+    auto next_sample = dataset_->getNext();
     auto data = data_pipeline_->GetNext(next_sample.data);
-    auto target = target_pipeline_->GetNext(next_sample.target);
-    return {data, target};
+    auto target = target_pipeline_->GetNext({next_sample.target});
+
+    return {data, target.at(0)};
   }
 
  private:

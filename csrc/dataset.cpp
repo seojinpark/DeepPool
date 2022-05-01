@@ -12,11 +12,10 @@ ABSL_FLAG(std::string, cifar_dataset,
 class FakeDataset : public Dataset {
  public:
   FakeDataset(size_t rank, long globalBatchSize,
-              std::vector<long> initialBatchSizes,
-              std::vector<long> sampleIndices,
-              std::function<torch::data::Example<>()> gen,
-              size_t images_per_epoch);
-  torch::data::Example<> getNext() override;
+              std::vector<std::shared_ptr<Layer>> input_layers,
+              std::vector<long> sampleIndices, std::function<Example()> gen,
+              size_t samples_per_epoch);
+  Example getNext() override;
   bool IsDone() override;
   void Reset() override;
   size_t GetItersPerEpoch() override;
@@ -24,15 +23,15 @@ class FakeDataset : public Dataset {
  private:
   size_t batches_per_epoch_;
   size_t ctr_{0};
-  std::vector<torch::data::Example<>> cached_;
+  std::vector<Example> cached_;
 };
 
 class CifarDataset : public Dataset {
  public:
   CifarDataset(size_t rank, long globalBatchSize,
-               std::vector<long> initialBatchSizes,
+               std::vector<std::shared_ptr<Layer>> input_layers,
                std::vector<long> sampleIndices, bool is_eval);
-  torch::data::Example<> getNext() override;
+  Example getNext() override;
   bool IsDone() override;
   void Reset() override;
   size_t GetItersPerEpoch() override;
@@ -51,20 +50,20 @@ class CifarDataset : public Dataset {
 };
 
 FakeDataset::FakeDataset(size_t rank, long globalBatchSize,
-                         std::vector<long> initialBatchSizes,
+                         std::vector<std::shared_ptr<Layer>> input_layers,
                          std::vector<long> sampleIndices,
-                         std::function<torch::data::Example<>()> gen,
-                         size_t images_per_epoch)
-    : Dataset(rank, globalBatchSize, initialBatchSizes, sampleIndices) {
-  for (size_t i = 0; i < 64; i++) cached_.emplace_back(gen());
-  batches_per_epoch_ = images_per_epoch / globalBatchSize;
+                         std::function<Example()> gen, size_t samples_per_epoch)
+    : Dataset(rank, globalBatchSize, input_layers, sampleIndices) {
+  for (size_t i = 0; i < 64; i++)
+    cached_.emplace_back(globalToPerRankExample(gen()));
+  batches_per_epoch_ = samples_per_epoch / globalBatchSize;
 }
 
 size_t FakeDataset::GetItersPerEpoch() { return batches_per_epoch_; };
 
 bool FakeDataset::IsDone() { return ctr_ >= batches_per_epoch_; }
 
-torch::data::Example<> FakeDataset::getNext() {
+Example FakeDataset::getNext() {
   assert(!IsDone());
   return cached_[ctr_++ % cached_.size()];
 }
@@ -72,9 +71,9 @@ torch::data::Example<> FakeDataset::getNext() {
 void FakeDataset::Reset() { ctr_ = 0; }
 
 CifarDataset::CifarDataset(size_t rank, long globalBatchSize,
-                           std::vector<long> initialBatchSizes,
+                           std::vector<std::shared_ptr<Layer>> input_layers,
                            std::vector<long> sampleIndices, bool is_eval)
-    : Dataset(rank, globalBatchSize, initialBatchSizes, sampleIndices) {
+    : Dataset(rank, globalBatchSize, input_layers, sampleIndices) {
   DP_LOG(DEBUG, "Using CIFAR dataset");
   auto c = CIFAR10(absl::GetFlag(FLAGS_cifar_dataset),
                    is_eval ? CIFAR10::Mode::kTest : CIFAR10::Mode::kTrain)
@@ -97,11 +96,11 @@ bool CifarDataset::IsDone() {
   return false;
 }
 
-torch::data::Example<> CifarDataset::getNext() {
+Example CifarDataset::getNext() {
   assert(!IsDone());
   auto cur_example = *cur_iter.value();
   cur_iter = ++cur_iter.value();
-  return cur_example;
+  return globalToPerRankExample({{cur_example.data}, cur_example.target});
 }
 
 size_t CifarDataset::GetItersPerEpoch() { return batches_per_epoch_; };
@@ -109,16 +108,15 @@ size_t CifarDataset::GetItersPerEpoch() { return batches_per_epoch_; };
 void CifarDataset::Reset() { cur_iter = loader->begin(); }
 
 Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
-                           std::vector<long> initialBatchSizes,
+                           std::vector<std::shared_ptr<Layer>> input_layers,
                            std::vector<long> sampleIndices,
-                           size_t fake_train_iters_per_epoch,
-                           std::vector<long> indim) {
+                           size_t fake_train_iters_per_epoch) {
   bool eval = name.find("eval") != std::string::npos;
   if (name.find("cifar") != std::string::npos)
-    return new CifarDataset(rank, globalBatchSize, initialBatchSizes,
-                            sampleIndices, eval);
+    return new CifarDataset(rank, globalBatchSize, input_layers, sampleIndices,
+                            eval);
 
-  long fake_images = globalBatchSize * fake_train_iters_per_epoch;
+  long fake_samples = globalBatchSize * fake_train_iters_per_epoch;
 
   if (name.find("gpt2") != std::string::npos) {
     DP_LOG(DEBUG, "Using GPT2 fake dataset");
@@ -130,13 +128,11 @@ Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
                                  {globalBatchSize, 1024}, dopts);
       auto target = torch::randint(/*low=*/0, /*high=*/1024,
                                    {globalBatchSize, 1024}, topts);
-      return torch::data::Example<>(data, target);
+      return Example(data, target);
     };
-    return new FakeDataset(rank, globalBatchSize, initialBatchSizes,
-                           sampleIndices, gen, eval ? 1000 : fake_images);
+    return new FakeDataset(rank, globalBatchSize, input_layers, sampleIndices,
+                           gen, eval ? 1000 : fake_samples);
   }
-
-  indim[0] = globalBatchSize;
 
   if (name.find("dlrm") != std::string::npos) {
     DP_LOG(DEBUG, "Using dlrm fake dataset");
@@ -149,29 +145,37 @@ Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
       constexpr int64_t nr_emb = 4;
       constexpr int64_t indices_per_lookup = 10;
       auto dense = torch::randn({globalBatchSize, m_den});
-      auto indices = torch::randint(
-          0, emb_size, {globalBatchSize, nr_emb * indices_per_lookup});
-      std::vector<torch::Tensor> l;
-      l.push_back(dense);
-      l.push_back(indices);
+      std::vector<torch::Tensor> inputs;
+      inputs.push_back(dense);
+      for (int64_t i = 0; i < nr_emb; i++) {
+        inputs.push_back(
+            torch::randint(0, emb_size, {globalBatchSize, indices_per_lookup})
+                .to(torch::kInt64));
+      }
 
-      auto data = torch::cat(l, 1);
       auto target = torch::zeros({globalBatchSize, 1}, targetOpts);
-      return torch::data::Example<>(data, target);
+      return Example(inputs, target);
     };
-    return new FakeDataset(rank, globalBatchSize, initialBatchSizes,
-                           sampleIndices, gen, eval ? 1000 : fake_images);
+    return new FakeDataset(rank, globalBatchSize, input_layers, sampleIndices,
+                           gen, eval ? 1000 : fake_samples);
   }
 
   DP_LOG(DEBUG, "Using fake dataset");
   auto targetOpts =
       torch::TensorOptions().dtype(torch::kInt64).requires_grad(false);
   auto gen = [=] {
-    auto data = torch::randn(indim);
+    std::vector<torch::Tensor> ts;
+    for (auto &iLayer : input_layers) {
+      assert(iLayer->emptyInSizes.size() == 1);
+      auto inDim = iLayer->emptyInSizes[0];
+      inDim[0] = globalBatchSize;
+      auto topts = torch::TensorOptions().dtype(iLayer->inOpts.at(0));
+      ts.push_back(torch::randn(inDim, topts));
+    }
     auto target =
         torch::randint(/*low=*/0, /*high=*/1000, {globalBatchSize}, targetOpts);
-    return torch::data::Example<>(data, target);
+    return Example(ts, target);
   };
-  return new FakeDataset(rank, globalBatchSize, initialBatchSizes,
-                         sampleIndices, gen, eval ? 1000 : fake_images);
+  return new FakeDataset(rank, globalBatchSize, input_layers, sampleIndices,
+                         gen, eval ? 1000 : fake_samples);
 }

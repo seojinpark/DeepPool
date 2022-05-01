@@ -66,16 +66,12 @@ RunnableModule::RunnableModule(
       sync_manager_(commHandler, rtctx->sync_bucket_size),
       lossfn_(lf) {
   auto& layersInJson = spec["layers"];
-  long initialBatchSize = layersInJson[0]["config"][0];
 
   globalBatchSize = spec["globalBatchSize"].get<long>();
   for (long sample : spec["sampleIndices"]) sampleIndices.push_back(sample);
-  for (long batch : spec["initialBatchSizes"])
-    initialBatchSizes.push_back(batch);
 
   assert(spec["rank"].get<int>() == rtctx->rank);
   DP_LOG(DEBUG, "Constructing runnable module.. rank:%d", rtctx->rank);
-  DP_LOG(DEBUG, "             initialBatchSize:%ld", initialBatchSize);
   DP_LOG(DEBUG, "             layersInJson's size:%lu (from spec)",
          spec["layers"].size());
   DP_LOG(DEBUG, "             layersInJson's size:%lu", layersInJson.size());
@@ -139,6 +135,11 @@ RunnableModule::RunnableModule(
                                          layerIsActive, doLocalGradSync, name);
     layers.push_back(layer);
 
+    layer->layerLocalBatch = layerLocalBatch;
+    layer->localRank = 0;
+    for (auto rank : ldsc["gpuAssignment"])
+      if (rank < rtctx->rank) layer->localRank++;
+
     layer->commGroupKey = RankVecToKey(ldsc["gpuAssignment"]);
     if (doLocalGradSync) {
       if (rtctx->nccl_groups.count(layer->commGroupKey) == 0) {
@@ -162,12 +163,34 @@ RunnableModule::RunnableModule(
       layer->nr_current_depedencies++;
     }
 
+    if (layer->prevLayers.empty()) input_layers.push_back(layer);
+
     layer->layerLocalBatch = layerLocalBatch;
 
-    layer->emptyOutSizes.push_back(0);
-    for (int size : ldsc["outputDim"]) layer->emptyOutSizes.push_back(size);
-    layer->emptyInSizes.push_back(0);
-    for (int size : ldsc["inputDim"]) layer->emptyInSizes.push_back(size);
+    const std::map<std::string, c10::ScalarType> type_map = {
+        {"torch.float32", torch::kFloat32}, {"torch.float", torch::kFloat32},
+        {"torch.float64", torch::kFloat64}, {"torch.double", torch::kFloat64},
+        {"torch.float16", torch::kFloat16}, {"torch.half", torch::kFloat16},
+        {"torch.int32", torch::kInt32},     {"torch.int", torch::kInt32},
+        {"torch.int64", torch::kInt64},     {"torch.long", torch::kInt64},
+        {"torch.int16", torch::kInt16},     {"torch.short", torch::kInt16},
+        {"torch.int8", torch::kInt8}};
+
+    for (auto& ishapes : ldsc["inputs"]) {
+      std::vector<long> dims;
+      for (auto& dim : ishapes["tensor_shape"]) dims.push_back(dim.get<long>());
+      layer->emptyInSizes.push_back(dims);
+      auto dt = ishapes["dtype"].get<std::string>();
+      layer->inOpts.push_back(type_map.at(dt));
+    }
+
+    for (auto& oshapes : ldsc["outputs"]) {
+      std::vector<long> dims;
+      for (auto& dim : oshapes["tensor_shape"]) dims.push_back(dim.get<long>());
+      layer->emptyOutSizes.push_back(dims);
+      auto dt = oshapes["dtype"].get<std::string>();
+      layer->outOpts.push_back(type_map.at(dt));
+    }
 
     if (ldsc.contains("xfers")) {
       for (auto& item : ldsc["xfers"]) {
@@ -179,7 +202,7 @@ RunnableModule::RunnableModule(
         n.nr_samples = item["prop"]["xferSamples"];
         n.src_lid = src_lid;
         n.tag = commHandler->getTag(item["name"].get<std::string>());
-
+        n.skip_backward = item["prop"]["skipBackward"].get<bool>();
         bool local = n.src.first == n.dst.first;
 
         if (local)
@@ -266,25 +289,37 @@ void RunnableModule::SetupOptimizer() {
   optimizer = std::make_unique<torch::optim::SGD>(parameters, /*lr=*/0.01);
 }
 
-void RunnableModule::SetInputsTargets(torch::Tensor input,
+void RunnableModule::SetInputsTargets(std::vector<torch::Tensor> inputs,
                                       torch::Tensor target) {
   assert(state == JobState::INIT);
 
-  size_t input_nb = input.defined() ? input.nbytes() : 0;
+  if (input_bufs.size() < inputs.size()) input_bufs.resize(inputs.size());
 
-  if (input_nb) {
-    /* should already be on device */
-    assert(input.is_cuda());
+  assert(inputs.size() == input_layers.size());
 
-    if (!input_buf.defined() || input_nb != input_buf.nbytes()) {
-      /* reallocate input buffer */
-      assert(!has_graph);
-      input_buf = torch::empty(input.sizes(), input.options());
-      assert(input_buf.is_cuda());
+  for (size_t i = 0, nr = inputs.size(); i < nr; i++) {
+    auto& input = inputs[i];
+    auto& input_buf = input_bufs[i];
+
+    size_t input_nb = input.defined() ? input.nbytes() : 0;
+
+    if (input_nb) {
+      /* should already be on device */
+      assert(input.is_cuda());
+
+      if (!input_buf.defined() || input_nb != input_buf.nbytes()) {
+        /* reallocate input buffer */
+        assert(!has_graph);
+        input_buf = torch::empty(input.sizes(), input.options());
+        input_bufs[i] = input_buf;
+        assert(input_buf.is_cuda());
+      }
+
+      input_buf.copy_(input, /*non_blocking=*/true);
+      input.record_stream(rtctx->torch_stream);
     }
 
-    input_buf.copy_(input, /*non_blocking=*/true);
-    input.record_stream(rtctx->torch_stream);
+    input_layers[i]->tensors_in[0] = input_buf;
   }
 
   size_t target_nb = target.defined() ? target.nbytes() : 0;
@@ -304,8 +339,6 @@ void RunnableModule::SetInputsTargets(torch::Tensor input,
     target.record_stream(rtctx->torch_stream);
   }
 
-  /* enqueue input to first layer */
-  layers[0]->tensors_in[0] = input_buf;
   fpTargets = target_buf;
 }
 
@@ -340,32 +373,38 @@ torch::Tensor Layer::DoForward(RunnableModule* model, bool captureLayer) {
 
   if (out.isTensor()) {
     output = out.toTensor();
+
+    assert(emptyOutSizes.size() == 1);
+    assert(specialModule != SpecialModuleTypes::DISTRIBUTE);
     /* verify output shape is as expected per job description */
-    for (size_t i = 1; i < emptyOutSizes.size(); i++)
-      assert(emptyOutSizes[i] == output.sizes().vec()[i]);
-    assert(emptyOutSizes.size() == output.sizes().vec().size());
-  } else {
-    assert(out.isList());
-    assert(specialModule == SpecialModuleTypes::DISTRIBUTE);
-  }
+    for (size_t i = 1; i < emptyOutSizes.at(0).size(); i++)
+      assert(emptyOutSizes[0][i] == output.sizes().vec()[i]);
+    assert(emptyOutSizes[0].size() == output.sizes().vec().size());
 
-  if (captureLayer) fwUsec = fwdtimer.EndCaptureAndTime();
-
-  if (specialModule != SpecialModuleTypes::DISTRIBUTE) {
     for (auto& nl : nextLayers)
       nl->tensors_in[id] =
           output.detach().requires_grad_(output.is_floating_point());
   } else {
-    size_t done = 0;
-    for (auto outIt : out.toListRef()) {
+    assert(out.isList());
+    assert(specialModule == SpecialModuleTypes::DISTRIBUTE);
+    auto outList = out.toListRef();
+    assert(outList.size() == nextLayers.size());
+
+    size_t idx = 0;
+    for (auto& outIt : outList) {
       auto outT = outIt.toTensor();
-      assert(done < nextLayers.size());
-      auto& nl = nextLayers.at(done++);
+      for (size_t i = 1; i < emptyOutSizes.at(idx).size(); i++)
+        assert(emptyOutSizes[idx][i] == outT.sizes().vec()[i]);
+      assert(emptyOutSizes[idx].size() == outT.sizes().vec().size());
+      auto& nl = nextLayers.at(idx);
       dist_outputs[nl->id] = outT;
       nl->tensors_in[id] =
           outT.detach().requires_grad_(outT.is_floating_point());
+      idx++;
     }
   }
+
+  if (captureLayer) fwUsec = fwdtimer.EndCaptureAndTime();
 
   return output;
 }
@@ -402,7 +441,7 @@ void Layer::DoBackward(RunnableModule* model, bool captureLayer) {
     DP_LOG(DEBUG, "Backward on output:%s grad(%d):%s",
            tsrSizeToStr(output).c_str(), nl->id, tsrSizeToStr(grad).c_str());
     if (specialModule == SpecialModuleTypes::DISTRIBUTE) {
-      auto &t = dist_outputs[nl->id];
+      auto& t = dist_outputs[nl->id];
       if (t.requires_grad()) t.backward(grad);
       t.reset();
     } else {
@@ -459,11 +498,20 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
 
   /* prepare pointers for inbound samples */
   for (size_t lid : inbound_lids) {
-    std::vector<long> inDim = layers.at(lid)->emptyOutSizes;
+    auto& inbound_layer = layers.at(lid);
+    size_t i;
+    for (i = 0; i < inbound_layer->nextLayers.size(); i++)
+      if (inbound_layer->nextLayers.at(i).get() == layer.get()) break;
+    std::vector<long> inDim = layers.at(lid)->emptyOutSizes.at(i);
     inDim[0] =
         backward ? layers.at(lid)->layerLocalBatch : layer->layerLocalBatch;
 
-    torch::Tensor in = torch::empty(inDim, topts);
+    auto dt = inbound_layer->outOpts.at(i);
+    auto ttopts = topts;
+    if (dt == torch::kInt32 || dt == torch::kInt64)
+      ttopts = ttopts.dtype(dt).requires_grad(false);
+
+    torch::Tensor in = torch::empty(inDim, ttopts);
     layer->tensors_in[lid] = in;
     inbound_tensors[lid] = in;
   }
@@ -473,6 +521,7 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
     auto fn = [=](c10::cuda::CUDAStream stream) mutable {
       commHandler->comm_start(stream);
       for (const auto& ixfer : layer->xfers) {
+        if (backward && ixfer.skip_backward) continue;
         const size_t lid = ixfer.src_lid;
         const std::pair<size_t, size_t>& src = backward ? ixfer.dst : ixfer.src;
         const std::pair<size_t, size_t>& dst = backward ? ixfer.src : ixfer.dst;
@@ -507,6 +556,7 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
                               "memcpy_" + layer->layername);
 
     for (const auto& ixfer : layer->xfers_local) {
+      if (backward && ixfer.skip_backward) continue;
       const size_t lid = ixfer.src_lid;
       const std::pair<size_t, size_t>& src = backward ? ixfer.dst : ixfer.src;
       const std::pair<size_t, size_t>& dst = backward ? ixfer.src : ixfer.dst;
@@ -521,6 +571,7 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
       auto dstTsr =
           getSampleSlice(inbound_tensors.at(lid), dst.second, ixfer.nr_samples);
 
+      assert(dstTsr.dtype() == srcTsr.dtype());
       CUDACHECK(cudaMemcpyAsync(dstTsr.data_ptr(), srcTsr.data_ptr(),
                                 srcTsr.nbytes(), cudaMemcpyDeviceToDevice,
                                 rtctx->torch_stream));
@@ -656,7 +707,7 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     TimerRecordStage("start");
 
     layerQ.clear();
-    layerQ.push_back(layers.at(0));
+    layerQ.insert(layerQ.end(), input_layers.begin(), input_layers.end());
 
     nr_iters_++;
 

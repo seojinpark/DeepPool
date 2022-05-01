@@ -43,8 +43,7 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
   nr_gpus_ = job_params["nr_gpus"].get<size_t>();
 
   std::string dset = "random";
-  if (job_params.contains("dset"))
-    dset = job_params["dset"].get<std::string>();
+  if (job_params.contains("dset")) dset = job_params["dset"].get<std::string>();
 
   if (job_params.contains("cifar_training") &&
       job_params["cifar_training"].get<bool>()) {
@@ -70,16 +69,15 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
   if (job_params.contains("epochs_to_train"))
     epochsToTrain = job_params["epochs_to_train"].get<size_t>();
 
-  train_dataset_.reset(Dataset::fromName(
-      dset, rtctx->rank, model->globalBatchSize, model->initialBatchSizes,
-      model->sampleIndices, 2000, model->layers.at(0)->emptyInSizes));
+  train_dataset_.reset(
+      Dataset::fromName(dset, rtctx->rank, model->globalBatchSize,
+                        model->input_layers, model->sampleIndices, 2000));
   dataset_pipeline_.reset(new DatasetPipelineWrapper(train_dataset_));
 
   if (runTestRoutine_)
     eval_dataset_.reset(
         Dataset::fromName(dset + "_eval", rtctx->rank, model->globalBatchSize,
-                          model->initialBatchSizes, model->sampleIndices, 10,
-                          model->layers.at(0)->emptyInSizes));
+                          model->input_layers, model->sampleIndices, 10));
 
   if (!rtctx->use_fg_graph)
     iters_before_graph_capture = itersToTrain * epochsToTrain;
@@ -181,10 +179,10 @@ void JobContext::Test() {
   while (!eval_dataset_->IsDone()) {
     total += model->GetGlobalBatchSize();
 
-    auto batch = eval_dataset_->getNextThisRank();
-    torch::Tensor input = batch.data;
-    if (input.defined()) input = input.to(rtctx->c10dev);
-    auto output = Infer(input);
+    auto batch = eval_dataset_->getNext();
+    for (auto &input : batch.data)
+      if (input.defined()) input.to(rtctx->c10dev);
+    auto output = Infer(batch.data);
     if (output.defined() && output.nbytes() > 0) {
       auto pred = output.argmax(1);
       correct += pred.eq(batch.target.to(rtctx->c10dev)).sum();
@@ -209,27 +207,28 @@ void JobContext::Test() {
          corr, static_cast<double>(corr) / total);
 }
 
-torch::Tensor JobContext::Infer(torch::Tensor input) {
+torch::Tensor JobContext::Infer(std::vector<torch::Tensor> inputs) {
   torch::NoGradGuard guard;
   model->SetEval();
-  model->SetInputsTargets(input, {});
+  model->SetInputsTargets(inputs, {});
   FinishIteration();
   return model->getOutput();
 }
 
-void JobContext::Train(torch::Tensor input, torch::Tensor target) {
+void JobContext::Train(std::vector<torch::Tensor> inputs,
+                       torch::Tensor target) {
   model->SetTrain();
-  model->SetInputsTargets(input, target);
+  model->SetInputsTargets(inputs, target);
   FinishIteration();
 }
 
 void JobContext::TrainOneEpoch() {
-  dataset_pipeline_->Reset();
   size_t i = 0;
-  if (iters_before_graph_capture < totiters && rtctx->use_fg_graph)
+  if (!model->isTrain() && iters_before_graph_capture < totiters &&
+      rtctx->use_fg_graph)
     iters_before_graph_capture = totiters + 5;
   while (!dataset_pipeline_->IsDone() && !job_done_) {
-    auto batch = dataset_pipeline_->getNextThisRank();
+    auto batch = dataset_pipeline_->getNext();
     Train(batch.data, batch.target);
     DP_LOG(DEBUG, "Training iteration %lu/%lu\n", ++i,
            dataset_pipeline_->GetItersPerEpoch());
@@ -240,6 +239,7 @@ void JobContext::TrainOneEpoch() {
   rtctx->torch_stream.synchronize();
   end = std::chrono::steady_clock::now();
   be_img_end = GetBeCounter();
+  dataset_pipeline_->Reset();
 }
 
 /**
