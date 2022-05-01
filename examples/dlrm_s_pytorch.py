@@ -55,14 +55,17 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 import argparse
 
+import os, sys
+currentdir = os.path.dirname(os.path.realpath(__file__))
+parentdir = os.path.dirname(currentdir)
+sys.path.append(parentdir)
+sys.path.append(f"{currentdir}/dlrm")
+
 # miscellaneous
 import builtins
-import datetime
+from datetime import datetime
 import json
-import sys
 import time
-import bisect
-from collections import deque
 
 # onnx
 # The onnx import causes deprecation warnings every time workers
@@ -70,7 +73,7 @@ from collections import deque
 import warnings
 
 # data generation
-# import dlrm_data_pytorch as dp
+import dlrm_data_pytorch as dp
 
 # For distributed run
 # import extend_distributed as ext_dist
@@ -78,13 +81,11 @@ import warnings
 
 # numpy
 import numpy as np
-from numpy import random as ra
 import sklearn.metrics
 
 # pytorch
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, RandomSampler
 from torch._ops import ops
 from torch.autograd.profiler import record_function
 from torch.nn.parallel.parallel_apply import parallel_apply
@@ -96,10 +97,10 @@ from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.tensorboard import SummaryWriter
 
 # mixed-dimension trick
-# from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
+from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 
 # quotient-remainder trick
-# from tricks.qr_embedding_bag import QREmbeddingBag
+from tricks.qr_embedding_bag import QREmbeddingBag
 
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -111,11 +112,6 @@ with warnings.catch_warnings():
 # from torchviz import make_dot
 # import torch.nn.functional as Functional
 # from torch.nn.parameter import Parameter
-import os
-currentdir = os.path.dirname(os.path.realpath(__file__))
-parentdir = os.path.dirname(currentdir)
-sys.path.append(parentdir)
-# sys.path.append('.')
 from parallelizationPlanner import CostSim
 from parallelizationPlanner import GpuProfiler
 from clusterClient import ClusterClient
@@ -125,288 +121,10 @@ from jobDescription import TrainingJob
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 
-do_embed_layer_mp = False #True
+do_embed_layer_mp = True #True
 bbn_max_gpus = None
 
-
-
-# Copyright (c) Facebook, Inc. and its affiliates.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-#
-# Mixed-Dimensions Trick
-#
-# Description: Applies mixed dimension trick to embeddings to reduce
-# embedding sizes.
-#
-# References:
-# [1] Antonio Ginart, Maxim Naumov, Dheevatsa Mudigere, Jiyan Yang, James Zou,
-# "Mixed Dimension Embeddings with Application to Memory-Efficient Recommendation
-# Systems", CoRR, arXiv:1909.11810, 2019
-def md_solver(n, alpha, d0=None, B=None, round_dim=True, k=None):
-    '''
-    An external facing function call for mixed-dimension assignment
-    with the alpha power temperature heuristic
-    Inputs:
-    n -- (torch.LongTensor) ; Vector of num of rows for each embedding matrix
-    alpha -- (torch.FloatTensor); Scalar, non-negative, controls dim. skew
-    d0 -- (torch.FloatTensor); Scalar, baseline embedding dimension
-    B -- (torch.FloatTensor); Scalar, parameter budget for embedding layer
-    round_dim -- (bool); flag for rounding dims to nearest pow of 2
-    k -- (torch.LongTensor) ; Vector of average number of queries per inference
-    '''
-    n, indices = torch.sort(n)
-    k = k[indices] if k is not None else torch.ones(len(n))
-    d = alpha_power_rule(n.type(torch.float) / k, alpha, d0=d0, B=B)
-    if round_dim:
-        d = pow_2_round(d)
-    undo_sort = [0] * len(indices)
-    for i, v in enumerate(indices):
-        undo_sort[v] = i
-    return d[undo_sort]
-
-
-def alpha_power_rule(n, alpha, d0=None, B=None):
-    if d0 is not None:
-        lamb = d0 * (n[0].type(torch.float) ** alpha)
-    elif B is not None:
-        lamb = B / torch.sum(n.type(torch.float) ** (1 - alpha))
-    else:
-        raise ValueError("Must specify either d0 or B")
-    d = torch.ones(len(n)) * lamb * (n.type(torch.float) ** (-alpha))
-    for i in range(len(d)):
-        if i == 0 and d0 is not None:
-            d[i] = d0
-        else:
-            d[i] = 1 if d[i] < 1 else d[i]
-    return (torch.round(d).type(torch.long))
-
-
-def pow_2_round(dims):
-    return 2 ** torch.round(torch.log2(dims.type(torch.float)))
-
-
-class PrEmbeddingBag(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, base_dim):
-        super(PrEmbeddingBag, self).__init__()
-        self.embs = cs.EmbeddingBag(
-            num_embeddings, embedding_dim, mode="sum", sparse=True)
-        torch.nn.init.xavier_uniform_(self.embs.weight)
-        if embedding_dim < base_dim:
-            self.proj = cs.Linear(embedding_dim, base_dim, bias=False)
-            torch.nn.init.xavier_uniform_(self.proj.weight)
-        elif embedding_dim == base_dim:
-            self.proj = cs.Identity()
-        else:
-            raise ValueError(
-                "Embedding dim " + str(embedding_dim) + " > base dim " + str(base_dim)
-            )
-
-    def forward(self, input, offsets=None, per_sample_weights=None):
-        return self.proj(self.embs(
-            input, offsets=offsets, per_sample_weights=per_sample_weights))
-# end mixed-dimension trick
-
-
-
-
-
-
-
-# Copyright (c) Facebook, Inc. and its affiliates.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-#
-# Quotient-Remainder Trick
-#
-# Description: Applies quotient remainder-trick to embeddings to reduce
-# embedding sizes.
-#
-# References:
-# [1] Hao-Jun Michael Shi, Dheevatsa Mudigere, Maxim Naumov, Jiyan Yang,
-# "Compositional Embeddings Using Complementary Partitions for Memory-Efficient
-# Recommendation Systems", CoRR, arXiv:1909.02107, 2019
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.parameter import Parameter
-import numpy as np
-
-
-class QREmbeddingBag(nn.Module):
-    r"""Computes sums or means over two 'bags' of embeddings, one using the quotient
-    of the indices and the other using the remainder of the indices, without
-    instantiating the intermediate embeddings, then performs an operation to combine these.
-
-    For bags of constant length and no :attr:`per_sample_weights`, this class
-
-        * with ``mode="sum"`` is equivalent to :class:`~torch.nn.Embedding` followed by ``torch.sum(dim=0)``,
-        * with ``mode="mean"`` is equivalent to :class:`~torch.nn.Embedding` followed by ``torch.mean(dim=0)``,
-        * with ``mode="max"`` is equivalent to :class:`~torch.nn.Embedding` followed by ``torch.max(dim=0)``.
-
-    However, :class:`~torch.nn.EmbeddingBag` is much more time and memory efficient than using a chain of these
-    operations.
-
-    QREmbeddingBag also supports per-sample weights as an argument to the forward
-    pass. This scales the output of the Embedding before performing a weighted
-    reduction as specified by ``mode``. If :attr:`per_sample_weights`` is passed, the
-    only supported ``mode`` is ``"sum"``, which computes a weighted sum according to
-    :attr:`per_sample_weights`.
-
-    Known Issues:
-    Autograd breaks with multiple GPUs. It breaks only with multiple embeddings.
-
-    Args:
-        num_categories (int): total number of unique categories. The input indices must be in
-                              0, 1, ..., num_categories - 1.
-        embedding_dim (list): list of sizes for each embedding vector in each table. If ``"add"``
-                              or ``"mult"`` operation are used, these embedding dimensions must be
-                              the same. If a single embedding_dim is used, then it will use this
-                              embedding_dim for both embedding tables.
-        num_collisions (int): number of collisions to enforce.
-        operation (string, optional): ``"concat"``, ``"add"``, or ``"mult". Specifies the operation
-                                      to compose embeddings. ``"concat"`` concatenates the embeddings,
-                                      ``"add"`` sums the embeddings, and ``"mult"`` multiplies
-                                      (component-wise) the embeddings.
-                                      Default: ``"mult"``
-        max_norm (float, optional): If given, each embedding vector with norm larger than :attr:`max_norm`
-                                    is renormalized to have norm :attr:`max_norm`.
-        norm_type (float, optional): The p of the p-norm to compute for the :attr:`max_norm` option. Default ``2``.
-        scale_grad_by_freq (boolean, optional): if given, this will scale gradients by the inverse of frequency of
-                                                the words in the mini-batch. Default ``False``.
-                                                Note: this option is not supported when ``mode="max"``.
-        mode (string, optional): ``"sum"``, ``"mean"`` or ``"max"``. Specifies the way to reduce the bag.
-                                 ``"sum"`` computes the weighted sum, taking :attr:`per_sample_weights`
-                                 into consideration. ``"mean"`` computes the average of the values
-                                 in the bag, ``"max"`` computes the max value over each bag.
-                                 Default: ``"mean"``
-        sparse (bool, optional): if ``True``, gradient w.r.t. :attr:`weight` matrix will be a sparse tensor. See
-                                 Notes for more details regarding sparse gradients. Note: this option is not
-                                 supported when ``mode="max"``.
-
-    Attributes:
-        weight (Tensor): the learnable weights of each embedding table is the module of shape
-                         `(num_embeddings, embedding_dim)` initialized using a uniform distribution
-                         with sqrt(1 / num_categories).
-
-    Inputs: :attr:`input` (LongTensor), :attr:`offsets` (LongTensor, optional), and
-        :attr:`per_index_weights` (Tensor, optional)
-
-        - If :attr:`input` is 2D of shape `(B, N)`,
-
-          it will be treated as ``B`` bags (sequences) each of fixed length ``N``, and
-          this will return ``B`` values aggregated in a way depending on the :attr:`mode`.
-          :attr:`offsets` is ignored and required to be ``None`` in this case.
-
-        - If :attr:`input` is 1D of shape `(N)`,
-
-          it will be treated as a concatenation of multiple bags (sequences).
-          :attr:`offsets` is required to be a 1D tensor containing the
-          starting index positions of each bag in :attr:`input`. Therefore,
-          for :attr:`offsets` of shape `(B)`, :attr:`input` will be viewed as
-          having ``B`` bags. Empty bags (i.e., having 0-length) will have
-          returned vectors filled by zeros.
-
-        per_sample_weights (Tensor, optional): a tensor of float / double weights, or None
-            to indicate all weights should be taken to be ``1``. If specified, :attr:`per_sample_weights`
-            must have exactly the same shape as input and is treated as having the same
-            :attr:`offsets`, if those are not ``None``. Only supported for ``mode='sum'``.
-
-
-    Output shape: `(B, embedding_dim)`
-
-    """
-    __constants__ = ['num_categories', 'embedding_dim', 'num_collisions',
-                     'operation', 'max_norm', 'norm_type', 'scale_grad_by_freq',
-                     'mode', 'sparse']
-
-    def __init__(self, num_categories, embedding_dim, num_collisions,
-                 operation='mult', max_norm=None, norm_type=2.,
-                 scale_grad_by_freq=False, mode='mean', sparse=False,
-                 _weight=None):
-        super(QREmbeddingBag, self).__init__()
-
-        assert operation in ['concat', 'mult', 'add'], 'Not valid operation!'
-
-        self.num_categories = num_categories
-        if isinstance(embedding_dim, int) or len(embedding_dim) == 1:
-            self.embedding_dim = [embedding_dim, embedding_dim]
-        else:
-            self.embedding_dim = embedding_dim
-        self.num_collisions = num_collisions
-        self.operation = operation
-        self.max_norm = max_norm
-        self.norm_type = norm_type
-        self.scale_grad_by_freq = scale_grad_by_freq
-
-        if self.operation == 'add' or self.operation == 'mult':
-            assert self.embedding_dim[0] == self.embedding_dim[1], \
-                'Embedding dimensions do not match!'
-
-        self.num_embeddings = [int(np.ceil(num_categories / num_collisions)),
-            num_collisions]
-
-        if _weight is None:
-            self.weight_q = Parameter(torch.Tensor(self.num_embeddings[0], self.embedding_dim[0]))
-            self.weight_r = Parameter(torch.Tensor(self.num_embeddings[1], self.embedding_dim[1]))
-            self.reset_parameters()
-        else:
-            assert list(_weight[0].shape) == [self.num_embeddings[0], self.embedding_dim[0]], \
-                'Shape of weight for quotient table does not match num_embeddings and embedding_dim'
-            assert list(_weight[1].shape) == [self.num_embeddings[1], self.embedding_dim[1]], \
-                'Shape of weight for remainder table does not match num_embeddings and embedding_dim'
-            self.weight_q = Parameter(_weight[0])
-            self.weight_r = Parameter(_weight[1])
-        self.mode = mode
-        self.sparse = sparse
-
-    def reset_parameters(self):
-        nn.init.uniform_(self.weight_q, np.sqrt(1 / self.num_categories))
-        nn.init.uniform_(self.weight_r, np.sqrt(1 / self.num_categories))
-
-    def forward(self, input, offsets=None, per_sample_weights=None):
-        input_q = (input / self.num_collisions).long()
-        input_r = torch.remainder(input, self.num_collisions).long()
-
-        embed_q = F.embedding_bag(input_q, self.weight_q, offsets, self.max_norm,
-                                  self.norm_type, self.scale_grad_by_freq, self.mode,
-                                  self.sparse, per_sample_weights)
-        embed_r = F.embedding_bag(input_r, self.weight_r, offsets, self.max_norm,
-                                  self.norm_type, self.scale_grad_by_freq, self.mode,
-                                  self.sparse, per_sample_weights)
-
-        if self.operation == 'concat':
-            embed = torch.cat((embed_q, embed_r), dim=1)
-        elif self.operation == 'add':
-            embed = embed_q + embed_r
-        elif self.operation == 'mult':
-            embed = embed_q * embed_r
-
-        return embed
-
-    def extra_repr(self):
-        s = '{num_embeddings}, {embedding_dim}'
-        if self.max_norm is not None:
-            s += ', max_norm={max_norm}'
-        if self.norm_type != 2:
-            s += ', norm_type={norm_type}'
-        if self.scale_grad_by_freq is not False:
-            s += ', scale_grad_by_freq={scale_grad_by_freq}'
-        s += ', mode={mode}'
-        return s.format(**self.__dict__)
-# end quotient-remainder trick
-
-
-
-
-
-
-
-
-
+globalBatch = 0
 
 def time_wrap(use_gpu):
     if use_gpu:
@@ -497,32 +215,6 @@ class LRPolicyScheduler(_LRScheduler):
                 lr = self.base_lrs
         return lr
 
-"""
-This super hacky module helps get fake data into the right place in the runtime.
-Currently the runtime supports a single data Tensor as input to the model, and
-only supports a single "first" node. The runtime's dataset generator generates
-the dense features, and embedding indexes/offsets in a single tensor per sample;
-this input node unpacks the data and forwards the relevant parts to the relevant
-operators.
-"""
-
-class FakeDataDistributionNode(nn.Module):
-    def __init__(self, dense_features, nl_bags, num_indices_per_lookup):
-        super(FakeDataDistributionNode, self).__init__()
-        self.dense_features = dense_features
-        self.nl_bags = nl_bags
-        self.num_indices_per_lookup = num_indices_per_lookup
-
-    def forward(self, input_data):
-        # [Batch Dim, DATA]
-        # DATA := [nr_dense_features] + [nr_bags * num_indices_per_lookup]
-        dense_x = input_data[:, :self.dense_features]
-        idx = input_data[:, self.dense_features:]
-        idx = idx.view(-1, self.nl_bags, self.num_indices_per_lookup)
-        idx = torch.transpose(idx, 0, 1).contiguous().to(torch.int32) # TODO: should these be int64
-
-        return [dense_x] + list(i.squeeze(0) for i in idx.split([1] * self.nl_bags))
-
 class DLRMDotModule(nn.Module):
     def __init__(self, arch_interaction_itself: bool = False, nr_emb: int = 1):
         super(DLRMDotModule, self).__init__()
@@ -563,7 +255,7 @@ class DLRMDotModule(nn.Module):
 
 ### define dlrm in PyTorch ###
 class DLRM_Net(nn.Module):
-    def create_mlp(self, ln, sigmoid_layer, mlp_in_shape=None, custom_previous_layers = None):
+    def create_mlp(self, ln, sigmoid_layer, m_den=None, custom_previous_layers = None):
         # build MLP layer by layer
         layers = nn.ModuleList()
         for i in range(0, ln.size - 1):
@@ -573,6 +265,8 @@ class DLRM_Net(nn.Module):
             # construct fully connected operator
             if i == 0 and custom_previous_layers is not None:
                 LL = cs.Linear(int(n), int(m), bias=True, custom_previous_layers=custom_previous_layers)
+                if len(custom_previous_layers) == 0:
+                    cs.layers[-1].addInputShape(torch.zeros(1, m_den))
             else:
                 LL = cs.Linear(int(n), int(m), bias=True)
 
@@ -618,8 +312,8 @@ class DLRM_Net(nn.Module):
             # construct embedding operator
             if self.qr_flag and n > self.qr_threshold:
                 EE = QREmbeddingBag(
-                    n,
-                    m,
+                    int(n),
+                    int(m),
                     self.qr_collisions,
                     operation=self.qr_operation,
                     mode="sum",
@@ -628,23 +322,14 @@ class DLRM_Net(nn.Module):
             elif self.md_flag and n > self.md_threshold:
                 base = max(m)
                 _m = m[i] if n > self.md_threshold else base
-                EE = PrEmbeddingBag(n, _m, base)
+                EE = PrEmbeddingBag(int(n), int(_m), base)
                 # use np initialization as below for consistency...
                 W = np.random.uniform(
                     low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, _m)
                 ).astype(np.float32)
                 EE.embs.weight.data = torch.tensor(W, requires_grad=True)
             else:
-                global do_embed_layer_mp
-                if do_embed_layer_mp:
-                    global bbn_max_gpus
-                    ngpus = bbn_max_gpus
-                    EE = cs.EmbeddingBag(int(n), int(m), mode="sum", sparse=True, custom_previous_layers=[], device=i%ngpus)
-                else:
-                    EE = nn.EmbeddingBag(int(n), int(m), mode="sum", sparse=True)
-                    cs.GeneralLayer(EE, "EmbeddingBag", {}, custom_previous_layers=[self.distlayer], mustTrace=False)
-
-                self.merge_layers.append(cs.layers[-1])
+                EE = nn.EmbeddingBag(int(n), int(m), mode="sum", sparse=True)
                 # initialize embeddings
                 # nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
                 W = np.random.uniform(
@@ -660,6 +345,15 @@ class DLRM_Net(nn.Module):
                 v_W_l.append(None)
             else:
                 v_W_l.append(torch.ones(n, dtype=torch.float32))
+
+            global do_embed_layer_mp
+            device = None
+            if do_embed_layer_mp:
+                global bbn_max_gpus
+                ngpus = bbn_max_gpus
+                device = i % ngpus
+            cs.GeneralLayer(EE, "EmbeddingBag", {}, custom_previous_layers=[], mustTrace=False, device=device)
+            self.merge_layers.append(cs.layers[-1])
             emb_l.append(EE).to(device=0)
         return emb_l, v_W_l
 
@@ -684,7 +378,7 @@ class DLRM_Net(nn.Module):
         md_threshold=200,
         weighted_pooling=None,
         loss_function="bce",
-        mlp_in_shape = None,
+        m_den = None,
         args=None,
     ):
         super(DLRM_Net, self).__init__()
@@ -739,14 +433,13 @@ class DLRM_Net(nn.Module):
             #     self.local_emb_slice = ext_dist.get_my_slice(n_emb)
             #     self.local_emb_indices = list(range(n_emb))[self.local_emb_slice]
 
-            distmod = FakeDataDistributionNode(mlp_in_shape[1], len(ln_emb), args.num_indices_per_lookup)
-            self.distlayer = cs.GeneralDistributionLayer(distmod, "inputsplit")
-            self.distlayer.addInputShape(torch.zeros(1,  mlp_in_shape[1] + len(ln_emb) * args.num_indices_per_lookup))
-            self.bot_l = self.create_mlp(ln_bot, sigmoid_bot, mlp_in_shape).to(device=0)
+            self.bot_l = self.create_mlp(ln_bot, sigmoid_bot, m_den, custom_previous_layers=[]).to(device=0)
             self.merge_layers.append(cs.layers[-1])
             # create operators
             if ndevices <= 1:
                 self.emb_l, w_list = self.create_emb(m_spa, ln_emb, weighted_pooling)
+                for l in self.merge_layers[1:]:
+                    l.addInputShape(torch.zeros(1,  args.num_indices_per_lookup, dtype=torch.int32))
                 if self.weighted_pooling == "learned":
                     self.v_W_l = nn.ParameterList()
                     for w in w_list:
@@ -805,11 +498,13 @@ class DLRM_Net(nn.Module):
             # E = emb_l[k]
 
             if v_W_l[k] is not None:
+                assert False
                 per_sample_weights = v_W_l[k].gather(0, sparse_index_group_batch)
             else:
                 per_sample_weights = None
 
             if self.quantize_emb:
+                assert False
                 s1 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
                 s2 = self.emb_l_q[k].element_size() * self.emb_l_q[k].nelement()
                 print("quantized emb sizes:", s1, s2)
@@ -1285,441 +980,6 @@ def inference(
     return model_metrics_dict, is_best
 
 
-
-# WARNING: global define, must be consistent across all synthetic functions
-cache_line_size = 1
-
-
-
-def generate_stack_distance(cumm_val, cumm_dist, max_i, i, enable_padding=False):
-    u = ra.rand(1)
-    if i < max_i:
-        # only generate stack distances up to the number of new references seen so far
-        j = bisect.bisect(cumm_val, i) - 1
-        fi = cumm_dist[j]
-        u *= fi  # shrink distribution support to exclude last values
-    elif enable_padding:
-        # WARNING: disable generation of new references (once all have been seen)
-        fi = cumm_dist[0]
-        u = (1.0 - fi) * u + fi  # remap distribution support to exclude first value
-
-    for (j, f) in enumerate(cumm_dist):
-        if u <= f:
-            return cumm_val[j]
-
-def trace_generate_lru(
-    line_accesses, list_sd, cumm_sd, out_trace_len, enable_padding=False
-):
-    max_sd = list_sd[-1]
-    l = len(line_accesses)
-    i = 0
-    ztrace = deque()
-    for _ in range(out_trace_len):
-        sd = generate_stack_distance(list_sd, cumm_sd, max_sd, i, enable_padding)
-        mem_ref_within_line = 0  # floor(ra.rand(1)*cache_line_size) #0
-
-        # generate memory reference
-        if sd == 0:  # new reference #
-            line_ref = line_accesses[0]
-            del line_accesses[0]
-            line_accesses.append(line_ref)
-            mem_ref = np.uint64(line_ref * cache_line_size + mem_ref_within_line)
-            i += 1
-        else:  # existing reference #
-            line_ref = line_accesses[l - sd]
-            mem_ref = np.uint64(line_ref * cache_line_size + mem_ref_within_line)
-            del line_accesses[l - sd]
-            line_accesses.append(line_ref)
-        # save generated memory reference
-        ztrace.append(mem_ref)
-
-    return ztrace
-
-def read_dist_from_file(file_path):
-    try:
-        with open(file_path, "r") as f:
-            lines = f.read().splitlines()
-    except Exception:
-        print("{file_path} Wrong file or file path")
-    # read unique accesses
-    unique_accesses = [int(el) for el in lines[0].split(", ")]
-    # read cumulative distribution (elements are passed as two separate lists)
-    list_sd = [int(el) for el in lines[1].split(", ")]
-    cumm_sd = [float(el) for el in lines[2].split(", ")]
-
-    return unique_accesses, list_sd, cumm_sd
-
-# synthetic distribution (input data)
-def generate_synthetic_input_batch(
-    m_den,
-    ln_emb,
-    n,
-    num_indices_per_lookup,
-    num_indices_per_lookup_fixed,
-    trace_file,
-    enable_padding=False,
-):
-    # dense feature
-    Xt = torch.tensor(ra.rand(n, m_den).astype(np.float32))
-
-    # sparse feature (sparse indices)
-    lS_emb_offsets = []
-    lS_emb_indices = []
-    # for each embedding generate a list of n lookups,
-    # where each lookup is composed of multiple sparse indices
-    for i, size in enumerate(ln_emb):
-        lS_batch_offsets = []
-        lS_batch_indices = []
-        offset = 0
-        for _ in range(n):
-            # num of sparse indices to be used per embedding (between
-            if num_indices_per_lookup_fixed:
-                sparse_group_size = np.int64(num_indices_per_lookup)
-            else:
-                # random between [1,num_indices_per_lookup])
-                r = ra.random(1)
-                sparse_group_size = np.int64(
-                    max(1, np.round(r * min(size, num_indices_per_lookup))[0])
-                )
-            # sparse indices to be used per embedding
-            file_path = trace_file
-            line_accesses, list_sd, cumm_sd = read_dist_from_file(
-                file_path.replace("j", str(i))
-            )
-            # debug prints
-            # print("input")
-            # print(line_accesses); print(list_sd); print(cumm_sd);
-            # print(sparse_group_size)
-            # approach 1: rand
-            # r = trace_generate_rand(
-            #     line_accesses, list_sd, cumm_sd, sparse_group_size, enable_padding
-            # )
-            # approach 2: lru
-            r = trace_generate_lru(
-                line_accesses, list_sd, cumm_sd, sparse_group_size, enable_padding
-            )
-            # WARNING: if the distribution in the file is not consistent
-            # with embedding table dimensions, below mod guards against out
-            # of range access
-            sparse_group = np.unique(r).astype(np.int64)
-            minsg = np.min(sparse_group)
-            maxsg = np.max(sparse_group)
-            if (minsg < 0) or (size <= maxsg):
-                print(
-                    "WARNING: distribution is inconsistent with embedding "
-                    + "table size (using mod to recover and continue)"
-                )
-                sparse_group = np.mod(sparse_group, size).astype(np.int64)
-            # sparse_group = np.unique(np.array(np.mod(r, size-1)).astype(np.int64))
-            # reset sparse_group_size in case some index duplicates were removed
-            sparse_group_size = np.int64(sparse_group.size)
-            # store lengths and indices
-            lS_batch_offsets += [offset]
-            lS_batch_indices += sparse_group.tolist()
-            # update offset for next iteration
-            offset += sparse_group_size
-        lS_emb_offsets.append(torch.tensor(lS_batch_offsets))
-        lS_emb_indices.append(torch.tensor(lS_batch_indices))
-
-    return (Xt, lS_emb_offsets, lS_emb_indices)
-
-# random data from uniform or gaussian ditribution (input data)
-def generate_dist_input_batch(
-    m_den,
-    ln_emb,
-    n,
-    num_indices_per_lookup,
-    num_indices_per_lookup_fixed,
-    rand_data_dist,
-    rand_data_min,
-    rand_data_max,
-    rand_data_mu,
-    rand_data_sigma,
-):
-    # dense feature
-    Xt = torch.tensor(ra.rand(n, m_den).astype(np.float32))
-
-    # sparse feature (sparse indices)
-    lS_emb_offsets = []
-    lS_emb_indices = []
-    # for each embedding generate a list of n lookups,
-    # where each lookup is composed of multiple sparse indices
-    for size in ln_emb:
-        lS_batch_offsets = []
-        lS_batch_indices = []
-        offset = 0
-        for _ in range(n):
-            # num of sparse indices to be used per embedding (between
-            if num_indices_per_lookup_fixed:
-                sparse_group_size = np.int64(num_indices_per_lookup)
-            else:
-                # random between [1,num_indices_per_lookup])
-                r = ra.random(1)
-                sparse_group_size = np.int64(
-                    np.round(max([1.0], r * min(size, num_indices_per_lookup)))
-                )
-            # sparse indices to be used per embedding
-            if rand_data_dist == "gaussian":
-                if rand_data_mu == -1:
-                    rand_data_mu = (rand_data_max + rand_data_min) / 2.0
-                r = ra.normal(rand_data_mu, rand_data_sigma, sparse_group_size)
-                sparse_group = np.clip(r, rand_data_min, rand_data_max)
-                sparse_group = np.unique(sparse_group).astype(np.int64)
-            elif rand_data_dist == "uniform":
-                r = ra.random(sparse_group_size)
-                sparse_group = np.unique(np.round(r * (size - 1)).astype(np.int64))
-            else:
-                raise(rand_data_dist, "distribution is not supported. \
-                     please select uniform or gaussian")
-
-            # reset sparse_group_size in case some index duplicates were removed
-            sparse_group_size = np.int64(sparse_group.size)
-            # store lengths and indices
-            lS_batch_offsets += [offset]
-            lS_batch_indices += sparse_group.tolist()
-            # update offset for next iteration
-            offset += sparse_group_size
-        lS_emb_offsets.append(torch.tensor(lS_batch_offsets))
-        lS_emb_indices.append(torch.tensor(lS_batch_indices))
-
-    return (Xt, lS_emb_offsets, lS_emb_indices)
-
-def generate_random_output_batch(n, num_targets, round_targets=False):
-    # target (probability of a click)
-    if round_targets:
-        P = np.round(ra.rand(n, num_targets).astype(np.float32)).astype(np.float32)
-    else:
-        P = ra.rand(n, num_targets).astype(np.float32)
-
-    return torch.tensor(P)
-
-# Conversion from offset to length
-def offset_to_length_converter(lS_o, lS_i):
-    def diff(tensor):
-        return tensor[1:] - tensor[:-1]
-
-    return torch.stack(
-        [
-            diff(torch.cat((S_o, torch.tensor(lS_i[ind].shape))).int())
-            for ind, S_o in enumerate(lS_o)
-        ]
-    )
-
-# uniform ditribution (input data)
-class RandomDataset(Dataset):
-
-    def __init__(
-            self,
-            m_den,
-            ln_emb,
-            data_size,
-            num_batches,
-            mini_batch_size,
-            num_indices_per_lookup,
-            num_indices_per_lookup_fixed,
-            num_targets=1,
-            round_targets=False,
-            data_generation="random",
-            trace_file="",
-            enable_padding=False,
-            reset_seed_on_access=False,
-            rand_data_dist="uniform",
-            rand_data_min=1,
-            rand_data_max=1,
-            rand_data_mu=-1,
-            rand_data_sigma=1,
-            rand_seed=0
-    ):
-        # compute batch size
-        nbatches = int(np.ceil((data_size * 1.0) / mini_batch_size))
-        if num_batches != 0:
-            nbatches = num_batches
-            data_size = nbatches * mini_batch_size
-            # print("Total number of batches %d" % nbatches)
-
-        # save args (recompute data_size if needed)
-        self.m_den = m_den
-        self.ln_emb = ln_emb
-        self.data_size = data_size
-        self.num_batches = nbatches
-        self.mini_batch_size = mini_batch_size
-        self.num_indices_per_lookup = num_indices_per_lookup
-        self.num_indices_per_lookup_fixed = num_indices_per_lookup_fixed
-        self.num_targets = num_targets
-        self.round_targets = round_targets
-        self.data_generation = data_generation
-        self.trace_file = trace_file
-        self.enable_padding = enable_padding
-        self.reset_seed_on_access = reset_seed_on_access
-        self.rand_seed = rand_seed
-        self.rand_data_dist = rand_data_dist
-        self.rand_data_min = rand_data_min
-        self.rand_data_max = rand_data_max
-        self.rand_data_mu = rand_data_mu
-        self.rand_data_sigma = rand_data_sigma
-
-    def reset_numpy_seed(self, numpy_rand_seed):
-        np.random.seed(numpy_rand_seed)
-        # torch.manual_seed(numpy_rand_seed)
-
-    def __getitem__(self, index):
-
-        if isinstance(index, slice):
-            return [
-                self[idx] for idx in range(
-                    index.start or 0, index.stop or len(self), index.step or 1
-                )
-            ]
-
-        # WARNING: reset seed on access to first element
-        # (e.g. if same random samples needed across epochs)
-        if self.reset_seed_on_access and index == 0:
-            self.reset_numpy_seed(self.rand_seed)
-
-        # number of data points in a batch
-        n = min(self.mini_batch_size, self.data_size - (index * self.mini_batch_size))
-
-        # generate a batch of dense and sparse features
-        if self.data_generation == "random":
-            (X, lS_o, lS_i) = generate_dist_input_batch(
-                self.m_den,
-                self.ln_emb,
-                n,
-                self.num_indices_per_lookup,
-                self.num_indices_per_lookup_fixed,
-                rand_data_dist=self.rand_data_dist,
-                rand_data_min=self.rand_data_min,
-                rand_data_max=self.rand_data_max,
-                rand_data_mu=self.rand_data_mu,
-                rand_data_sigma=self.rand_data_sigma,
-            )
-        elif self.data_generation == "synthetic":
-            (X, lS_o, lS_i) = generate_synthetic_input_batch(
-                self.m_den,
-                self.ln_emb,
-                n,
-                self.num_indices_per_lookup,
-                self.num_indices_per_lookup_fixed,
-                self.trace_file,
-                self.enable_padding
-            )
-        else:
-            sys.exit(
-                "ERROR: --data-generation=" + self.data_generation + " is not supported"
-            )
-
-        # generate a batch of target (probability of a click)
-        T = generate_random_output_batch(n, self.num_targets, self.round_targets)
-
-        return (X, lS_o, lS_i, T)
-
-    def __len__(self):
-        # WARNING: note that we produce bacthes of outputs in __getitem__
-        # therefore we should use num_batches rather than data_size below
-        return self.num_batches
-
-
-def collate_wrapper_random_offset(list_of_tuples):
-    # where each tuple is (X, lS_o, lS_i, T)
-    (X, lS_o, lS_i, T) = list_of_tuples[0]
-    return (X,
-            torch.stack(lS_o),
-            lS_i,
-            T)
-
-
-def collate_wrapper_random_length(list_of_tuples):
-    # where each tuple is (X, lS_o, lS_i, T)
-    (X, lS_o, lS_i, T) = list_of_tuples[0]
-    return (X,
-            offset_to_length_converter(torch.stack(lS_o), lS_i),
-            lS_i,
-            T)
-
-
-
-def make_random_data_and_loader(args, ln_emb, m_den,
-    offset_to_length_converter=False,
-):
-
-    train_data = RandomDataset(
-        m_den,
-        ln_emb,
-        args.data_size,
-        args.num_batches,
-        args.mini_batch_size,
-        args.num_indices_per_lookup,
-        args.num_indices_per_lookup_fixed,
-        1,  # num_targets
-        args.round_targets,
-        args.data_generation,
-        args.data_trace_file,
-        args.data_trace_enable_padding,
-        reset_seed_on_access=True,
-        rand_data_dist=args.rand_data_dist,
-        rand_data_min=args.rand_data_min,
-        rand_data_max=args.rand_data_max,
-        rand_data_mu=args.rand_data_mu,
-        rand_data_sigma=args.rand_data_sigma,
-        rand_seed=args.numpy_rand_seed
-    )  # WARNING: generates a batch of lookups at once
-
-    test_data = RandomDataset(
-        m_den,
-        ln_emb,
-        args.data_size,
-        args.num_batches,
-        args.mini_batch_size,
-        args.num_indices_per_lookup,
-        args.num_indices_per_lookup_fixed,
-        1,  # num_targets
-        args.round_targets,
-        args.data_generation,
-        args.data_trace_file,
-        args.data_trace_enable_padding,
-        reset_seed_on_access=True,
-        rand_data_dist=args.rand_data_dist,
-        rand_data_min=args.rand_data_min,
-        rand_data_max=args.rand_data_max,
-        rand_data_mu=args.rand_data_mu,
-        rand_data_sigma=args.rand_data_sigma,
-        rand_seed=args.numpy_rand_seed
-    )
-
-    collate_wrapper_random = collate_wrapper_random_offset
-    if offset_to_length_converter:
-        collate_wrapper_random = collate_wrapper_random_length
-
-    train_loader = torch.utils.data.DataLoader(
-        train_data,
-        batch_size=1,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_wrapper_random,
-        pin_memory=False,
-        drop_last=False,  # True
-    )
-
-    test_loader = torch.utils.data.DataLoader(
-        test_data,
-        batch_size=1,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_wrapper_random,
-        pin_memory=False,
-        drop_last=False,  # True
-    )
-    return train_data, train_loader, test_data, test_loader
-
-
-
-
-
-
-
-
-
-
 def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66E5, spatialSplit=False, simResultFilename=None, simOnly=False, use_be=False):
     global cs
     cs = CostSim(None, netBw=netBw, verbose=True, gpuProfileLoc="profile/A100_anvil.prof")#, gpuProfileLocSub="resnetLayerGpuProfileA100.txt")
@@ -1781,9 +1041,9 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
     parser.add_argument("--max-ind-range", type=int, default=-1)
     parser.add_argument("--data-sub-sample-rate", type=float, default=0.0)  # in [0, 1]
     parser.add_argument("--num-indices-per-lookup", type=int, default=10)
-    parser.add_argument("--num-indices-per-lookup-fixed", type=bool, default=False)
+    parser.add_argument("--num-indices-per-lookup-fixed", type=bool, default=True)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--memory-map", action="store_true", default=False)
+    parser.add_argument("--memory-map", action="store_true", default=True)
     # training
     parser.add_argument("--mini-batch-size", type=int, default=1)
     parser.add_argument("--nepochs", type=int, default=1)
@@ -1795,7 +1055,7 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
     parser.add_argument(
         "--dataset-multiprocessing",
         action="store_true",
-        default=False,
+        default=True,
         help="The Kaggle dataset can be multiprocessed in an environment \
                         with more than 7 CPU cores and more than 20 GB of memory. \n \
                         The Terabyte dataset can be multiprocessed in an environment \
@@ -1878,6 +1138,7 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
                 "ERROR: 4 and 8-bit quantization on GPU is not supported"
             )
 
+    global globalBatch
     globalBatch = args.mini_batch_size
 
     ### some basic setup ###
@@ -1924,32 +1185,34 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
     #     mlperf_logger.log_start(key=mlperf_logger.constants.RUN_START)
     #     mlperf_logger.barrier()
 
-    # if args.data_generation == "dataset":
-    #     train_data, train_ld, test_data, test_ld = dp.make_criteo_data_and_loaders(args)
-    #     table_feature_map = {idx: idx for idx in range(len(train_data.counts))}
-    #     nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
-    #     nbatches_test = len(test_ld)
+    if args.data_generation == "dataset":
+        train_data, train_ld, test_data, test_ld = dp.make_criteo_data_and_loaders(args)
+        table_feature_map = {idx: idx for idx in range(len(train_data.counts))}
+        nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
+        nbatches_test = len(test_ld)
 
-    #     ln_emb = train_data.counts
-    #     # enforce maximum limit on number of vectors per embedding
-    #     if args.max_ind_range > 0:
-    #         ln_emb = np.array(
-    #             list(
-    #                 map(
-    #                     lambda x: x if x < args.max_ind_range else args.max_ind_range,
-    #                     ln_emb,
-    #                 )
-    #             )
-    #         )
-    #     else:
-    #         ln_emb = np.array(ln_emb)
-    #     m_den = train_data.m_den
-    #     ln_bot[0] = m_den
-    if True:
+        ln_emb = train_data.counts
+        # enforce maximum limit on number of vectors per embedding
+        if args.max_ind_range > 0:
+            ln_emb = np.array(
+                list(
+                    map(
+                        lambda x: x if x < args.max_ind_range else args.max_ind_range,
+                        ln_emb,
+                    )
+                )
+            )
+        else:
+            ln_emb = np.array(ln_emb)
+        m_den = train_data.m_den
+        ln_bot[0] = m_den
+
+    else:
         # input and target at random
         ln_emb = np.fromstring(args.arch_embedding_size, dtype=int, sep="-")
         m_den = ln_bot[0]
-        train_data, train_ld, test_data, test_ld = make_random_data_and_loader(args, ln_emb, m_den)
+        train_data, train_ld, test_data, test_ld = dp.make_random_data_and_loader(args, ln_emb, m_den)
+
         nbatches = args.num_batches if args.num_batches > 0 else len(train_ld)
         nbatches_test = len(test_ld)
 
@@ -2024,6 +1287,7 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
 
     # assign mixed dimensions if applicable
     if args.md_flag:
+        assert False
         m_spa = md_solver(
             torch.tensor(ln_emb),
             args.md_temperature,  # alpha
@@ -2033,7 +1297,7 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
 
     # test prints (model arch)
     #if args.debug_mode:
-    if True:
+    # if True:
         # print("model arch:")
         # print(
         #     "mlp top arch "
@@ -2064,21 +1328,21 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
         # )
         # print(ln_emb)
 
-        print("data (inputs and targets):")
-        exampleBatch = None
-        average_lS_i_len = 0
-        for j, inputBatch in enumerate(train_ld):
-            if j >= 10:
-                break
-            exampleBatch = inputBatch
-            X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
-            print('X.shape',X.shape)
-            print('lS_o.shape',lS_o.shape)
-            average_lS_i_len+=lS_i[0].shape[0]
-            print('len(lS_i)',len(lS_i), lS_i[0].shape)
-            print('T.shape',T.shape)
-            print('W.shape',W.shape)
-            print('CBPP',CBPP)
+        # print("data (inputs and targets):")
+        # exampleBatch = None
+        # average_lS_i_len = 0
+        # for j, inputBatch in enumerate(train_ld):
+        #     if j >= 10:
+        #         break
+        #     exampleBatch = inputBatch
+        #     X, lS_o, lS_i, T, W, CBPP = unpack_batch(inputBatch)
+            # print('X.shape',X.shape)
+            # print('lS_o.shape',lS_o.shape)
+            # average_lS_i_len+=lS_i[0].shape[0]
+            # print('len(lS_i)',len(lS_i), lS_i[0].shape)
+            # print('T.shape',T.shape)
+            # print('W.shape',W.shape)
+            # print('CBPP',CBPP)
 
             # torch.set_printoptions(precision=4)
             # # early exit if nbatches was set by the user and has been exceeded
@@ -2100,8 +1364,7 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
             # print([S_i.detach().cpu() for S_i in lS_i])
             # print(T.detach().cpu())
             # break
-    average_lS_i_len //= j + 1
-    X, lS_o, lS_i, T, W, CBPP = unpack_batch(exampleBatch)
+    # average_lS_i_len //= j + 1
     
     global ndevices
     # ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
@@ -2132,7 +1395,7 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
         md_threshold=args.md_threshold,
         weighted_pooling=args.weighted_pooling,
         loss_function=args.loss_function,
-        mlp_in_shape=X.shape,
+        m_den=m_den,
         args = args,
     )
     
@@ -2153,11 +1416,7 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
             print(param.detach().cpu().numpy())
         # print(dlrm)
 
-    # model = dlrm
-    X, lS_o, lS_i, T, W, CBPP = unpack_batch(exampleBatch)
-
     cs.printAllLayers()
-    # cs.computeInputDimensions((2,240,240))
     cs.to_dot("Digraph", globalBatch, justdag=True)
 
     # job, iterMs, gpuMs, maxGpusUsed = cs.JustDoDP(gpuCount, globalBatch)
