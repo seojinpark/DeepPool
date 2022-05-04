@@ -236,7 +236,6 @@ void GpuTask::TimeRun(bool no_bench) {
   (void)(no_bench);
 #endif
 
-  double total_us = 0;
   for (size_t i = 0; i < tasks_.size(); i++) {
     auto& t = tasks_.at(i);
     float tm = 1000.0 * start_events.at(i).elapsed_time(end_events.at(i));
@@ -249,11 +248,7 @@ void GpuTask::TimeRun(bool no_bench) {
       if (t.timings_.dram_gbps > 1483) t.timings_.dram_gbps = 1483;
     }
 #endif
-    total_us += tm;
-    std::cerr << t << std::endl;
   }
-
-  std::cerr << "Total " << total_us << " us" << std::endl;
 }
 
 void GpuTask::DumpState() {
@@ -289,14 +284,17 @@ void GpuTask::DumpState() {
 void GpuTask::CombineGraphs() {
   TimeRun(true);
 
+  double total_us = 0;
   for (auto& t : tasks_) {
-    if (t.type_flags_ & TASK_FLAGS_DO_NOT_BENCH) continue;
-    t.BenchMicros();
+    if ((t.type_flags_ & TASK_FLAGS_DO_NOT_BENCH) == 0) t.BenchMicros();
+    std::cerr << t << std::endl;
+    total_us += t.timings_.benchmark_us;
   }
+  std::cerr << "Total " << total_us << " us" << std::endl;
 
   std::vector<Tasklet> newTasks;
   std::vector<Tasklet> curMergeSet;
-  double total_us = 0;
+  total_us = 0;
   unsigned int prevtype = 0;
 
   auto finMerge = [&] {
@@ -339,6 +337,15 @@ void GpuTask::CombineGraphs() {
 
   tasks_ = std::move(newTasks);
   TimeRun(true);
+
+  total_us = 0;
+  for (auto& t : tasks_) {
+    std::cerr << t << std::endl;
+    total_us += t.timings_.benchmark_us;
+  }
+  std::cerr << "Total " << total_us << " us" << std::endl;
+
+
 }
 
 GpuManager* GpuManager::instance;

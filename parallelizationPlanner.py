@@ -1682,6 +1682,7 @@ class CostSim:
         if randomMode: random.seed(0)
         lastCfg = 0
         lastAssign = []
+        tot_fw, tot_bw = 0, 0
         for ln, layer in enumerate(self.layers):
             layer.t = {}
             layer.initCfg = layer.getInitialConfig(globalBatch)
@@ -1698,7 +1699,11 @@ class CostSim:
                 rn = lastCfg
 
             config = configCandidates[rn]
-            gpuTime = 1
+            fw, bw = self.queryFwBwTime(layer, config)
+            tot_fw += fw
+            tot_bw += bw
+            gpuTime = fw + bw
+            print(f"Layer {layer.name} micros: {fw} {bw}")
             syncTime = 1
             cumulativeTime = 0
             activationTime = 0
@@ -1719,8 +1724,10 @@ class CostSim:
                 lastAssign = layer.gpuAssignment
             layer.bestCfg = config
             layer.gpuTime = (1,1)
+
         finalTime = 0
         dpTime = 0
+        print(f"Total FW: {tot_fw} us Total BW: {tot_bw} us Total: {tot_fw + tot_bw} us")
         for layer in self.layers:
             cumulativeTime, layerTime, prevConfigIndexOfPrev, timeComposition, mpIdleTime = layer.t[layer.bestCfg]
             dpTime += layerTime
