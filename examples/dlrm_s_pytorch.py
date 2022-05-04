@@ -1424,6 +1424,7 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
 
     # jobInJson = job.dumpInJSON()
 
+    cs.setAutocast(False)
     cs.setLossFunction(lambda a,b: loss_fn_wrap_nodevice(a, b), "dlrm_loss", torch.zeros((1,1)))
     job, iterMs, gpuMs, maxGpusUsed = cs.searchBestSplitsV3(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
     print("  %2d    %2d   %4.1f  %4.1f\n" % (globalBatch, maxGpusUsed, iterMs, gpuMs))
@@ -1447,7 +1448,11 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
     
     if not spatialSplit and not simOnly:
         cc = ClusterClient()
-        jobName = "DLRM_%d_%d_%2.1f%s" % (gpuCount, globalBatch, amplificationLimit, "_DP" if dataParallelBaseline else "")
+        jobName = f"DLRM_{gpuCount}_{globalBatch}"
+        if do_embed_layer_mp:
+            jobName += "_MP"
+        else:
+            jobName += "_DP"
         jobName += "_BE" if use_be else ""
         cc.submitTrainingJob(jobName, jobInJson, use_be)
 
@@ -2100,6 +2105,13 @@ if __name__ == "__main__":
         del sys.argv[1]
     except:
         ngpu = 4
+
+
+    if sys.argv[1] in ["DP", "MP"]:
+        # global do_embed_layer_mp
+        do_embed_layer_mp = sys.argv[1] == "MP"
+        del sys.argv[1]
+
     # if len(sys.argv) == 3:
     run(ngpu, dataParallelBaseline=True)
     # elif len(sys.argv) >= 4:
