@@ -5,42 +5,28 @@
 
 #include <vector>
 
+#include "runtime.h"
+
 class CommunicationHandler;
 
-class GradientSyncManager {
+class GradientSyncGroup {
+  static constexpr size_t kBytesPerParam = 4;
+
  public:
-  GradientSyncManager(std::shared_ptr<CommunicationHandler> commHandler,
-                      size_t flush_threshold_bytes)
-      : commHandler_(commHandler),
-        flush_threshold_bytes_(flush_threshold_bytes) {}
-
-  void Flush(c10::optional<c10::cuda::CUDAStream> stream = {});
-  void AddGradient(torch::Tensor grad, size_t comm_group_key);
-  void Join(c10::optional<c10::cuda::CUDAStream> stream = {});
-
-  bool HasPendingJoinOrFlush() {
-    return has_unjoined_work_ || total_pending_bytes_ > 0;
+  /* return true if more than sync_bucket_size bytes have been registered in
+   * this group */
+  bool RegisterParameter(torch::Tensor param) {
+    param_group.push_back(param);
+    nelem += param.mutable_grad().numel();
+    return rtctx->sync_bucket_size &&
+           nelem * kBytesPerParam >= rtctx->sync_bucket_size;
   }
-
-  void Reset() {
-    has_unjoined_work_ = false;
-    freeze_ = false;
-    total_pending_bytes_ = 0;
-    pending_bytes_by_key_.clear();
-    grads_by_key_.clear();
-  }
-
-  void Freeze() { freeze_ = true; }
+  void Coalesce();
+  void Sync(size_t key, c10::cuda::CUDAStream stream,
+            std::shared_ptr<CommunicationHandler> &commHandler);
 
  private:
-  const std::shared_ptr<CommunicationHandler> commHandler_;
-  const size_t flush_threshold_bytes_;
-  bool has_unjoined_work_{false};
-  bool freeze_{false};
-  ssize_t total_pending_bytes_{0};
-
-  void FlushKey(size_t key, c10::optional<c10::cuda::CUDAStream> stream);
-
-  std::map<size_t, size_t> pending_bytes_by_key_;
-  std::map<size_t, std::vector<torch::Tensor>> grads_by_key_;
+  torch::Tensor buf;
+  long nelem{0};
+  std::vector<torch::Tensor> param_group;
 };

@@ -30,6 +30,8 @@
 #define TASK_FLAGS_DO_NOT_BENCH (1U << 5)
 #define TASK_FLAGS_EXTERNAL (1U << 6)
 #define TASK_FLAGS_MULTIPLEX (1U << 7)
+#define TASK_FLAGS_STEP (1U << 8)
+#define TASK_FLAGS_ALLREDUCE_SIDE (1U << 9)
 
 class OwnedGraph {
  public:
@@ -238,6 +240,7 @@ class GpuTask {
   std::vector<Tasklet> tasks_;
   bool is_high_priority{true};
   bool waiting_recv{false};
+  bool waiting_sync_side{false};
   std::atomic<size_t> owner_{0};
   size_t outstanding_micros_{0};
   size_t manager_gen_{0};

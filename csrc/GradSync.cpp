@@ -1,56 +1,50 @@
 #include "GradSync.h"
 
+#include <absl/flags/flag.h>
 #include <torch/torch.h>
 
 #include "communication.h"
 #include "logger.h"
 #include "runtime.h"
 
-void GradientSyncManager::FlushKey(
-    size_t key, c10::optional<c10::cuda::CUDAStream> stream) {
-  auto &vec = grads_by_key_[key];
+using namespace torch::indexing;
 
-  assert(vec.size());
+void GradientSyncGroup::Coalesce() {
+  if (rtctx->disable_grad_sync || !rtctx->sync_coalesce || !nelem) return;
 
-  // TODO possible bug here (or in NCCL): with graphs and grouped all reduces,
-  // model performance was a little worse
-  // TODO - using separate stream causing NCCL to hang with graphs, try again at
-  // some pt.
-  commHandler_->comm_start(stream, key);
-  for (auto &grad : vec) commHandler_->all_reduce(grad, c10d::ReduceOp::SUM);
-  commHandler_->comm_end();
+  /* pad contigious buffer if needed */
+  if (nelem % rtctx->sync_tensor_pad != 0)
+    nelem += rtctx->sync_tensor_pad - (nelem % rtctx->sync_tensor_pad);
 
-  has_unjoined_work_ = true;
-  if (!freeze_) {
-    vec.clear();
-    total_pending_bytes_ -= pending_bytes_by_key_[key];
-    assert(total_pending_bytes_ >= 0);
-    pending_bytes_by_key_[key] = 0;
+  /* create new contiguous buffer */
+  buf = torch::empty({nelem}, param_group[0].mutable_grad().options());
+
+  size_t nelem_offset = 0;
+  for (auto &p : param_group) {
+    auto &gr = p.mutable_grad();
+    auto dst =
+        buf.index({Slice(nelem_offset, nelem_offset + gr.numel())}).view_as(gr);
+
+    /* copy gradients into contiguous buffer */
+    dst.copy_(gr, true);
+    nelem_offset += gr.numel();
+
+    /* reassign gradient as view into buffer */
+    p.mutable_grad() = dst;
   }
 }
 
-void GradientSyncManager::Flush(c10::optional<c10::cuda::CUDAStream> stream) {
-  for (auto &kp : pending_bytes_by_key_)
-    if (kp.second) FlushKey(kp.first, stream);
-}
+void GradientSyncGroup::Sync(
+    size_t key, c10::cuda::CUDAStream stream,
+    std::shared_ptr<CommunicationHandler> &commHandler) {
+  if (rtctx->disable_grad_sync || !nelem) return;
 
-void GradientSyncManager::AddGradient(torch::Tensor grad,
-                                      size_t comm_group_key) {
-  assert(comm_group_key > 0);
-
-  auto &vec = grads_by_key_[comm_group_key];
-  vec.push_back(grad);
-  pending_bytes_by_key_[comm_group_key] += grad.nbytes();
-  total_pending_bytes_ += grad.nbytes();
-
-  if (flush_threshold_bytes_ &&
-      pending_bytes_by_key_[comm_group_key] >= flush_threshold_bytes_)
-    FlushKey(comm_group_key, {});
-}
-
-void GradientSyncManager::Join(c10::optional<c10::cuda::CUDAStream> stream) {
-  if (has_unjoined_work_) {
-    commHandler_->sync(stream);
-    has_unjoined_work_ = false;
+  commHandler->comm_start(stream, key);
+  if (rtctx->sync_coalesce) {
+    commHandler->all_reduce(buf, c10d::ReduceOp::SUM);
+  } else {
+    for (auto &p : param_group)
+      commHandler->all_reduce(p.mutable_grad(), c10d::ReduceOp::SUM);
   }
+  commHandler->comm_end();
 }

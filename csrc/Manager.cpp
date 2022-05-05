@@ -158,12 +158,24 @@ bool GpuTask::RunNext(c10::cuda::CUDAStream stream) {
 
   outstanding_micros_ += t.timings_.benchmark_us;
 
-  if (t.IsNccl()) {
+  if ((t.type_flags_ & TASK_FLAGS_ALLREDUCE_SIDE) > 0) {
+    ev.record(stream);
+    ev.block(rtctx->grad_sync_stream);
+    t.Run(rtctx->grad_sync_stream);
+    assert(next_run_idx < tasks_.size());
+    waiting_sync_side = true;
+  } else if (t.IsNccl()) {
     ev.record(stream);
     ev.block(nccl_stream);
     t.Run(nccl_stream);
     if (!t.IsAsync()) waiting_recv = true;
     return next_run_idx >= tasks_.size();
+  }
+
+  if ((t.type_flags_ & TASK_FLAGS_STEP) > 0 && waiting_sync_side) {
+    ev.record(rtctx->grad_sync_stream);
+    ev.block(stream);
+    waiting_sync_side = false;
   }
 
   if ((t.type_flags_ & TASK_FLAGS_COMPUTE) > 0 && waiting_recv) {
@@ -344,8 +356,6 @@ void GpuTask::CombineGraphs() {
     total_us += t.timings_.benchmark_us;
   }
   std::cerr << "Total " << total_us << " us" << std::endl;
-
-
 }
 
 GpuManager* GpuManager::instance;
