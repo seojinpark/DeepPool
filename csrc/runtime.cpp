@@ -55,13 +55,26 @@ ABSL_FLAG(bool, profile_layer_times_timers, false, "");
 ABSL_FLAG(bool, cuda_profile, false,
           "use cuda profiler API to mark an iteration for profiling");
 
+ABSL_FLAG(bool, debug_log, false, "");
 ABSL_FLAG(bool, debug, false, "");
 ABSL_FLAG(std::string, be_jit_file,
           "/home/seojin/DeepPoolRuntime/beModules/resnet.jit", "");
 ABSL_FLAG(bool, use_fg_graph, true, "");
 ABSL_FLAG(bool, use_be_graph, true, "");
-ABSL_FLAG(size_t, min_layer_sync, 0, "");
-ABSL_FLAG(size_t, sync_bucket_size,0, "");
+
+/* gradient sync parameters */
+ABSL_FLAG(bool, disable_grad_sync, false, "Disable gradient sync");
+ABSL_FLAG(bool, sync_coalesce, false,
+          "Coalesce all_reduce buffers into a single buffer");
+ABSL_FLAG(
+    size_t, sync_tensor_pad, 8,
+    "number of elements in all_reduce tensors must be a multiple of this "
+    "parameter. only used when coalescing is enabled. Set to 1 to disable.");
+ABSL_FLAG(
+    size_t, sync_bucket_size, 0,
+    "Run all reduce in parallel with backwards pass for every "
+    "sync_bucket_size bytes worth of gradients that are ready. Set to 0 to "
+    "disable.");
 
 /**
  * Destructing RuntimeContext.
@@ -186,7 +199,9 @@ void parse_args(RuntimeContext& ctx, int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
 
 #define PARSEFLAG(x) ctx.x = absl::GetFlag(FLAGS_##x);
-  PARSEFLAG(min_layer_sync);
+  PARSEFLAG(disable_grad_sync);
+  PARSEFLAG(sync_coalesce);
+  PARSEFLAG(sync_tensor_pad);
   PARSEFLAG(sync_bucket_size);
   PARSEFLAG(device);
   PARSEFLAG(c10dBackend);
@@ -223,8 +238,10 @@ int main(int argc, char** argv) {
   std::string logFilePath =
       format("%s/cpprt%d.out", rtctx->logdir.c_str(), ctx.rank);
   Logger::get().setLogFile(logFilePath.c_str(), false);
-  // Logger::get().setLogLevel(DEBUG);
-  Logger::get().setLogLevel(NOTICE);
+  if (absl::GetFlag(FLAGS_debug_log))
+    Logger::get().setLogLevel(DEBUG);
+  else
+    Logger::get().setLogLevel(NOTICE);
 
   DP_LOG(NOTICE, "Current file path: %s", argv[0]);
 

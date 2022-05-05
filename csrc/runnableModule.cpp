@@ -63,7 +63,6 @@ RunnableModule::RunnableModule(
     LossFunctions lf)
     : cur_task(std::make_shared<GpuTask>(true, rtctx->torch_stream)),
       commHandler(commHandler),
-      sync_manager_(commHandler, rtctx->sync_bucket_size),
       lossfn_(lf) {
   auto& layersInJson = spec["layers"];
   long initialBatchSize = layersInJson[0]["config"][0];
@@ -130,9 +129,6 @@ RunnableModule::RunnableModule(
     }
 
     bool doLocalGradSync = layerIsActive && ldsc["gpuAssignment"].size() > 1;
-    doLocalGradSync &=
-        rtctx->min_layer_sync <= static_cast<size_t>(rtctx->worldSize);
-
     auto layer = std::make_shared<Layer>(module, specialModule, id,
                                          layerIsActive, doLocalGradSync, name);
     layers.push_back(layer);
@@ -247,7 +243,6 @@ void RunnableModule::SetMode(bool train) {
   }
   loss_tracker_ = torch::zeros({1}).to(rtctx->c10dev);
   nr_iters_ = 0;
-  sync_manager_.Reset();
 }
 
 /**
@@ -587,9 +582,36 @@ JobStatus RunnableModule::backwardAStep(bool captureLayer) {
   layer->nr_current_depedencies = layer->prevLayers.size();
 
   if (layer->doLocalGradSync) {
-    for (const auto& param : layer->module.parameters()) {
-      if (param.mutable_grad().defined())
-        sync_manager_.AddGradient(param.mutable_grad(), layer->commGroupKey);
+    /* register parameters on the first pass */
+    if (first_pass) {
+      bool sync_now = false;
+      for (const auto& param : layer->module.parameters()) {
+        if (!param.mutable_grad().defined()) continue;
+        if (param.mutable_grad().is_sparse()) continue;
+        sync_now |=
+            grad_sync_groups[layer->commGroupKey].RegisterParameter(param);
+      }
+      /* attach this group to this layer if it is time to sync */
+      if (sync_now) {
+        layer->grad_sync_group = grad_sync_groups[layer->commGroupKey];
+        grad_sync_groups[layer->commGroupKey] = {};
+      }
+    }
+
+    if (layer->grad_sync_group) {
+      {
+        ScopedGraphRecorder graph(this, TASK_FLAGS_COMPUTE, "coalesce");
+        layer->grad_sync_group.value().Coalesce();
+      }
+      auto fn = [=](c10::cuda::CUDAStream stream) mutable {
+        layer->grad_sync_group.value().Sync(layer->commGroupKey, stream,
+                                            commHandler);
+      };
+      if (graph_recording)
+        cur_task->AddTask({fn, TASK_FLAGS_ALLREDUCE | TASK_FLAGS_ALLREDUCE_SIDE,
+                           "intermediate_sync"});
+      fn(rtctx->grad_sync_stream);
+      backwards_did_sync = true;
     }
   }
 
@@ -706,24 +728,35 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
   } else if (state == JobState::SYNC) {
     DP_LOG(DEBUG, "JobState::SYNC.");
 
-    if (graph_recording) {
-      sync_manager_.Freeze();
-      auto fn = [&](c10::cuda::CUDAStream stream) mutable {
-        sync_manager_.Flush(stream);
-      };
-      cur_task->AddTask({fn, TASK_FLAGS_ALLREDUCE, "sync"});
-    }
+    first_pass = false;
 
-    sync_manager_.Flush();
-    sync_manager_.Join();
+    for (auto& grp : grad_sync_groups) {
+      {
+        ScopedGraphRecorder graph(this, TASK_FLAGS_COMPUTE, "coalesce");
+        grp.second.Coalesce();
+      }
+      auto fn = [=](c10::cuda::CUDAStream stream) mutable {
+        grp.second.Sync(grp.first, stream, commHandler);
+      };
+      if (graph_recording)
+        cur_task->AddTask({fn, TASK_FLAGS_ALLREDUCE, "final_sync"});
+      fn(rtctx->torch_stream);
+    }
 
     TimerRecordStage("sync");
     state = JobState::STEP;
   } else if (state == JobState::STEP) {
     DP_LOG(DEBUG, "JobState::STEP");
+    /* synchronize with grad sync stream if work was enqueued on it */
+    if (backwards_did_sync) {
+      ev.record(rtctx->grad_sync_stream);
+      ev.block(rtctx->torch_stream);
+      backwards_did_sync = false;
+    }
     {
       ScopedGraphRecorder graph(
-          this, TASK_FLAGS_COMPUTE | TASK_FLAGS_DO_NOT_BENCH, "step");
+          this, TASK_FLAGS_COMPUTE | TASK_FLAGS_DO_NOT_BENCH | TASK_FLAGS_STEP,
+          "step");
       optimizer->step();
     }
     TimerRecordStage("step");

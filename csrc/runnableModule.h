@@ -98,6 +98,9 @@ struct Layer {
   std::set<size_t> tx_lids;
   std::set<size_t> rx_lids;
 
+  /* defined if gradients should be synced after this layer's backprop */
+  c10::optional<GradientSyncGroup> grad_sync_group;
+
   std::string layername;
 
   torch::jit::Module module;
@@ -236,7 +239,7 @@ class RunnableModule {
   // Internal data structure.
   ////////////////////////////////////////////
   std::shared_ptr<CommunicationHandler> commHandler;
-  GradientSyncManager sync_manager_;
+  std::map<size_t, GradientSyncGroup> grad_sync_groups;
   // Topologically sorted list of layers.
   std::vector<std::shared_ptr<Layer>> layers;
   std::shared_ptr<Layer> lossLayer;
@@ -254,10 +257,12 @@ class RunnableModule {
 
   JobState state{JobState::INIT};
 
+  bool first_pass{true};
   bool backwards_did_sync{false};
   bool has_graph{false};
   bool graph_recording{false};
   torch::Tensor input_buf, target_buf;
+  at::cuda::CUDAEvent ev;
 
   at::cuda::MempoolId_t graph_mempool;
 

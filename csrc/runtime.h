@@ -83,7 +83,9 @@ struct RuntimeContext {
   std::string logdir;
   c10::Device c10dev;
   bool use_fg_graph;
-  size_t min_layer_sync;
+  bool disable_grad_sync;
+  bool sync_coalesce;
+  size_t sync_tensor_pad;
   size_t sync_bucket_size;
   std::atomic<uint64_t> fgcounter{0};
 
@@ -91,7 +93,6 @@ struct RuntimeContext {
   std::vector<std::unique_ptr<JobContext>> jobList;
   int addTrainingJob(std::unique_ptr<JobContext> job);
   int poll();
-
 
   std::shared_ptr<CommunicationHandler> global_comms;
 
