@@ -93,6 +93,7 @@ class CommunicationHandlerNCCL : public CommunicationHandler {
   void all_reduce(torch::Tensor& tensor, c10d::ReduceOp op);
   void testRingP2P();
   void testAllReduce();
+  void fnTestAllReduce();
 
  private:
   at::cuda::CUDAEvent sync_event;

@@ -85,6 +85,7 @@ struct RuntimeContext {
   bool use_fg_graph;
   size_t min_layer_sync;
   size_t sync_bucket_size;
+  bool ar_test;
   std::atomic<uint64_t> fgcounter{0};
 
   std::mutex jobListMutex;

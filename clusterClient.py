@@ -16,7 +16,8 @@ import time
 import xmlrpc.client
 
 PRIVATE_ADDR_FILENAME="aws_ec2_tools/aws-started-privateIps.txt"
-COORD_PORT = 12347
+#COORD_PORT = 12347
+COORD_PORT = 15507
 
 class ClusterClient:
     """ A handle to submit training job to cluster. """

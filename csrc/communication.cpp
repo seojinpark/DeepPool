@@ -251,21 +251,21 @@ void CommunicationHandlerNCCL::testAllReduce() {
   if (rtctx->worldSize == 1) return;
 
   /* sum */
-  torch::Tensor t = torch::full({3, 3}, rtctx->rank + 1, rtctx->c10dev);
+  torch::Tensor t = torch::full({16, 16}, rtctx->rank + 1, rtctx->c10dev);
   comm_start();
   all_reduce(t, c10d::ReduceOp::SUM);
   comm_end();
   sync();
   int sum = 0;
   for (int i = 1; i < rtctx->worldSize + 1; i++) sum += i;
-  torch::Tensor expected = torch::full({3, 3}, sum, rtctx->c10dev);
+  torch::Tensor expected = torch::full({16, 16}, sum, rtctx->c10dev);
   assert(at::equal(t, expected));
 
   /* prod */
   int prod = 1;
   for (int i = 1; i < rtctx->worldSize + 1; i++) prod *= i;
-  t = torch::full({3, 3}, rtctx->rank + 1, rtctx->c10dev);
-  expected = torch::full({3, 3}, prod, rtctx->c10dev);
+  t = torch::full({16, 16}, rtctx->rank + 1, rtctx->c10dev);
+  expected = torch::full({16, 16}, prod, rtctx->c10dev);
   comm_start();
   all_reduce(t, c10d::ReduceOp::PRODUCT);
   comm_end();
@@ -273,8 +273,8 @@ void CommunicationHandlerNCCL::testAllReduce() {
   assert(at::equal(t, expected));
 
   /* max */
-  t = torch::full({3, 3}, rtctx->rank + 1, rtctx->c10dev);
-  expected = torch::full({3, 3}, rtctx->worldSize, rtctx->c10dev);
+  t = torch::full({16, 16}, rtctx->rank + 1, rtctx->c10dev);
+  expected = torch::full({16, 16}, rtctx->worldSize, rtctx->c10dev);
   comm_start();
   all_reduce(t, c10d::ReduceOp::MAX);
   comm_end();
@@ -282,6 +282,38 @@ void CommunicationHandlerNCCL::testAllReduce() {
   assert(at::equal(t, expected));
 
   DP_LOG(NOTICE, "Completed 3 NCCL all reduce tests.");
+}
+
+void CommunicationHandlerNCCL::fnTestAllReduce() {
+  if (rtctx->worldSize == 1) return;
+
+  DP_LOG(NOTICE, "Starting FastNICs NCCL all reduce tests.");
+
+  /* Use a sum. */
+  int dim = 8;
+  int dim2 = 16;
+  torch::Tensor t = torch::full({dim, dim}, rtctx->rank + 1, rtctx->c10dev);
+  torch::Tensor t2 = torch::full({dim2, dim2}, rtctx->rank + 1, rtctx->c10dev);
+  comm_start();
+  all_reduce(t, c10d::ReduceOp::SUM);
+  all_reduce(t2, c10d::ReduceOp::SUM);
+  comm_end();
+  sync();
+  
+  // Need sync here, as sync() above doesn't seem to do anything.
+  c10::cuda::device_synchronize();
+
+  int sum = 0;
+  for (int i = 1; i < rtctx->worldSize + 1; i++) sum += i;
+  torch::Tensor expected = torch::full({dim, dim}, sum, rtctx->c10dev);
+  assert(at::equal(t, expected));
+
+  int sum2 = 0;
+  for (int i2 = 1; i2 < rtctx->worldSize + 1; i2++) sum2 += i2;
+  torch::Tensor expected2 = torch::full({dim2, dim2}, sum2, rtctx->c10dev);
+  assert(at::equal(t2, expected2));
+
+  DP_LOG(NOTICE, "Completed FastNICs NCCL all reduce tests.");
 }
 
 void CommunicationHandlerNCCL::testRingP2P() {

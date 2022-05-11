@@ -16,9 +16,18 @@ void GradientSyncManager::FlushKey(
   // model performance was a little worse
   // TODO - using separate stream causing NCCL to hang with graphs, try again at
   // some pt.
-  commHandler_->comm_start(stream, key);
-  for (auto &grad : vec) commHandler_->all_reduce(grad, c10d::ReduceOp::SUM);
-  commHandler_->comm_end();
+
+  // ORIG
+  //commHandler_->comm_start(stream, key);
+  //for (auto &grad : vec) commHandler_->all_reduce(grad, c10d::ReduceOp::SUM);
+  //commHandler_->comm_end();
+
+  // FIX
+  for (auto &grad : vec) {
+    commHandler_->comm_start(stream, key);
+    commHandler_->all_reduce(grad, c10d::ReduceOp::SUM);
+    commHandler_->comm_end();
+  }
 
   has_unjoined_work_ = true;
   if (!freeze_) {
