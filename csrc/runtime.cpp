@@ -75,6 +75,7 @@ ABSL_FLAG(
     "Run all reduce in parallel with backwards pass for every "
     "sync_bucket_size bytes worth of gradients that are ready. Set to 0 to "
     "disable.");
+ABSL_FLAG(bool, ar_test, false, "");
 
 /**
  * Destructing RuntimeContext.
@@ -134,15 +135,19 @@ void grpcCommTest() {
   commHandler->testRingP2P();
 }
 
-void ncclCommTest() {
+void ncclCommTest(bool arTest) {
   json tensorTags;
   json jobRankToGlobalRank;
   auto commHandler = std::make_shared<CommunicationHandlerNCCL>(
       "default", rtctx->worldSize, tensorTags, rtctx->rank,
       jobRankToGlobalRank);
   DP_LOG(DEBUG, "a default commHandler created for testing.");
-  commHandler->testRingP2P();
-  commHandler->testAllReduce();
+  if (arTest) {
+    commHandler->fnTestAllReduce();
+  } else {
+    commHandler->testRingP2P();
+    commHandler->testAllReduce();
+  }
   rtctx->global_comms = commHandler;
 }
 
@@ -214,6 +219,7 @@ void parse_args(RuntimeContext& ctx, int argc, char** argv) {
   PARSEFLAG(cuda_profile);
   PARSEFLAG(debug);
   PARSEFLAG(logdir);
+  PARSEFLAG(ar_test);
 #undef PARSEFLAG
 
 #define PARSEFLAG(x) becfg.x = absl::GetFlag(FLAGS_##x);
@@ -271,7 +277,7 @@ int main(int argc, char** argv) {
     while (!ctx.ncclCommReady.load(std::memory_order_relaxed)) {
     }
     DP_LOG(DEBUG, "InitCommNCCL done. Running test now.");
-    ncclCommTest();
+    ncclCommTest(ctx.ar_test);
   }
 
   int version;

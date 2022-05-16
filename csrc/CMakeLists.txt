@@ -1,15 +1,27 @@
 cmake_minimum_required(VERSION 3.11 FATAL_ERROR)
 project(DeepPool)
 
-list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}/")
-list(APPEND CMAKE_MODULE_PATH "$ENV{CONDA_PREFIX}/lib/cmake/")
-list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}/lib/python3.9/site-packages/torch/")
-list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}/lib/python3.8/site-packages/torch/")
-list(APPEND CMAKE_PREFIX_PATH "/opt/conda/lib/python3.8/site-packages/torch/")
+# FastNICs start
+list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/nccl/build")
+list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/debug/libtorch")
+list(APPEND CMAKE_PREFIX_PATH "/usr/local/cuda")
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake-modules")
+
+#list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}/")
+#list(APPEND CMAKE_MODULE_PATH "$ENV{CONDA_PREFIX}/lib/cmake/")
+#list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}/lib/python3.9/site-packages/torch/")
+#list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}/lib/python3.8/site-packages/torch/")
+#list(APPEND CMAKE_PREFIX_PATH "/opt/conda/lib/python3.8/site-packages/torch/")
+# FastNICs end
 
 add_subdirectory(grpc)
 
 find_package(Torch REQUIRED)
+
+# FastNICs start
+find_package(NCCL REQUIRED)
+# FastNICs end
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -23,6 +35,10 @@ enable_language(CUDA)
 #set(CUDA_ATTACH_VS_BUILD_RULE_TO_CUDA_FILE ON)
 set(BUILD_SHARED_LIBS ON)
 #set(CUDA_SEPARABLE_COMPILATION ON)
+
+# FastNICs start
+set(CMAKE_CUDA_ARCHITECTURES "80")
+# FastNICs end
 
 #add_subdirectory(proflib)
 
@@ -78,6 +94,14 @@ add_custom_command(
 # Include generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
+# FastNICs start
+include_directories("$ENV{HOME}/debug/libtorch/include")
+link_directories("$ENV{HOME}/debug/libtorch/lib")
+
+include_directories("$ENV{HOME}/nccl/build/include")
+link_directories("$ENV{HOME}/nccl/build/lib")
+# FastNICs end
+
 # dp_grpc_proto
 add_library(dp_grpc_proto
   ${dp_grpc_srcs}
@@ -103,6 +127,9 @@ target_link_libraries(runtime
   ${_REFLECTION}
   ${_GRPC_GRPCPP}
   ${_PROTOBUF_LIBPROTOBUF}
-  ${TORCH_LIBRARIES})
+# FastNICs start
+  ${TORCH_LIBRARIES}
+  ${NCCL_LIBRARIES})
+# FastNICs end
 
 set_property(TARGET runtime PROPERTY CXX_STANDARD 14)

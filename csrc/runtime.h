@@ -87,6 +87,7 @@ struct RuntimeContext {
   bool sync_coalesce;
   size_t sync_tensor_pad;
   size_t sync_bucket_size;
+  bool ar_test;
   std::atomic<uint64_t> fgcounter{0};
 
   std::mutex jobListMutex;

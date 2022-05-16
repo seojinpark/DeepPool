@@ -551,6 +551,7 @@ def parse_args():
     parser.add_argument('--manualLaunch', default=False, action='store_true',
                         help="Do not runtimes automatically. Primarily for using gdb on runtime processes.")
     parser.add_argument("--logdir", type=str, default="", help="Full path of log directory")
+    parser.add_argument("--gpus", type=int, default=0, help="Number of GPUs to use.")
     # For installing nsys.. (with other cuda toolkit..)
     # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/cuda-ubuntu1804.pin
     # sudo mv cuda-ubuntu1804.pin /etc/apt/preferences.d/cuda-repository-pin-600
@@ -563,6 +564,7 @@ def parse_args():
 
 def main():
     global args, extra_args
+    print("Arguments: %s" % str(sys.argv))
     args, extra_args = parse_args()
 #    clusterConfig = json.load(open(args.pathToConfig))
     global rankToIpMap
@@ -572,7 +574,15 @@ def main():
 #    for serverConfig in clusterConfig["serverList"]:
 #        print("Found %s" % str(serverConfig))
     port = 11270
+    # ----- BEGIN FastNICS Mods -----
+    # Note: Returns [0, 0, 0, 0, 1, 1, 1, 1] for 8 GPUs
     gpus = discover_gpu_numa()
+    if args.gpus > 0:
+        print("Changing GPUs from %s to..." % str(gpus))
+        if args.gpus < len(gpus):
+            gpus = gpus[:args.gpus]
+    print("GPUs %s" % str(gpus))
+    # ----- END FastNICs Mods -----
     for idx, node in gpus:
         rankToIpMap[str(len(locations))] = f"127.0.0.1:{port}"
         commGrpRanksWorld.append(len(locations))
