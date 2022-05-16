@@ -4,6 +4,7 @@
 #include <ATen/cuda/CUDAEvent.h>
 #include <torch/torch.h>
 
+#include "json.hpp"
 #include "runnableModule.h"
 #include "runtime.h"
 #include "utils.h"
@@ -26,7 +27,8 @@ class Dataset {
   virtual size_t GetItersPerEpoch() = 0;
   virtual bool IsDone() = 0;
   virtual void Reset() = 0;
-  static Dataset *fromName(std::string name, size_t rank, long globalBatchSize,
+  static Dataset *fromName(std::string name, json jobParams, size_t rank,
+                           long globalBatchSize,
                            std::vector<std::shared_ptr<Layer>> input_layers,
                            std::vector<long> sampleIndices,
                            size_t fake_train_iters_per_epoch);

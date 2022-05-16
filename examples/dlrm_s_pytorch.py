@@ -1454,7 +1454,16 @@ def run(gpuCount, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66
         else:
             jobName += "_DP"
         jobName += "_BE" if use_be else ""
-        cc.submitTrainingJob(jobName, jobInJson, use_be)
+        jobParams = {}
+        jobParams["dlrm_m_den"] = int(m_den)
+        assert all(l == ln_emb[0] for l in ln_emb)
+        jobParams["dlrm_emb_size"] = int(ln_emb[0])
+        jobParams["dlrm_nr_emb"] = len(ln_emb)
+        jobParams["dlrm_num_indices_per_lookup"] = int(args.num_indices_per_lookup)
+        jobParams["autocast"] = False
+        jobParams["dset"] = "dlrm"
+
+        cc.submitTrainingJob(jobName, jobInJson, use_be, jobParams)
 
     # cs.printAllLayers(slient=False)
     # cs.computeInputDimensions((2,240,240))

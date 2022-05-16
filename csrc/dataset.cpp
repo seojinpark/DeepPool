@@ -107,7 +107,8 @@ size_t CifarDataset::GetItersPerEpoch() { return batches_per_epoch_; };
 
 void CifarDataset::Reset() { cur_iter = loader->begin(); }
 
-Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
+Dataset *Dataset::fromName(std::string name, json jobParams, size_t rank,
+                           long globalBatchSize,
                            std::vector<std::shared_ptr<Layer>> input_layers,
                            std::vector<long> sampleIndices,
                            size_t fake_train_iters_per_epoch) {
@@ -137,13 +138,23 @@ Dataset *Dataset::fromName(std::string name, size_t rank, long globalBatchSize,
   if (name.find("dlrm") != std::string::npos) {
     DP_LOG(DEBUG, "Using dlrm fake dataset");
     auto targetOpts = torch::TensorOptions().requires_grad(false);
-    // TODO: recreate the random dataset generator from the FB python impl
     auto gen = [=] {
-      // TODO: make dynamic
-      constexpr int64_t m_den = 128;
-      constexpr int64_t emb_size = 80000;
-      constexpr int64_t nr_emb = 4;
-      constexpr int64_t indices_per_lookup = 10;
+      assert(jobParams.contains("dlrm_m_den"));
+      assert(jobParams.contains("dlrm_emb_size"));
+      assert(jobParams.contains("dlrm_nr_emb"));
+      assert(jobParams.contains("dlrm_num_indices_per_lookup"));
+
+      int64_t m_den = jobParams["dlrm_m_den"].get<int64_t>();
+      int64_t emb_size = jobParams["dlrm_emb_size"].get<int64_t>();
+      int64_t nr_emb = jobParams["dlrm_nr_emb"].get<int64_t>();
+      int64_t indices_per_lookup =
+          jobParams["dlrm_num_indices_per_lookup"].get<int64_t>();
+
+      DP_LOG(DEBUG,
+             "DLRM params: m_den %ld, emb_size %ld, nr_emb %ld, "
+             "indices_per_lookup %ld",
+             m_den, emb_size, nr_emb, indices_per_lookup);
+
       auto dense = torch::randn({globalBatchSize, m_den});
       std::vector<torch::Tensor> inputs;
       inputs.push_back(dense);

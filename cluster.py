@@ -253,16 +253,16 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
     def export_poke(self):
         return 'Returned from poke at %s' % self.myAddr
 
-    def export_scheduleTraining(self, jobName: str, trainingJobInJSON: str, runbe):
+    def export_scheduleTraining(self, jobName: str, trainingJobInJSON: str, runbe, jobParams=None):
         try:
-            return self.scheduleTraining_wrap(jobName, trainingJobInJSON, runbe)
+            return self.scheduleTraining_wrap(jobName, trainingJobInJSON, runbe, jobParams)
         except:
             traceback.print_exc()
             sys.stdout.flush()
             raise
 
 
-    def scheduleTraining_wrap(self, jobName: str, trainingJobInJSON: str, runbe):
+    def scheduleTraining_wrap(self, jobName: str, trainingJobInJSON: str, runbe, jobParams):
         job = TrainingJob("test", None, None, 0, 0, "")
         job.loadJSON(trainingJobInJSON)
         print("received job")
@@ -287,14 +287,12 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         if len(self.locations) < gpusUsed:
             return "Not enough servers available. %d gpus available while %d needed" % (len(self.locations), gpusUsed)
 
-        jobParams = {
-            "run_with_be": runbe,
-            "nr_gpus": gpusUsed,
-            "cifar_training": "cifar" in jobName,
-            "lossfn": "CrossEntropyLoss" if "gpt2" in jobName else "NLL",
-            "autocast": "dlrm" not in jobName.lower(), # TODO: investigate autocast + DLRM
-            "dset": "dlrm" if "dlrm" in jobName.lower() else "random",
-        }
+        jobParams = jobParams or {}
+        jobParams["run_with_be"] = runbe
+        jobParams["nr_gpus"] = gpusUsed
+        jobParams["lossfn"] = "CrossEntropyLoss" if "gpt2" in jobName else "NLL"
+        jobParams["autocast"] = jobParams.get("autocast", True)
+        jobParams["dset"] = jobParams.get("dset", "random")
 
         jobParamsInJson = json.dumps(jobParams)
 
@@ -574,7 +572,7 @@ def main():
 #    for serverConfig in clusterConfig["serverList"]:
 #        print("Found %s" % str(serverConfig))
     port = 11270
-    gpus = discover_gpu_numa()[:4]
+    gpus = discover_gpu_numa()
     for idx, node in gpus:
         rankToIpMap[str(len(locations))] = f"127.0.0.1:{port}"
         commGrpRanksWorld.append(len(locations))
