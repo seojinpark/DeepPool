@@ -437,7 +437,12 @@ def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fal
     cs.printAllLayers(slient=True)
     cs.computeInputDimensions((3,224,224))
     # job, iterMs, gpuMs = cs.searchBestSplits(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
+
+    start = time.time()
     job, iterMs, gpuMs, maxGpusUsed = cs.searchBestSplitsV3(gpuCount, globalBatch, amplificationLimit=amplificationLimit, dataParallelBaseline=dataParallelBaseline, spatialSplit=spatialSplit)
+    end = time.time()
+    print("search took: ", end - start)
+
     jobInJson = job.dumpInJSON()
     profiler.saveProfile()
     # for rank in range(4):
