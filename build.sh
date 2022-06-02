@@ -10,13 +10,13 @@ pip3 install -r requirements.txt
 python -m grpc_tools.protoc -Icsrc/protos --python_out=. --grpc_python_out=. csrc/protos/runtime.proto
 
 # FastNICS start
-export Torch_DIR=$HOME/debug/libtorch
-export NCCL_DIR=$HOME/nccl/build
+export Torch_DIR=$HOME/libtorch
+export NCCL_DIR=$HOME/msccl/build
 
 export NCCL_ROOT_DIR=$NCCL_DIR
 export NCCL_INCLUDE_DIR=$NCCL_DIR/include
 export NCCL_LIB_DIR=$NCCL_DIR/lib
-export NCCL_VERSION="2.11.4"
+export NCCL_VERSION="2.8.4"
 
 export CUDA_HOME=/usr/local/cuda
 
