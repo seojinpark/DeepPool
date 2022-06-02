@@ -216,6 +216,12 @@ RunnableModule::RunnableModule(
           if (!local) layer->nr_nccl_send++;
         }
       }
+
+      // TODO: If the above transfers are all part of an all-to-all collective
+      // communications transfer, then set alltoall_xfer to true.  This
+      // setting needs to come from the planner via the json, as it cannot be
+      // determined here.
+      layer->alltoall_xfer = true;
     }
 
     if (rtctx->profile_layer_times_graph) {
@@ -515,20 +521,134 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
   if (layer->xfers.size()) {
     auto fn = [=](c10::cuda::CUDAStream stream) mutable {
       commHandler->comm_start(stream);
-      for (const auto& ixfer : layer->xfers) {
-        if (backward && ixfer.skip_backward) continue;
-        const size_t lid = ixfer.src_lid;
-        const std::pair<size_t, size_t>& src = backward ? ixfer.dst : ixfer.src;
-        const std::pair<size_t, size_t>& dst = backward ? ixfer.src : ixfer.dst;
-        if (src.first == static_cast<size_t>(rtctx->rank)) {
-          auto tsr = getSampleSlice(outbound_tensors.at(lid), src.second,
-                                    ixfer.nr_samples);
-          commHandler->send(tsr, ixfer.tag, dst.first);
+
+      if (layer->alltoall_xfer) {
+        // Use the number of outbound and inbound tensors to determine how to
+        // manipulate the tensors to do an all-to-all call.
+        if (outbound_tensors.size() == 1) {
+          size_t         out_lid = outbound_tensors.begin()->first;
+          torch::Tensor& out_tsr = outbound_tensors.at(out_lid);
+
+          size_t full_cnt = out_tsr.numel();
+          size_t send_cnt = full_cnt / rtctx->worldSize;
+
+          assert((full_cnt % rtctx->worldSize) == 0);
+
+          if (inbound_tensors.size() == 1) {
+            // 1 out, 1 in: No tensor copying required.
+            size_t         in_lid = inbound_tensors.begin()->first;
+            torch::Tensor& in_tsr = inbound_tensors.at(in_lid);
+
+            assert(static_cast<size_t>(in_tsr.numel()) == full_cnt);
+
+            commHandler->all_to_all(out_tsr, in_tsr, send_cnt);
+          } else {
+            // 1 out, N in: Create a temporary inbound (receive) tensor.
+            assert(inbound_tensors.size() == static_cast<size_t>(rtctx->worldSize));
+
+            // Create a rank to lid mapping by walking the xfers.
+            std::map<size_t, size_t> rank_to_lid;
+
+            for (const auto& ixfer : layer->xfers) {
+              const size_t                     lid = ixfer.src_lid;
+              const std::pair<size_t, size_t>& src = backward ? ixfer.dst : ixfer.src;
+
+              rank_to_lid[src.first] = lid;
+            }
+
+            // Create a temporary inbound tensor to match the outbound tensor.
+            torch::Tensor tmp_in_tsr = torch::empty(out_tsr.sizes(), out_tsr.options());
+
+            commHandler->all_to_all(out_tsr, tmp_in_tsr, send_cnt);
+
+            // Copy from tmp_in_tsr to the N inbound_tensors.
+            for (int rank = 0; rank < rtctx->worldSize; rank++) {
+              // TODO: Is this the best way to copy between tensors?  Which
+              // stream should be used?
+              torch::Tensor& dst_tsr   = inbound_tensors.at(rank_to_lid[rank]);
+              size_t         num_bytes = dst_tsr.nbytes();
+              size_t         offset    = rank * num_bytes;
+              char          *src_ptr   = reinterpret_cast<char *>(tmp_in_tsr.data_ptr()) + offset;
+
+              assert(static_cast<size_t>(dst_tsr.numel()) == send_cnt);
+
+              CUDACHECK(cudaMemcpyAsync(dst_tsr.data_ptr(),
+                                        src_ptr,
+                                        num_bytes,
+                                        cudaMemcpyDeviceToDevice,
+                                        rtctx->torch_stream));
+            }
+          }
         } else {
-          assert(dst.first == static_cast<size_t>(rtctx->rank));
-          auto tsr = getSampleSlice(inbound_tensors.at(lid), dst.second,
-                                    ixfer.nr_samples);
-          commHandler->recv(tsr, ixfer.tag, src.first);
+          assert(outbound_tensors.size() == static_cast<size_t>(rtctx->worldSize));
+
+          if (inbound_tensors.size() == 1) {
+            // N out, 1 in: Create a temporary outbound (send) tensor.
+            size_t         in_lid = inbound_tensors.begin()->first;
+            torch::Tensor& in_tsr = inbound_tensors.at(in_lid);
+
+            size_t full_cnt = in_tsr.numel();
+            size_t send_cnt = full_cnt / rtctx->worldSize;
+
+            assert((full_cnt % rtctx->worldSize) == 0);
+
+            // Create a rank to lid mapping by walking the xfers:
+            std::map<size_t, size_t> rank_to_lid;
+
+            for (const auto& ixfer : layer->xfers) {
+              const size_t                     lid = ixfer.src_lid;
+              const std::pair<size_t, size_t>& dst = backward ? ixfer.src : ixfer.dst;
+
+              rank_to_lid[dst.first] = lid;
+            }
+
+            // Create a temporary outbound tensor to match the inbound tensor.
+            torch::Tensor tmp_out_tsr = torch::empty(in_tsr.sizes(), in_tsr.options());
+
+            // Copy from the N outbound_tensors to tmp_out_tsr.
+            for (int rank = 0; rank < rtctx->worldSize; rank++) {
+              // TODO: Is this the best way to copy between tensors?  Which
+              // stream should be used?
+              torch::Tensor& src_tsr   = outbound_tensors.at(rank_to_lid[rank]);
+              size_t         num_bytes = src_tsr.nbytes();
+              size_t         offset    = rank * num_bytes;
+              char          *dst_ptr   = reinterpret_cast<char *>(tmp_out_tsr.data_ptr()) + offset;
+
+              assert(static_cast<size_t>(src_tsr.numel()) == send_cnt);
+
+              CUDACHECK(cudaMemcpyAsync(dst_ptr,
+                                        src_tsr.data_ptr(),
+                                        num_bytes,
+                                        cudaMemcpyDeviceToDevice,
+                                        rtctx->torch_stream));
+            }
+
+            commHandler->all_to_all(tmp_out_tsr, in_tsr, send_cnt);
+          } else {
+            // N out, N in: Create temporary outbound and inbound tensors.
+            assert(inbound_tensors.size() == static_cast<size_t>(rtctx->worldSize));
+
+            // TODO: Does this need to be supported?  If so, then implement.
+            DP_LOG(ERROR, "All-to-all for N out N in not supported yet.\n");
+          }
+        }
+      } else {
+        // Use the manual transfer recorded in the Xfer structures.
+        for (const auto& ixfer : layer->xfers) {
+          if (backward && ixfer.skip_backward) continue;
+          const size_t lid = ixfer.src_lid;
+          const std::pair<size_t, size_t>& src = backward ? ixfer.dst : ixfer.src;
+          const std::pair<size_t, size_t>& dst = backward ? ixfer.src : ixfer.dst;
+          if (src.first == static_cast<size_t>(rtctx->rank)) {
+            auto tsr = getSampleSlice(outbound_tensors.at(lid), src.second,
+                                      ixfer.nr_samples);
+            commHandler->send(tsr, ixfer.tag, dst.first);
+          } else {
+            assert(dst.first == static_cast<size_t>(rtctx->rank));
+            auto tsr = getSampleSlice(inbound_tensors.at(lid), dst.second,
+                                      ixfer.nr_samples);
+            commHandler->recv(tsr, ixfer.tag, src.first);
+          }
         }
       }
       commHandler->comm_end();

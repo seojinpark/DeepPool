@@ -50,6 +50,7 @@ class CommunicationHandler {
   virtual void recv(torch::Tensor& tensor, int tag, int src) = 0;
 
   virtual void all_reduce(torch::Tensor& tensor, c10d::ReduceOp op) = 0;
+  virtual void all_to_all(torch::Tensor& sendTensor, torch::Tensor& recvTensor, size_t sendCount) = 0;
 
   /* block until all outstanding send/recvs have completed */
   virtual void sync(c10::optional<c10::cuda::CUDAStream> stream = {}) = 0;
@@ -91,6 +92,7 @@ class CommunicationHandlerNCCL : public CommunicationHandler {
   void comm_end();
 
   void all_reduce(torch::Tensor& tensor, c10d::ReduceOp op);
+  void all_to_all(torch::Tensor& sendTensor, torch::Tensor& recvTensor, size_t sendCount);
   void testRingP2P();
   void testAllReduce();
   void fnTestAllReduce();
@@ -124,6 +126,7 @@ class CommunicationHandlerGRPC : public CommunicationHandler {
   void comm_end(){};
 
   void all_reduce(torch::Tensor& tensor, c10d::ReduceOp op);
+  void all_to_all(torch::Tensor& sendTensor, torch::Tensor& recvTensor, size_t sendCount);
 
  private:
   std::string taskName;

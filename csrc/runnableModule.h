@@ -94,6 +94,7 @@ struct Layer {
   /* stores outputs for distribute nodes */
   std::map<size_t, torch::Tensor> dist_outputs;
 
+  bool alltoall_xfer{false};
   std::vector<Xfer> xfers;
   size_t nr_nccl_recv{0}, nr_nccl_send{0};
   std::vector<Xfer> xfers_local;

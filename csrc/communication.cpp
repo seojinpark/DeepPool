@@ -145,6 +145,15 @@ void CommunicationHandlerGRPC::all_reduce(torch::Tensor& tensor,
   fprintf(stderr, "GRPC all reduce not implemented\n");
 }
 
+void CommunicationHandlerGRPC::all_to_all(torch::Tensor& sendTensor,
+                                          torch::Tensor& recvTensor,
+                                          size_t sendCount) {
+  UNUSED(sendTensor);
+  UNUSED(recvTensor);
+  UNUSED(sendCount);
+  fprintf(stderr, "GRPC all to all not implemented\n");
+}
+
 void CommunicationHandlerGRPC::testRingP2P() {
   torch::Tensor tsr2Send = torch::ones({2}, rtctx->c10dev);
   // DP_LOG(DEBUG, "Created tensor [%s] in dev.", tsrToStr(tsr2Send).c_str());
@@ -245,6 +254,21 @@ void CommunicationHandlerNCCL::all_reduce(torch::Tensor& tensor,
                     to_nccl_data_type(tensor.scalar_type()), ncclOp.at(op),
                     reinterpret_cast<ncclComm_t>(group_call_commObj),
                     group_call_stream.value()));
+}
+
+void CommunicationHandlerNCCL::all_to_all(torch::Tensor& sendTensor,
+                                          torch::Tensor& recvTensor,
+                                          size_t sendCount) {
+  assert(in_group_call);
+  DP_LOG(DEBUG, "NCCL all to all.");
+
+  sendTensor.record_stream(group_call_stream.value());
+  recvTensor.record_stream(group_call_stream.value());
+  NCCL_API_CALL(
+      ncclAllToAll(sendTensor.data_ptr(), recvTensor.data_ptr(), sendCount,
+                   to_nccl_data_type(sendTensor.scalar_type()),
+                   reinterpret_cast<ncclComm_t>(group_call_commObj),
+                   group_call_stream.value()));
 }
 
 void CommunicationHandlerNCCL::testAllReduce() {
