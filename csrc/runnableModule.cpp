@@ -520,7 +520,6 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
   bool has_recv = backward ? layer->nr_nccl_send : layer->nr_nccl_recv;
   if (layer->xfers.size()) {
     auto fn = [=](c10::cuda::CUDAStream stream) mutable {
-      commHandler->comm_start(stream);
 
       if (layer->alltoall_xfer) {
         // Use the number of outbound and inbound tensors to determine how to
@@ -541,7 +540,12 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
 
             assert(static_cast<size_t>(in_tsr.numel()) == full_cnt);
 
+            commHandler->comm_start(stream);
             commHandler->all_to_all(out_tsr, in_tsr, send_cnt);
+            commHandler->comm_end();
+
+            // Wait until the inbound tensor is fully populated.
+            commHandler->sync(stream);
           } else {
             // 1 out, N in: Create a temporary inbound (receive) tensor.
             assert(inbound_tensors.size() == static_cast<size_t>(rtctx->worldSize));
@@ -559,7 +563,12 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
             // Create a temporary inbound tensor to match the outbound tensor.
             torch::Tensor tmp_in_tsr = torch::empty(out_tsr.sizes(), out_tsr.options());
 
+            commHandler->comm_start(stream);
             commHandler->all_to_all(out_tsr, tmp_in_tsr, send_cnt);
+            commHandler->comm_end();
+
+            // Wait until the temporary inbound tensor is populated.
+            commHandler->sync(stream);
 
             // Copy from tmp_in_tsr to the N inbound_tensors.
             for (int rank = 0; rank < rtctx->worldSize; rank++) {
@@ -578,6 +587,9 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
                                         cudaMemcpyDeviceToDevice,
                                         rtctx->torch_stream));
             }
+
+            // Wait until the inbound tensor is populated.
+            commHandler->sync(rtctx->torch_stream);
           }
         } else {
           assert(outbound_tensors.size() == static_cast<size_t>(rtctx->worldSize));
@@ -592,7 +604,7 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
 
             assert((full_cnt % rtctx->worldSize) == 0);
 
-            // Create a rank to lid mapping by walking the xfers:
+            // Create a rank to lid mapping by walking the xfers.
             std::map<size_t, size_t> rank_to_lid;
 
             for (const auto& ixfer : layer->xfers) {
@@ -623,7 +635,15 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
                                         rtctx->torch_stream));
             }
 
+            // Wait until the temporary outbound tensor is populated.
+            commHandler->sync(rtctx->torch_stream);
+
+            commHandler->comm_start(stream);
             commHandler->all_to_all(tmp_out_tsr, in_tsr, send_cnt);
+            commHandler->comm_end();
+
+            // Wait until the inbound tensor is populated.
+            commHandler->sync(stream);
           } else {
             // N out, N in: Create temporary outbound and inbound tensors.
             assert(inbound_tensors.size() == static_cast<size_t>(rtctx->worldSize));
@@ -634,6 +654,7 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
         }
       } else {
         // Use the manual transfer recorded in the Xfer structures.
+        commHandler->comm_start(stream);
         for (const auto& ixfer : layer->xfers) {
           if (backward && ixfer.skip_backward) continue;
           const size_t lid = ixfer.src_lid;
@@ -650,8 +671,8 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
             commHandler->recv(tsr, ixfer.tag, src.first);
           }
         }
+        commHandler->comm_end();
       }
-      commHandler->comm_end();
     };
 
     if (graph_recording) {
@@ -660,10 +681,18 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
            (backward ? "backward_nccl_" : "forward_nccl_") + layer->layername});
     };
 
-    commHandler->comm_start();
+    // TODO: Why is the default comm stream used from this function, while
+    // other calls to the lambda expression use a different stream?
+    if (!layer->alltoall_xfer) {
+      commHandler->comm_start();
+    }
+
     fn(c10::cuda::getCurrentCUDAStream());  // stream will be ignored when
                                             // already in comm call
-    commHandler->comm_end();
+
+    if (!layer->alltoall_xfer) {
+      commHandler->comm_end();
+    }
   }
 
   if (layer->xfers_local.size()) {
@@ -693,7 +722,7 @@ void RunnableModule::ExecuteXfers(std::shared_ptr<Layer>& layer,
     }
   }
 
-  if (has_recv) commHandler->sync();
+  if (!layer->alltoall_xfer && has_recv) commHandler->sync();
 }
 
 /**
