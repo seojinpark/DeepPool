@@ -59,14 +59,14 @@ def discover_gpu_numa():
     except:
         has_numactl = False
 
-    if not has_numactl:
-        return [-1] * len(gpus)
-
     nodes = []
     for idx, g in enumerate(gpus):
-        gid = g.split("\"")[1][4:].lower()
-        node = check_output(f"cat /sys/bus/pci/devices/{gid}/numa_node", shell=True).decode("utf-8").strip()
-        nodes.append((idx, int(node)))
+        if has_numactl:
+            gid = g.split("\"")[1][4:].lower()
+            node = check_output(f"cat /sys/bus/pci/devices/{gid}/numa_node", shell=True).decode("utf-8").strip()
+            nodes.append((idx, int(node)))
+        else:
+            nodes.append((idx, -1))
     return nodes
 
 class CppRuntimeProxy:
@@ -575,7 +575,7 @@ def main():
 #        print("Found %s" % str(serverConfig))
     port = 11270
     # ----- BEGIN FastNICS Mods -----
-    # Note: Returns [0, 0, 0, 0, 1, 1, 1, 1] for 8 GPUs
+    # Note: Returns [(0, 0), (1, 0), (2, 0), (3, 0), (4, 1), (5, 1), (6, 1), (7, 1)] for 8 GPUs
     gpus = discover_gpu_numa()
     if args.gpus > 0:
         print("Changing GPUs from %s to..." % str(gpus))

@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.11 FATAL_ERROR)
 project(DeepPool)
 
 # FastNICs start
-list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/msccl/build")
-list(APPEND CMAKE_PREFIX_PATH "$ENV{HOME}/libtorch")
+list(APPEND CMAKE_PREFIX_PATH "/msccl/build")
+list(APPEND CMAKE_PREFIX_PATH "/libtorch")
 list(APPEND CMAKE_PREFIX_PATH "/usr/local/cuda")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake-modules")
@@ -95,11 +95,11 @@ add_custom_command(
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
 # FastNICs start
-include_directories("$ENV{HOME}/libtorch/include")
-link_directories("$ENV{HOME}/libtorch/lib")
+include_directories("/libtorch/include")
+link_directories("/libtorch/lib")
 
-include_directories("$ENV{HOME}/msccl/build/include")
-link_directories("$ENV{HOME}/msccl/build/lib")
+include_directories("/msccl/build/include")
+link_directories("/msccl/build/lib")
 # FastNICs end
 
 # dp_grpc_proto

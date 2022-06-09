@@ -3,15 +3,15 @@
 set -x
 set -e
 
-git submodule update --init --recursive .
-pip3 install -r requirements.txt
+# git submodule update --init --recursive .
+# pip3 install -r requirements.txt
 
 # GRPC build for python
 python -m grpc_tools.protoc -Icsrc/protos --python_out=. --grpc_python_out=. csrc/protos/runtime.proto
 
 # FastNICS start
-export Torch_DIR=$HOME/libtorch
-export NCCL_DIR=$HOME/msccl/build
+export Torch_DIR=/libtorch
+export NCCL_DIR=/msccl/build
 
 export NCCL_ROOT_DIR=$NCCL_DIR
 export NCCL_INCLUDE_DIR=$NCCL_DIR/include
