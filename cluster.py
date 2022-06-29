@@ -50,25 +50,6 @@ def waitthreads(threadList):
             sys.exit(-1)
         thread.join()
 
-def discover_gpu_numa():
-    from subprocess import check_output
-    gpus = check_output("nvidia-smi -x -q | grep \"gpu id\"", shell=True).decode("utf-8").splitlines()
-
-    try:
-        has_numactl = os.system("numactl ls > /dev/null 2>&1") == 0
-    except:
-        has_numactl = False
-
-    if not has_numactl:
-        return [-1] * len(gpus)
-
-    nodes = []
-    for idx, g in enumerate(gpus):
-        gid = g.split("\"")[1][4:].lower()
-        node = check_output(f"cat /sys/bus/pci/devices/{gid}/numa_node", shell=True).decode("utf-8").strip()
-        nodes.append((idx, int(node)))
-    return nodes
-
 class CppRuntimeProxy:
     def __init__(self, addressWithPort: str):
         self.channel = grpc.insecure_channel(addressWithPort) # ex) 'localhost:50051'
@@ -80,7 +61,7 @@ class CppRuntimeProxy:
             tensor_tags_in_json=tensorTagsInJson,
             job_rank_to_global_rank_in_json=jobRankToGlobalRankInJson, job_meta_params_in_json=jobParamsInJson))
         print("received: " + response.message)
-    
+
     def poke(self):
         response = self.stub.Poke(runtime_pb2.Empty())
         # print("received: " + response.message)
@@ -114,7 +95,7 @@ class CppRuntimeProxy:
 
 
 class Location:
-    def __init__(self, address: str, port: int, device: int, userId: str, sshKeyPath: str, isCpp: bool):
+    def __init__(self, address: str, port: int, device: int, userId: str, sshKeyPath: str):
         self.address = address
         self.port = port
         self.device = device
@@ -122,7 +103,6 @@ class Location:
         self.sshKeyPath = sshKeyPath
         self.serverId = None
         self.proxy = None
-        self.isCpp = isCpp
         self.is_local = address == "127.0.0.1"
         self.process = None
         self.numa_node = -1
@@ -137,11 +117,8 @@ class Location:
         retryCount = 0
         while retryCount < maxRetry and not HAS_EXCEPTION:
             try:
-                if self.isCpp: # CPP runtime
-                    self.proxy = CppRuntimeProxy("%s:%d"%(self.address, self.port))
-                    # print("cppProxy created for %s:%d"%(self.address, self.port))
-                else:
-                    self.proxy = xmlrpc.client.ServerProxy("http://%s:%d/"%(self.address, self.port))
+                self.proxy = CppRuntimeProxy("%s:%d"%(self.address, self.port))
+                # print("cppProxy created for %s:%d"%(self.address, self.port))
                 self.proxy.poke()
                 return self.proxy
             except (ConnectionRefusedError, grpc.RpcError): # ConnectionRefusedError is for xmlrpc.
@@ -152,7 +129,7 @@ class Location:
                 retryCount += 1
         assert False, "couldn't connect"
         return None
-
+    """
     def downloadFile(self, remotePath: str, localPath: str):
         assert not self.is_local
         print("  Downloading %s to %s at %s" % (remotePath, localPath, self.address))
@@ -171,11 +148,11 @@ class Location:
         kwargs['stderr'] = subprocess.STDOUT
         sh_command = ['scp', '-i', self.sshKeyPath, localFilePath, '%s@%s:%s' % (self.userId, self.address, remotePath)]
         subprocess.check_call(sh_command, **kwargs)
-    
+
     def rsh(self, command):
         kwargs = dict()
         kwargs['stderr'] = subprocess.STDOUT
-        
+
         # sh_command = ['ssh', '-v', '-i', '~/.ssh/ulma-sjp.pem', 'ubuntu@%s' % self, '%s' % command]
         if self.is_local:
             sh_command = command
@@ -188,7 +165,7 @@ class Location:
             output = e.output
             exit(1)
         return
-    
+    """
     def __monitor(self):
         self.process.wait()
         sys.exit(0)
@@ -199,24 +176,32 @@ class Location:
             sh_command = command
             kwargs["shell"] = True
         else:
-            sh_command = ['ssh', '-i', self.sshKeyPath, '-o StrictHostKeyChecking=no', '%s@%s' % (self.userId, self.address),
-                    '%s' % command]
+            sh_command = ['ssh', '-o StrictHostKeyChecking=no', self.address, '%s' % command]
         self.process = subprocess.Popen(sh_command, **kwargs)
         t = threading.Thread(target=Location.__monitor, args=(self,), daemon=True)
         t.start()
         return self.process
 
-    def upSync(self, localPath, remotePath):
-        if self.is_local:
-            assert False
-            return
-        try:
-            subprocess.check_call(['rsync', '-e', 'ssh -i %s -o StrictHostKeyChecking=no' % self.sshKeyPath,
-                '-rh', "--exclude=*__pycache__", localPath, "%s@%s:%s" % (self.userId, self.address, remotePath)],
-                stderr=subprocess.STDOUT)
-        except subprocess.CalledProcessError as e:
-            output = e.output
-            exit(1)
+def discover_local_gpu_numa():
+    from subprocess import check_output
+    gpus = check_output("nvidia-smi -x -q | grep \"gpu id\"", shell=True).decode("utf-8").splitlines()
+
+    try:
+        has_numactl = os.system("numactl ls > /dev/null 2>&1") == 0
+    except:
+        has_numactl = False
+
+    if not has_numactl:
+        return [Location("127.0.0.1", 0, i, None, None) for i in range(len(gpus))]
+
+    nodes = []
+    for idx, g in enumerate(gpus):
+        gid = g.split("\"")[1][4:].lower()
+        node = check_output(f"cat /sys/bus/pci/devices/{gid}/numa_node", shell=True).decode("utf-8").strip()
+        loc = Location("127.0.0.1", 0, idx, None, None)
+        loc.numa_node = int(node)
+        nodes.append(loc)
+    return nodes
 
 class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
     """ GPU cluster coordinator. It accepts training jobs from clients and schedule them to runtimes. """
@@ -234,8 +219,8 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         self.ongoingJobs = {} # Dict of contexts of ongoing jobs. Indexed by job name.
         f = open("runtimeResult.data", "w")
         f.close()
-        
-    
+
+
     def _dispatch(self, method, params):
         """ Custom dispatcher for XML-RPC server. """
         try:
@@ -380,7 +365,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         for location in self.locations:
             for pipPackage in pipPackages:
                 location.rsh("pip install %s" % pipPackage)
-    def launchRuntimeAll(self, c10dBackend: str, profile: bool, cppRuntime: bool, manualLaunch: bool):
+    def launchRuntimeAll(self, c10dBackend: str, profile: bool, manualLaunch: bool):
         """ Launch runtime at all remote locations. Also registers the sighandler
             that cleanly shuts down all remote runtime servers.
         """
@@ -389,13 +374,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         logdir = args.logdir
         if not logdir:
             logdir = os.getcwd() + "/logs/"
-        upSyncedAddrs = set()
         for i, location in enumerate(self.locations):
-            if (location.address not in upSyncedAddrs):
-                # TODO: skip if location's addr is same as the current node.
-                # location.upSync(".", self.workDir)
-                upSyncedAddrs.add(location.address)
-
             # pass master ip and port.
             stdoutFp = open(f"{logdir}/runtime%d.out"%i, "a", buffering=1)
             stderrFp = open(f"{logdir}/runtime%d.err"%i, "a", buffering=1)
@@ -404,7 +383,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
                 nsysPrefix = "nsys profile -f true -o net%d -c cudaProfilerApi -t cuda,nvtx --export sqlite " % i # -s none
             if manualLaunch:
                 print("Skipping ssh launching runtime. Must have launched them manually.")
-            elif cppRuntime:
+            elif True:
                 if location.numa_node >= 0:
                     numacmd = "numactl -N{nn} -m{nn}".format(nn=location.numa_node)
                 else:
@@ -413,13 +392,6 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
                     f"CUDA_VISIBLE_DEVICES={location.device} {numacmd} {nsysPrefix} {self.workDir}/csrc/build/runtime" + \
                     " --myAddr %s:%d --device 0 --c10dBackend %s --rank %d --worldSize %d --logdir %s --be_batch_size %d %s" % \
                         (location.address, location.port, c10dBackend, i, len(self.locations), logdir, self.be_batch_size, " ".join(extra_args)) #+ \
-                    , stdout=stdoutFp, stderr=stderrFp))
-            else:
-                self.processes.append(location.rshAsync(
-                    # nsysPrefix + "python3 " + self.workDir + "runtime.py" + \
-                    "source ~/.profile; " +  nsysPrefix + "python3 " + self.workDir + "runtime.py" + \
-                    " --coordinatorAddr %s:%d --myAddr %s:%d --device %d --c10dBackend %s --rank %d --worldSize %d --be_batch_size %d %s" % \
-                        (self.myAddr, self.myPort, location.address, location.port, location.device, c10dBackend, i, len(self.locations), self.be_batch_size, "--profile" if profile else "") #+ \
                     , stdout=stdoutFp, stderr=stderrFp))
 
             sig_names = {2: "SIGINT", 15: "SIGTERM"}
@@ -442,7 +414,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
                 sys.exit(1)
             signal.signal(signal.SIGINT, sigkill_handler)
             # signal.signal(signal.SIGTERM, sigkill_handler)
-        
+
         time.sleep(2) ## + (15 if profile else 0))
         for location in self.locations:
             proxy = location.getProxy()
@@ -546,11 +518,11 @@ def parse_args():
                         help="To launch runtimes with night system profiling.")
     parser.add_argument("--be_batch_size", type=int, default=0,
                         help="launch runtimes with be beatch size")
-    parser.add_argument('--cpp', default=False, action='store_true',
-                        help="To launch CPP version runtimes.")
     parser.add_argument('--manualLaunch', default=False, action='store_true',
                         help="Do not runtimes automatically. Primarily for using gdb on runtime processes.")
     parser.add_argument("--logdir", type=str, default="", help="Full path of log directory")
+    parser.add_argument("--hostfile", type=str, default="", help="Path to file that describes hosts and gpus")
+    parser.add_argument('--cpp', default=False, action='store_true')
     parser.add_argument("--gpus", type=int, default=0, help="Number of GPUs to use.")
     # For installing nsys.. (with other cuda toolkit..)
     # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1804/x86_64/cuda-ubuntu1804.pin
@@ -561,6 +533,20 @@ def parse_args():
     # sudo apt-get -y install cuda
 
     return parser.parse_known_args()
+
+def read_location_file(fn):
+    locations = []
+    with open(fn) as f:
+      lines = f.read().splitlines()
+    for line in lines:
+      line = line.strip()
+      if not line or line[0] in ["#", "/"]: continue
+      fields = line.strip().split(",")
+      host = fields[0]
+      gpuIdx = int(fields[1])
+      loc = Location(host, 0, gpuIdx, None, None)
+      locations.append(loc)
+    return locations
 
 def main():
     global args, extra_args
@@ -573,22 +559,25 @@ def main():
     locations = []
 #    for serverConfig in clusterConfig["serverList"]:
 #        print("Found %s" % str(serverConfig))
+    if args.hostfile:
+        locations = read_location_file(args.hostfile)
+    else:
+        locations = discover_local_gpu_numa()
+
     port = 11270
     # ----- BEGIN FastNICS Mods -----
-    # Note: Returns [0, 0, 0, 0, 1, 1, 1, 1] for 8 GPUs
-    gpus = discover_gpu_numa()
-    if args.gpus > 0:
-        print("Changing GPUs from %s to..." % str(gpus))
-        if args.gpus < len(gpus):
-            gpus = gpus[:args.gpus]
-    print("GPUs %s" % str(gpus))
+    if not args.hostfile:
+        # Note: Returns list of Location objects, one for each GPU
+        if args.gpus > 0:
+            print("Changing GPUs from %d to..." % len(locations))
+            if args.gpus < len(locations):
+                locations = locations[:args.gpus]
+        print("GPUs %d" % len(locations))
     # ----- END FastNICs Mods -----
-    for idx, node in gpus:
-        rankToIpMap[str(len(locations))] = f"127.0.0.1:{port}"
-        commGrpRanksWorld.append(len(locations))
-        loc = Location("127.0.0.1", port, idx, None, None, args.cpp)
-        loc.numa_node = node
-        locations.append(loc)
+    for idx, loc in enumerate(locations):
+        rankToIpMap[str(idx)] = f"127.0.0.1:{port}"
+        commGrpRanksWorld.append(idx)
+        loc.port = port
         port += 1
     addrToBindCombo = re.split('[-:]', args.addrToBind)
     addrToBind = addrToBindCombo[0]
@@ -598,14 +587,7 @@ def main():
     if args.install:
         coordinator.installPackages()
 
-    # Just make sure there's no previously left runtimes.
-    # CPP runtimes seem to terminate appropriately. So, there's no need to shutdown leftovers.
-    if not args.cpp:
-        print("Cleaning up potentially leftover runtime servers from previous experiment.")
-        coordinator.shutdownRuntimeAll()
-        time.sleep(10)
-
-    coordinator.launchRuntimeAll(args.c10dBackend, profile=args.profile, cppRuntime=args.cpp, manualLaunch=args.manualLaunch)
+    coordinator.launchRuntimeAll(args.c10dBackend, profile=args.profile, manualLaunch=args.manualLaunch)
     print("All runtime nodes are up and running. Now, initializing communication backend..")
     coordinator.initCommBackendAll(args.c10dBackend, commGrpRanksWorld)
     print("Communication backends are ready at all locations.")
