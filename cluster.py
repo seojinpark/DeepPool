@@ -217,6 +217,7 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         self.be_batch_size = be_batch_size
         self.commGroups = set()
         self.ongoingJobs = {} # Dict of contexts of ongoing jobs. Indexed by job name.
+        self.env = []
         f = open("runtimeResult.data", "w")
         f.close()
 
@@ -256,9 +257,11 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         moduleDescList = [job.dumpSingleRunnableModule(rank) for rank in range(gpusUsed)]
         tensorTags = self.buildCommTensorTags(moduleDescList)
         tensorTagsInJson = json.dumps(tensorTags)
-        for rank in range(gpusUsed):
-            with open(f"/tmp/rank{rank}.json", "wb") as f:
-                f.write(bytes(moduleDescList[rank].encode("utf-8")))
+        # TODO: Is this for debugging?  It does not seem to be used anywhere.
+        #       It was causing conflicts between users.
+        #for rank in range(gpusUsed):
+        #    with open(f"/tmp/rank{rank}.json", "wb") as f:
+        #        f.write(bytes(moduleDescList[rank].encode("utf-8")))
 
         commSets = self.buildNeededCommGroups(moduleDescList)
 
@@ -365,6 +368,11 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
         for location in self.locations:
             for pipPackage in pipPackages:
                 location.rsh("pip install %s" % pipPackage)
+
+    def setEnv(self, key: str, val: str):
+        if val is not None:
+            self.env.append(key + "=" + val)
+
     def launchRuntimeAll(self, c10dBackend: str, profile: bool, manualLaunch: bool):
         """ Launch runtime at all remote locations. Also registers the sighandler
             that cleanly shuts down all remote runtime servers.
@@ -388,8 +396,9 @@ class ClusterCoordinator(xmlrpc.server.SimpleXMLRPCServer):
                     numacmd = "numactl -N{nn} -m{nn}".format(nn=location.numa_node)
                 else:
                     numacmd = ""
+                envcmd = ' '.join(self.env)
                 self.processes.append(location.rshAsync(
-                    f"CUDA_VISIBLE_DEVICES={location.device} {numacmd} {nsysPrefix} {self.workDir}/csrc/build/runtime" + \
+                    f"CUDA_VISIBLE_DEVICES={location.device} {envcmd} {numacmd} {nsysPrefix} {self.workDir}/csrc/build/runtime" + \
                     " --myAddr %s:%d --device 0 --c10dBackend %s --rank %d --worldSize %d --logdir %s --be_batch_size %d %s" % \
                         (location.address, location.port, c10dBackend, i, len(self.locations), logdir, self.be_batch_size, " ".join(extra_args)) #+ \
                     , stdout=stdoutFp, stderr=stderrFp))
@@ -586,6 +595,24 @@ def main():
     coordinator = ClusterCoordinator(addrToBind, portToBind, locations, os.getcwd(), args.be_batch_size)
     if args.install:
         coordinator.installPackages()
+    if args.hostfile:
+        # TODO: These are the minimum environment variables needed
+        #       for the runtime processes.
+        #       Maybe there is a better way to do this.
+        envVarKeys = [ "LD_LIBRARY_PATH",
+                       "CUDA_LAUNCH_BLOCKING",
+                       "SCCL_XML_FILES",
+                       "NCCL_ALGO",
+                       "NCCL_PROTO",
+                       "NCCL_DEBUG",
+                       "NCCL_DEBUG_SUBSYS",
+                       "NCCL_P2P_DISABLE",
+                       "NCCL_NET",
+                       "NCCL_SHM_DISABLE",
+                       "NCCL_IB_GID_INDEX",
+                       "NCCL_TOPO_FILE" ]
+        for key in envVarKeys:
+            coordinator.setEnv(key, os.environ.get(key))
 
     coordinator.launchRuntimeAll(args.c10dBackend, profile=args.profile, manualLaunch=args.manualLaunch)
     print("All runtime nodes are up and running. Now, initializing communication backend..")
