@@ -275,21 +275,21 @@ void CommunicationHandlerNCCL::testAllReduce() {
   if (rtctx->worldSize == 1) return;
 
   /* sum */
-  torch::Tensor t = torch::full({16, 16}, rtctx->rank + 1, rtctx->c10dev);
+  torch::Tensor t = torch::full({32, 32}, rtctx->rank + 1, rtctx->c10dev);
   comm_start();
   all_reduce(t, c10d::ReduceOp::SUM);
   comm_end();
   sync();
   int sum = 0;
   for (int i = 1; i < rtctx->worldSize + 1; i++) sum += i;
-  torch::Tensor expected = torch::full({16, 16}, sum, rtctx->c10dev);
+  torch::Tensor expected = torch::full({32, 32}, sum, rtctx->c10dev);
   assert(at::equal(t, expected));
 
   /* prod */
   int prod = 1;
   for (int i = 1; i < rtctx->worldSize + 1; i++) prod *= i;
-  t = torch::full({16, 16}, rtctx->rank + 1, rtctx->c10dev);
-  expected = torch::full({16, 16}, prod, rtctx->c10dev);
+  t = torch::full({32, 32}, rtctx->rank + 1, rtctx->c10dev);
+  expected = torch::full({32, 32}, prod, rtctx->c10dev);
   comm_start();
   all_reduce(t, c10d::ReduceOp::PRODUCT);
   comm_end();
@@ -297,8 +297,8 @@ void CommunicationHandlerNCCL::testAllReduce() {
   assert(at::equal(t, expected));
 
   /* max */
-  t = torch::full({16, 16}, rtctx->rank + 1, rtctx->c10dev);
-  expected = torch::full({16, 16}, rtctx->worldSize, rtctx->c10dev);
+  t = torch::full({32, 32}, rtctx->rank + 1, rtctx->c10dev);
+  expected = torch::full({32, 32}, rtctx->worldSize, rtctx->c10dev);
   comm_start();
   all_reduce(t, c10d::ReduceOp::MAX);
   comm_end();

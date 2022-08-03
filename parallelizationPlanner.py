@@ -1796,7 +1796,8 @@ class CostSim:
                 rn = lastCfg
 
             config = configCandidates[rn]
-            fw, bw = self.queryFwBwTime(layer, config)
+            # fw, bw = self.queryFwBwTime(layer, config)
+            fw, bw = 0,0
             tot_fw += fw
             tot_bw += bw
             gpuTime = fw + bw

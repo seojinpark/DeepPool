@@ -559,7 +559,7 @@ def read_location_file(fn):
 
 def main():
     global args, extra_args
-    print("Arguments: %s" % str(sys.argv))
+    #print("Arguments: %s" % str(sys.argv))
     args, extra_args = parse_args()
 #    clusterConfig = json.load(open(args.pathToConfig))
     global rankToIpMap
@@ -578,10 +578,10 @@ def main():
     if not args.hostfile:
         # Note: Returns list of Location objects, one for each GPU
         if args.gpus > 0:
-            print("Changing GPUs from %d to..." % len(locations))
+            #print("Changing GPUs from %d to..." % len(locations))
             if args.gpus < len(locations):
                 locations = locations[:args.gpus]
-        print("GPUs %d" % len(locations))
+        #print("GPUs %d" % len(locations))
     # ----- END FastNICs Mods -----
     for idx, loc in enumerate(locations):
         rankToIpMap[str(idx)] = f"127.0.0.1:{port}"
@@ -595,27 +595,26 @@ def main():
     coordinator = ClusterCoordinator(addrToBind, portToBind, locations, os.getcwd(), args.be_batch_size)
     if args.install:
         coordinator.installPackages()
+    # If starting remote runtime processes, then copy necessary environment variables over to the
+    # new processes in the ssh commands.
     if args.hostfile:
-        # TODO: These are the minimum environment variables needed
-        #       for the runtime processes.
-        #       Maybe there is a better way to do this.
+        # Set "special" environment variables in the runtime processes.
         envVarKeys = [ "LD_LIBRARY_PATH",
                        "CUDA_LAUNCH_BLOCKING",
-                       "SCCL_XML_FILES",
-                       "NCCL_ALGO",
-                       "NCCL_PROTO",
-                       "NCCL_DEBUG",
-                       "NCCL_DEBUG_SUBSYS",
-                       "NCCL_P2P_DISABLE",
-                       "NCCL_NET",
-                       "NCCL_SHM_DISABLE",
-                       "NCCL_IB_GID_INDEX",
-                       "NCCL_TOPO_FILE" ]
+                       "GRPC_TRACE",
+                       "GRPC_VERBOSITY" ]
         for key in envVarKeys:
             coordinator.setEnv(key, os.environ.get(key))
+        # Set any environment variables that contain "NCCL_" or "SCCL_" in the runtime processes.
+        for key, value in os.environ.items():
+            if key != None:
+                if "NCCL_" in key or "SCCL_" in key:
+                    coordinator.setEnv(key, value)
 
     coordinator.launchRuntimeAll(args.c10dBackend, profile=args.profile, manualLaunch=args.manualLaunch)
-    print("All runtime nodes are up and running. Now, initializing communication backend..")
+    #print("All runtime nodes are up and running. Now, initializing communication backend..")
+    print("All runtime nodes are up and running.")
+    print("Configuring topology and collective schedules...")
     coordinator.initCommBackendAll(args.c10dBackend, commGrpRanksWorld)
     print("Communication backends are ready at all locations.")
     print("Now, cluster is ready to accept training jobs.")
