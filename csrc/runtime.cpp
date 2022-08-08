@@ -64,7 +64,7 @@ ABSL_FLAG(bool, use_be_graph, true, "");
 
 /* gradient sync parameters */
 ABSL_FLAG(bool, disable_grad_sync, false, "Disable gradient sync");
-ABSL_FLAG(bool, sync_coalesce, false,
+ABSL_FLAG(bool, sync_coalesce, true,
           "Coalesce all_reduce buffers into a single buffer");
 ABSL_FLAG(
     size_t, sync_tensor_pad, 8,
