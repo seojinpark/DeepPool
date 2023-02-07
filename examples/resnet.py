@@ -58,7 +58,7 @@ class BasicBlock(nn.Module):
     ) -> None:
         super(BasicBlock, self).__init__()
         if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
+            norm_layer = cs.BatchNorm2d
         if groups != 1 or base_width != 64:
             raise ValueError('BasicBlock only supports groups=1 and base_width=64')
         if dilation > 1:
@@ -114,7 +114,7 @@ class Bottleneck(nn.Module):
     ) -> None:
         super(Bottleneck, self).__init__()
         if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
+            norm_layer = cs.BatchNorm2d
         width = int(planes * (base_width / 64.)) * groups
         # Both self.conv2 and self.downsample layers downsample the input when stride != 1
         layerSideBranch = cs.layers[-1]
@@ -173,7 +173,7 @@ class ResNet(nn.Module):
     ) -> None:
         super(ResNet, self).__init__()
         if norm_layer is None:
-            norm_layer = nn.BatchNorm2d
+            norm_layer = cs.BatchNorm2d
         self._norm_layer = norm_layer
 
         self.inplanes = 64
