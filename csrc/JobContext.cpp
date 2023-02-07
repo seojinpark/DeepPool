@@ -181,7 +181,8 @@ void JobContext::Test() {
 
     auto batch = eval_dataset_->getNext();
     for (auto &input : batch.data)
-      if (input.defined()) input.to(rtctx->c10dev);
+      if (input.defined())
+        input = input.to(rtctx->c10dev);
     auto output = Infer(batch.data);
     if (output.defined() && output.nbytes() > 0) {
       auto pred = output.argmax(1);
