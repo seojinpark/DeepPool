@@ -50,7 +50,7 @@ class ClusterClient:
                 retryGap *= 2 # exponential back off.
                 retryCount += 1
     
-    def submitTrainingJob(self, jobName: str, trainingJobInJSON: str, runbe=False, jobParams=None):
+    def submitTrainingJob(self, jobName: str, trainingJobInJSON: str, runbe=False, jobParams={}):
         f = open(jobName + ".json", "w")
         f.write(trainingJobInJSON)
         f.close()
