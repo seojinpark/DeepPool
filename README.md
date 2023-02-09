@@ -1,60 +1,72 @@
-# DeepPool Artifact
+# DeepPool
 
-## Instructions on how to run the VGG example
+## Install
 
-Ensure you have NVIDIA docker available on your system
-Download and run the PyTorch container:
+Ensure you have NVIDIA drivers available on your system, and the NVIDIA Container Toolkit installed [https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html#docker].
+Download and run the NVIDIA PyTorch container with DeepPool and the data mounted:
 ```
-docker run --gpus all --network="host" -it --rm nvcr.io/nvidia/pytorch:22.01-py3
+docker run \
+    --gpus all \
+    --network="host" \
+    --shm-size 4G \
+    -it \
+    --rm \
+    -v "$(pwd)"/DeepPool:/DeepPool \
+    -v "$(pwd)"/Data:/Data \
+    nvcr.io/nvidia/pytorch:22.01-py3
 ```
-In the container, clone the DeepPool repo:
-```
-git clone https://github.com/joshuafried/DeepPool-Artifact
-````
 
-Enter the directory and build DeepPool:
+Now in the container, build DeepPool:
 ```
-cd DeepPool-Artifact
+cd /DeepPool
 bash build.sh
 ```
 
-Now you can launch the DeepPool cluster coordinator as a background job:
+## Data
+
+In `deeppoolexample/main.py` you provide a filepath to a CSV file that contains a list of image-label pairs. An exmaple CSV file looks like the below
 ```
-python3 cluster.py  --addrToBind 0.0.0.0:12347 --c10dBackend nccl --be_batch_size=0 --cpp --logdir=$PWD &
+/Data/catsDogs/train/dog.9636.jpg,1
+/Data/catsDogs/train/cat.3267.jpg,0
+/Data/catsDogs/train/cat.8683.jpg,0
+/Data/catsDogs/train/cat.4511.jpg,0
+/Data/catsDogs/train/dog.11091.jpg,1
 ```
 
-Once you see "Now, cluster is ready to accept training jobs." you may launch a job.
-For example, to run VGG across 8 GPUs in DataParallel mode with global batch size 32, run:
+For the example of the CatsDogs dataset, the code for loading and pre-processing can be seen in `/DeepPool/csrc/catsDogs.cpp` and `/DeepPool/csrc/dataset.cpp`. The number of workers to be used for dataloading is defined in `/DeepPool/csrc/dataset.cpp`, in the line
 ```
-python3 examples/vgg.py 8 32 DP 0
+  loader =
+      torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(
+          std::move(c), torch::data::DataLoaderOptions().batch_size(globalBatchSize).workers(16).drop_last(true));
 ```
-To run VGG in BurstParallel mode with an amplification limit of 5.0:
+where a good rule of thumb is to set the number of workers equal to the number of CPU cores available. If you get an error like `Caught signal 11 (Segmentation fault: address not mapped to object at address 0x7f96280568f4)`, then you are overloading your CPU and need to either decrease the batch size or the number of workers.
+
+After changing any c++ code, you rebuild the project with `./build.sh`.
+
+## Run
+
+Launch the cluster coordinator:
 ```
-python3 examples/vgg.py 8 32 5.0 0
+python cluster.py \
+    --addrToBind 127.0.0.1:12347 \
+    --hostfile hostfile.txt \
+    --be_batch_size=0 \
+    --cpp \
+    --logdir /DeepPool/logs
 ```
 
-To view the results of the run, inspect the contents of cpprt0.out:
+Once you see "Now, cluster is ready to accept training jobs." you may launch a job in another terminal.
+For example, to run ResNet18 with global batch size 32, run:
 ```
-tail cpprt0.out
+python deeppool_example/main.py 32
 ```
-When a job completes, you will see a line of output indicating the iteration such as:
+
+To view the results of the run, inspect the contents of `logs/cpprt0.out`. For more detailed logs, like forward and backward times, look in the `logs/runtime` logs. When the job completes, you will see a line similar to the below in `logs/cpprt0.out`.
 ```
 A training job vgg16_8_32_2.0_DP is completed (1800 iters, 13.57 ms/iter, 73.71 iter/s, 0.00 be img/s, 32 globalBatchSize).
 ```
 
-
-To kill the cluster, run
+Hitting Ctrl-C should kill the cluster, but if there are ever lingering processes, run
 ```
 pkill runtime
-```
-
-Now re-run VGG with a background training job:
-```
-python3 examples/vgg_be.py
-python3 cluster.py  --addrToBind 0.0.0.0:12347 --c10dBackend nccl --be_batch_size=8  --cpp --logdir=$PWD --be_jit_file=vgg.jit --sample_per_kernel=8 &
-```
-Once the cluster is running:
-```
-python3 examples/vgg.py 8 32 DP 1
-python3 examples/vgg.py 8 32 5.0 1
 ```
