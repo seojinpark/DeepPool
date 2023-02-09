@@ -164,7 +164,7 @@ class ResNet(nn.Module):
         self,
         block: Type[Union[BasicBlock, Bottleneck]],
         layers: List[int],
-        num_classes: int = 1000,
+        num_classes: int = 2,
         zero_init_residual: bool = False,
         groups: int = 1,
         width_per_group: int = 64,
@@ -428,7 +428,7 @@ def wide_resnet101_2(pretrained: bool = False, progress: bool = True, **kwargs: 
 def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=False, netBw=2.66E5, spatialSplit=False, simResultFilename=None, simOnly=False, use_be=False):
     global cs
     cs = CostSim(None, netBw=netBw, verbose=True, gpuProfileLoc="resnetLayerGpuProfileA100V2.txt", gpuProfileLocSub="resnetLayerGpuProfileA100.txt")
-    model = resnet34()
+    model = resnet18()
     # model = resnet152()
     # model = wide_resnet101_2()
     cs.printAllLayers(silent=True)
@@ -452,7 +452,13 @@ def main(gpuCount, globalBatch, amplificationLimit=2.0, dataParallelBaseline=Fal
         cc = ClusterClient()
         jobName = "Resnet34_%d_%d_%2.1f%s" % (gpuCount, globalBatch, amplificationLimit, "_DP" if dataParallelBaseline else "")
         jobName += "_BE" if use_be else ""
-        cc.submitTrainingJob(jobName, jobInJson, use_be)
+        jobParams = {}
+        jobParams["catsdogs"] = True
+
+        jobParams['evaluation_data'] = "/Data/catsDogs/test.csv"
+        jobParams['training_data'] = "/Data/catsDogs/train.csv"
+
+        cc.submitTrainingJob(jobName, jobInJson, use_be, jobParams)
 
     if simResultFilename != None:
         f = open(simResultFilename, "a")

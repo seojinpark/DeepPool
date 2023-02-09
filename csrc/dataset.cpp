@@ -4,10 +4,11 @@
 #include <torch/torch.h>
 
 #include "cifar10.h"
+#include "catsDogs.h"
 #include "logger.h"
 
 ABSL_FLAG(std::string, cifar_dataset,
-          "/home/friedj/mlsf/multimodel/data/cifar-10-batches-bin/", "");
+          "/home/friedj/data/cifar-10-batches-bin/", "");
 
 class FakeDataset : public Dataset {
  public:
@@ -49,6 +50,7 @@ class CifarDataset : public Dataset {
       loader;
 };
 
+
 FakeDataset::FakeDataset(size_t rank, long globalBatchSize,
                          std::vector<std::shared_ptr<Layer>> input_layers,
                          std::vector<long> sampleIndices,
@@ -63,8 +65,13 @@ size_t FakeDataset::GetItersPerEpoch() { return batches_per_epoch_; };
 
 bool FakeDataset::IsDone() { return ctr_ >= batches_per_epoch_; }
 
-Example FakeDataset::getNext() {
+Example FakeDataset::getNext()
+{
   assert(!IsDone());
+
+  // std::cout << cached_[ctr_++ % cached_.size()].target << std::endl;
+  //   std::cout << cached_[ctr_++ % cached_.size()].data[0] << std::endl;
+
   return cached_[ctr_++ % cached_.size()];
 }
 
@@ -73,7 +80,8 @@ void FakeDataset::Reset() { ctr_ = 0; }
 CifarDataset::CifarDataset(size_t rank, long globalBatchSize,
                            std::vector<std::shared_ptr<Layer>> input_layers,
                            std::vector<long> sampleIndices, bool is_eval)
-    : Dataset(rank, globalBatchSize, input_layers, sampleIndices) {
+    : Dataset(rank, globalBatchSize, input_layers, sampleIndices)
+{
   DP_LOG(DEBUG, "Using CIFAR dataset");
   auto c = CIFAR10(absl::GetFlag(FLAGS_cifar_dataset),
                    is_eval ? CIFAR10::Mode::kTest : CIFAR10::Mode::kTrain)
@@ -87,7 +95,8 @@ CifarDataset::CifarDataset(size_t rank, long globalBatchSize,
   cur_iter = loader->begin();
 }
 
-bool CifarDataset::IsDone() {
+bool CifarDataset::IsDone()
+{
   if (cur_iter == loader->end())
     return true;
   else if (cur_iter.value()->data.sizes().vec()[0] < globalBatchSize_)
@@ -96,7 +105,8 @@ bool CifarDataset::IsDone() {
   return false;
 }
 
-Example CifarDataset::getNext() {
+Example CifarDataset::getNext()
+{
   assert(!IsDone());
   auto cur_example = *cur_iter.value();
   cur_iter = ++cur_iter.value();
@@ -107,24 +117,127 @@ size_t CifarDataset::GetItersPerEpoch() { return batches_per_epoch_; };
 
 void CifarDataset::Reset() { cur_iter = loader->begin(); }
 
+class CatsDogsDataset : public Dataset
+{
+public:
+  CatsDogsDataset(size_t rank, long globalBatchSize,
+                  std::vector<std::shared_ptr<Layer>> input_layers,
+                  std::vector<long> sampleIndices, bool is_eval, std::string filepath);
+  Example getNext() override;
+  bool IsDone() override;
+  void Reset() override;
+  size_t GetItersPerEpoch() override;
+
+private:
+  c10::optional<torch::data::Iterator<torch::data::Example<>>> cur_iter;
+  size_t batches_per_epoch_;
+
+  std::unique_ptr<torch::data::StatelessDataLoader<
+      torch::data::datasets::MapDataset<
+              CatsDogs, torch::data::transforms::Stack<torch::data::Example<>>>,
+      torch::data::samplers::RandomSampler>>
+      loader;
+};
+
+CatsDogsDataset::CatsDogsDataset(size_t rank, long globalBatchSize,
+                                 std::vector<std::shared_ptr<Layer>> input_layers,
+                                 std::vector<long> sampleIndices, bool is_eval, std::string filepath)
+    : Dataset(rank, globalBatchSize, input_layers, sampleIndices)
+{
+  DP_LOG(NOTICE, "Using CatsDogs dataset");
+
+  auto c = CatsDogs(filepath)
+               .map(torch::data::transforms::Stack<>());
+  batches_per_epoch_ = c.size().value() / globalBatchSize;
+  loader =
+      torch::data::make_data_loader<torch::data::samplers::RandomSampler>(
+          std::move(c), torch::data::DataLoaderOptions().batch_size(globalBatchSize).workers(16).drop_last(true));
+
+      // torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(
+          // std::move(c), torch::data::DataLoaderOptions().batch_size(globalBatchSize).drop_last(true)); // good rule of thumb is number of workers equal to CPU cores
+  cur_iter = loader->begin();
+}
+
+bool CatsDogsDataset::IsDone()
+{
+  if (cur_iter == loader->end())
+  {
+    return true;
+  }
+  else if (cur_iter.value()->data.sizes().vec()[0] < globalBatchSize_)
+  {
+    return true;
+  }
+
+  return false;
+}
+
+Example CatsDogsDataset::getNext()
+{
+  assert(!IsDone());
+  auto cur_example = *cur_iter.value();
+  cur_iter = ++cur_iter.value();
+
+  // std::cout << cur_example.target << std::endl;
+  // std::cout << cur_example.data << std::endl;
+
+  // converts pytorch Example to our own class Example
+  return globalToPerRankExample({cur_example.data, cur_example.target});
+}
+
+size_t CatsDogsDataset::GetItersPerEpoch() { return batches_per_epoch_; };
+
+void CatsDogsDataset::Reset()
+{
+  cur_iter = loader->begin();
+}
+
 Dataset *Dataset::fromName(std::string name, json jobParams, size_t rank,
                            long globalBatchSize,
                            std::vector<std::shared_ptr<Layer>> input_layers,
                            std::vector<long> sampleIndices,
-                           size_t fake_train_iters_per_epoch) {
+                           size_t fake_train_iters_per_epoch)
+{
+
   bool eval = name.find("eval") != std::string::npos;
   if (name.find("cifar") != std::string::npos)
+  {
     return new CifarDataset(rank, globalBatchSize, input_layers, sampleIndices,
                             eval);
+  }
+
+  if (name.find("catsDogs") != std::string::npos)
+  {
+    // evaluation dataset is different from training dataset
+    if (jobParams.contains("evaluation_data") && eval)
+    {
+      std::string data_path = jobParams["evaluation_data"].get<std::string>();
+      return new CatsDogsDataset(rank, globalBatchSize, input_layers, sampleIndices,
+                                 eval, data_path);
+    }
+
+    if (jobParams.contains("training_data"))
+    {
+      std::string data_path = jobParams["training_data"].get<std::string>();
+      return new CatsDogsDataset(rank, globalBatchSize, input_layers, sampleIndices,
+                                 eval, data_path);
+    }
+    else
+    {
+      DP_LOG(DEBUG, "CatsDogs dataset cannot be used unless a filepath to the labeled csv is given. Add \"training_data\":\"my/path/some_data.csv\" to the job parameters.");
+    }
+  }
 
   long fake_samples = globalBatchSize * fake_train_iters_per_epoch;
 
-  if (name.find("gpt2") != std::string::npos) {
+  if (name.find("gpt2") != std::string::npos)
+  {
     DP_LOG(DEBUG, "Using GPT2 fake dataset");
     auto dopts = torch::TensorOptions().dtype(torch::kInt32);
     auto topts =
         torch::TensorOptions().dtype(torch::kInt64).requires_grad(false);
-    auto gen = [=] {
+    auto gen = [=]
+    {
       auto data = torch::randint(/*low=*/0, /*high=*/1024,
                                  {globalBatchSize, 1024}, dopts);
       auto target = torch::randint(/*low=*/0, /*high=*/1024,
@@ -135,10 +248,12 @@ Dataset *Dataset::fromName(std::string name, json jobParams, size_t rank,
                            gen, eval ? 1000 : fake_samples);
   }
 
-  if (name.find("dlrm") != std::string::npos) {
+  if (name.find("dlrm") != std::string::npos)
+  {
     DP_LOG(DEBUG, "Using dlrm fake dataset");
     auto targetOpts = torch::TensorOptions().requires_grad(false);
-    auto gen = [=] {
+    auto gen = [=]
+    {
       assert(jobParams.contains("dlrm_m_den"));
       assert(jobParams.contains("dlrm_emb_size"));
       assert(jobParams.contains("dlrm_nr_emb"));
@@ -158,7 +273,8 @@ Dataset *Dataset::fromName(std::string name, json jobParams, size_t rank,
       auto dense = torch::randn({globalBatchSize, m_den});
       std::vector<torch::Tensor> inputs;
       inputs.push_back(dense);
-      for (int64_t i = 0; i < nr_emb; i++) {
+      for (int64_t i = 0; i < nr_emb; i++)
+      {
         inputs.push_back(
             torch::randint(0, emb_size, {globalBatchSize, indices_per_lookup})
                 .to(torch::kInt64));
@@ -174,9 +290,11 @@ Dataset *Dataset::fromName(std::string name, json jobParams, size_t rank,
   DP_LOG(DEBUG, "Using fake dataset");
   auto targetOpts =
       torch::TensorOptions().dtype(torch::kInt64).requires_grad(false);
-  auto gen = [=] {
+  auto gen = [=]
+  {
     std::vector<torch::Tensor> ts;
-    for (auto &iLayer : input_layers) {
+    for (auto &iLayer : input_layers)
+    {
       assert(iLayer->emptyInSizes.size() == 1);
       auto inDim = iLayer->emptyInSizes[0];
       inDim[0] = globalBatchSize;

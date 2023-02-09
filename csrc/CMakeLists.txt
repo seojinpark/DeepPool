@@ -6,10 +6,17 @@ list(APPEND CMAKE_MODULE_PATH "$ENV{CONDA_PREFIX}/lib/cmake/")
 list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}/lib/python3.9/site-packages/torch/")
 list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}/lib/python3.8/site-packages/torch/")
 list(APPEND CMAKE_PREFIX_PATH "/opt/conda/lib/python3.8/site-packages/torch/")
+list(APPEND CMAKE_PREFIX_PATH "/home/friedj/nccl/build/")
+list(APPEND CMAKE_PREFIX_PATH "/usr/include/opencv2/")  
 
+find_library(nccl libnccl.so)
+include_directories(/home/friedj/nccl/build/include)
+link_directories(/home/friedj/nccl/build/lib)
+link_directories(/home/friedj/miniconda3/envs/ptsrc/lib)
 add_subdirectory(grpc)
 
 find_package(Torch REQUIRED)
+find_package(OpenCV REQUIRED)  
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
@@ -78,6 +85,7 @@ add_custom_command(
 # Include generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
+
 # dp_grpc_proto
 add_library(dp_grpc_proto
   ${dp_grpc_srcs}
@@ -93,16 +101,21 @@ target_link_libraries(dp_grpc_proto
 add_executable(runtime
   "runtime.cpp" "runnableModule.cpp" "JobContext.cpp" "logger.cpp"
   "communication.cpp" "rpcService.cpp" "GraphPieces.cpp" "BeTask.cpp" "Manager.cpp"
-  "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" "cifar10.cpp" "dataset.cpp" "GradSync.cpp" "CUDAGraph.cpp")
+  "CodeLocation.cpp" "Cycles.cpp" "SpinLock.cpp" "ThreadId.cpp" "cifar10.cpp" "catsDogs.cpp" "dataset.cpp" "GradSync.cpp" "CUDAGraph.cpp")
+
 target_link_libraries(runtime
   dp_grpc_proto
   cudasleep
 #  proflib
   absl::flags absl::flags_parse
   nccl
+  #iomp5
   ${_REFLECTION}
   ${_GRPC_GRPCPP}
   ${_PROTOBUF_LIBPROTOBUF}
-  ${TORCH_LIBRARIES})
+  ${TORCH_LIBRARIES}
+  ${OpenCV_LIBS})
+
+target_link_options(runtime INTERFACE -lmkl_intel_ilp64 -lmkl_core -lmkl_intel_thread -liomp5 -lpthread)
 
 set_property(TARGET runtime PROPERTY CXX_STANDARD 14)
