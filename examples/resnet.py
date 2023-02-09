@@ -33,13 +33,13 @@ model_urls = {
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
     """3x3 convolution with padding"""
-    return cs.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
                      padding=dilation, groups=groups, bias=False, dilation=dilation)
 
 
 def conv1x1(in_planes: int, out_planes: int, stride: int = 1, custom_previous_layers: list = None) -> nn.Conv2d:
     """1x1 convolution"""
-    return cs.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False, custom_previous_layers=custom_previous_layers)
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False, custom_previous_layers=custom_previous_layers)
 
 
 class BasicBlock(nn.Module):
@@ -58,7 +58,7 @@ class BasicBlock(nn.Module):
     ) -> None:
         super(BasicBlock, self).__init__()
         if norm_layer is None:
-            norm_layer = cs.BatchNorm2d
+            norm_layer = nn.BatchNorm2d
         if groups != 1 or base_width != 64:
             raise ValueError('BasicBlock only supports groups=1 and base_width=64')
         if dilation > 1:
@@ -66,7 +66,7 @@ class BasicBlock(nn.Module):
         # Both self.conv1 and self.downsample layers downsample the input when stride != 1
         self.conv1 = conv3x3(inplanes, planes, stride)
         self.bn1 = norm_layer(planes)
-        self.relu = cs.ReLU(inplace=False)
+        self.relu = nn.ReLU(inplace=False)
         self.conv2 = conv3x3(planes, planes)
         self.bn2 = norm_layer(planes)
         self.downsample = downsample
@@ -114,25 +114,20 @@ class Bottleneck(nn.Module):
     ) -> None:
         super(Bottleneck, self).__init__()
         if norm_layer is None:
-            norm_layer = cs.BatchNorm2d
+            norm_layer = nn.BatchNorm2d
         width = int(planes * (base_width / 64.)) * groups
         # Both self.conv2 and self.downsample layers downsample the input when stride != 1
-        layerSideBranch = cs.layers[-1]
+        layerSideBranch = nn.layers[-1]
         self.conv1 = conv1x1(inplanes, width)
         self.bn1 = norm_layer(width)
         self.conv2 = conv3x3(width, width, stride, groups, dilation)
         self.bn2 = norm_layer(width)
         self.conv3 = conv1x1(width, planes * self.expansion)
         self.bn3 = norm_layer(planes * self.expansion)
-        layerMainBranch = cs.layers[-1]
-        if False and downsampleParams is not None: # hack to test resnet152
-            convDownsample = conv1x1(*(downsampleParams[0]), [layerSideBranch])
-            layerSideBranch = cs.layers[-1]
-            self.downsample = nn.Sequential(convDownsample, norm_layer((downsampleParams[1])))
-        else:
-            self.downsample = None
-        # self.relu = cs.ReLU(inplace=True, custom_previous_layers=[layerMainBranch, layerSideBranch])
-        self.relu = cs.ReLU(inplace=False)
+        layerMainBranch = nn.layers[-1]
+        self.downsample = None
+        # self.relu = nn.ReLU(inplace=True, custom_previous_layers=[layerMainBranch, layerSideBranch])
+        self.relu = nn.ReLU(inplace=False)
         self.stride = stride
 
     def forward(self, x: Tensor) -> Tensor:
@@ -193,12 +188,19 @@ class ResNet(nn.Module):
         self.relu = cs.ReLU(inplace=False)
         self.maxpool = cs.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, 64, layers[0])
+        cs.GeneralLayer(self.layer1, "layer1", {}, mustTrace=True)
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
                                        dilate=replace_stride_with_dilation[0])
+        cs.GeneralLayer(self.layer2, "layer2", {}, mustTrace=True)
+
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2,
                                        dilate=replace_stride_with_dilation[1])
+        cs.GeneralLayer(self.layer3, "layer3", {}, mustTrace=True)
+
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
                                        dilate=replace_stride_with_dilation[2])
+        cs.GeneralLayer(self.layer4, "layer4", {}, mustTrace=True)
+
         self.avgpool = cs.AdaptiveAvgPool2d((1, 1))
         cs.Flatten()
         self.fc = cs.Linear(512 * block.expansion, num_classes)
