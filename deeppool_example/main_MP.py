@@ -7,8 +7,8 @@ from clusterClient import ClusterClient
 import resnet34_MP
 
 input_shape = (3,224,224)
-num_classes = 1000
-gloabal_batch_size = 64
+num_classes = 2
+gloabal_batch_size = 32
 GPU_count = 1
 
 cs = CostSim()

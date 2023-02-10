@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <fstream>
 #include <string>
-#include <map>
 #include <opencv2/opencv.hpp>
 
 // CatsDogs dataset
@@ -25,5 +24,4 @@ class CatsDogs : public torch::data::datasets::Dataset<CatsDogs> {
 
  private:
     std::vector<std::tuple<std::string, int>> data;
-    std::map<size_t, torch::data::Example<>> cache;
 };

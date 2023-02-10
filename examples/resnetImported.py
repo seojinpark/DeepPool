@@ -8,10 +8,8 @@ from torchvision.models import resnet18
 
 import torch
 
-torch.manual_seed(0)
-
 input_shape = (3,224,224)
-num_classes = 10
+num_classes = 2
 global_batch_size = int(sys.argv[1])
 GPU_count = 1
 

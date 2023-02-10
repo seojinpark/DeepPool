@@ -50,8 +50,6 @@ CatsDogs::CatsDogs(std::string root)
 torch::data::Example<> CatsDogs::get(size_t index)
 {
 
-    if (cache.count(index) > 0)
-        return cache[index];
 
     // images have 3 channels with values from 0-255. Size is not consistent, seen 200-500 for width and height values.
     // store image in Mat object
@@ -85,9 +83,7 @@ torch::data::Example<> CatsDogs::get(size_t index)
     // std::cerr << "Read image from " << image_path << std::endl;
 
 
-    // {images.to(torch::kFloat32).div_(255), targets.to(torch::kInt64)};
-    cache[index] = {tensor_image.to(torch::kFloat32).div_(255), label_tensor.to(torch::kInt64)};
-    return cache[index];
+    return  {tensor_image.to(torch::kFloat32).div_(255), label_tensor.to(torch::kInt64)};
 
     // fake data
     // torch::Tensor tensor_image = torch::zeros({3, 224, 224}, torch::kF32);
