@@ -137,7 +137,7 @@ private:
   std::unique_ptr<torch::data::StatelessDataLoader<
       torch::data::datasets::MapDataset<
           CatsDogs, torch::data::transforms::Stack<torch::data::Example<>>>,
-      torch::data::samplers::SequentialSampler>>
+      torch::data::samplers::RandomSampler>>
       loader;
   int iteration_count;
 };
@@ -153,7 +153,7 @@ CatsDogsDataset::CatsDogsDataset(size_t rank, long globalBatchSize,
                .map(torch::data::transforms::Stack<>());
   batches_per_epoch_ = c.size().value() / globalBatchSize;
   loader =
-      torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(
+      torch::data::make_data_loader<torch::data::samplers::RandomSampler>(
           std::move(c), torch::data::DataLoaderOptions().batch_size(globalBatchSize).workers(num_workers).drop_last(true));
 
   // torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(
@@ -165,12 +165,12 @@ bool CatsDogsDataset::IsDone()
 {
   if (cur_iter == loader->end())
   {
-    std::cout << "Total iterations: " << iteration_count << std::endl;
+    // std::cout << "Total iterations: " << iteration_count << std::endl;
     return true;
   }
   else if (cur_iter.value()->data.sizes().vec()[0] < globalBatchSize_)
   {
-    std::cout << "Total iterations: " << iteration_count << std::endl;
+    // std::cout << "Total iterations: " << iteration_count << std::endl;
     return true;
   }
 
