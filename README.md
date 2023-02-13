@@ -24,6 +24,8 @@ bash build.sh
 
 ## Data
 
+The CatsDogs dataset was downloaded from Kaggle [https://www.kaggle.com/competitions/dogs-vs-cats-redux-kernels-edition/data?select=train.zip]. The images in the Train directory were split into training data and evaluation data. A CSV file was generated for both training and evaluation, containing the filepaths and labels.
+
 In `deeppoolexample/main.py` you provide a filepath to a CSV file that contains a list of image-label pairs. An example CSV file looks like the below
 ```
 /Data/catsDogs/train/dog.9636.jpg,1
@@ -33,7 +35,7 @@ In `deeppoolexample/main.py` you provide a filepath to a CSV file that contains 
 /Data/catsDogs/train/dog.11091.jpg,1
 ```
 
-For the example of the CatsDogs dataset, the code for loading and pre-processing can be seen in `/DeepPool/csrc/catsDogs.cpp` and `/DeepPool/csrc/dataset.cpp`. A good rule of thumb is to set the number of workers equal to the number of CPU cores available. If you get an error like `Caught signal 11 (Segmentation fault: address not mapped to object at address 0x7f96280568f4)`, then you are overloading your CPU and need to either decrease the batch size, decrease the number of workers, or give more RAM to the docker container.
+For the example of the CatsDogs dataset, the code for loading and pre-processing can be seen in `/DeepPool/csrc/catsDogs.cpp` and `/DeepPool/csrc/dataset.cpp`. Dataloading is done in parallel by A good rule of thumb is to set the number of workers equal to the number of CPU cores available. If you get an error like `Caught signal 11 (Segmentation fault: address not mapped to object at address 0x7f96280568f4)`, then you are overloading your CPU and need to either decrease the batch size, decrease the number of workers, or give more RAM to the docker container.
 
 After changing any c++ code, you rebuild the project with `bash build.sh`.
 
