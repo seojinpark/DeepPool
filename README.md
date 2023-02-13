@@ -24,9 +24,9 @@ bash build.sh
 
 ## Data
 
-The CatsDogs dataset was downloaded from Kaggle [https://www.kaggle.com/competitions/dogs-vs-cats-redux-kernels-edition/data?select=train.zip]. The images in the Train directory were split into training data and evaluation data. A CSV file was generated for both training and evaluation, containing the filepaths and labels.
+The CatsDogs dataset was downloaded from Kaggle [https://www.kaggle.com/competitions/dogs-vs-cats-redux-kernels-edition/data?select=train.zip]. The images in the Train directory were split into training data and evaluation data. For each of these two new directories a CSV file was generated, containing the filepaths and labels for each image.
 
-In `deeppoolexample/main.py` you provide a filepath to a CSV file that contains a list of image-label pairs. An example CSV file looks like the below
+When submitting your model to the cluster you provide a filepath to a CSV file that contains a list of image-label pairs. An example CSV file looks like the below
 ```
 /Data/catsDogs/train/dog.9636.jpg,1
 /Data/catsDogs/train/cat.3267.jpg,0
@@ -35,7 +35,7 @@ In `deeppoolexample/main.py` you provide a filepath to a CSV file that contains 
 /Data/catsDogs/train/dog.11091.jpg,1
 ```
 
-For the example of the CatsDogs dataset, the code for loading and pre-processing can be seen in `/DeepPool/csrc/catsDogs.cpp` and `/DeepPool/csrc/dataset.cpp`. Dataloading is done in parallel by A good rule of thumb is to set the number of workers equal to the number of CPU cores available. If you get an error like `Caught signal 11 (Segmentation fault: address not mapped to object at address 0x7f96280568f4)`, then you are overloading your CPU and need to either decrease the batch size, decrease the number of workers, or give more RAM to the docker container.
+For the example of the CatsDogs dataset, the code for loading and pre-processing can be seen in `/DeepPool/csrc/catsDogs.cpp` and `/DeepPool/csrc/dataset.cpp`. Dataloading is done in parallel by multiple workers. You define how many when submitting the model to the cluster, a good rule of thumb is to set the number of workers equal to the number of CPU cores available. If you get an error like `Caught signal 11 (Segmentation fault: address not mapped to object at address 0x7f96280568f4)`, then you are overloading your CPU and need to either decrease the batch size, decrease the number of workers, or give more RAM to the docker container.
 
 After changing any c++ code, you rebuild the project with `bash build.sh`.
 
@@ -69,9 +69,9 @@ pkill runtime
 
 ## Multi-GPU
 
-Ensure that when you start the docker container that gives access to the gpus, most easily done with the flag `--gpus all`, or you can specify specific GPUs instead.
+Ensure that when you start the docker container that you give it access to the GPUs, most easily done with the flag `--gpus all`, or you can specify specific GPUs instead.
 
-Update the hostfile to point to multiple GPUs. For example, 4 GPUs on the local machine, the hostfile looks like
+Update the hostfile to point to multiple GPUs. For example, to specify 4 GPUs on the local machine, the hostfile looks like
 ```
 #address,gpu_idx
 127.0.0.1,0
@@ -80,4 +80,4 @@ Update the hostfile to point to multiple GPUs. For example, 4 GPUs on the local 
 127.0.0.1,3
 ```
 
-Now when you generate the job for your model, pass in the number of GPUs to be used, for `examples/resnetImported.py` tht would be in line `cs.searchBestSplitsV3(GPU_count, global_batch_size)`, where `GPU_count` has a value of 4.
+Now when you generate the job for your model, pass in the number of GPUs to be used. For `examples/resnetImported.py` that would be in line `cs.searchBestSplitsV3(GPU_count, global_batch_size)`, where `GPU_count` has a value of 4.
