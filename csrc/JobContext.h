@@ -88,7 +88,6 @@ class JobContext {
   std::shared_ptr<Dataset> train_dataset_;
   std::shared_ptr<Dataset> eval_dataset_;
   std::shared_ptr<DatasetPipelineWrapper> dataset_pipeline_;
-  std::shared_ptr<DatasetPipelineWrapper> eval_dataset_pipeline_;
 
   bool iter_in_progress{false};
   size_t totiters{0};                     // total iters executed

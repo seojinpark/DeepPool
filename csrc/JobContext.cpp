@@ -50,7 +50,7 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
     dset = "catsDogs";
     /* cifar default includes 10 epochs with test routine */
     runTestRoutine_ = true;
-    epochsToTrain = 20;
+    epochsToTrain = 1;
   } else if (job_params.contains("cifar_training") &&
       job_params["cifar_training"].get<bool>()) {
     dset = "cifar";
@@ -84,7 +84,6 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
     eval_dataset_.reset(Dataset::fromName(
         dset + "_eval", job_params, rtctx->rank, model->globalBatchSize,
         model->input_layers, model->sampleIndices, 10));
-    eval_dataset_pipeline_.reset(new DatasetPipelineWrapper(eval_dataset_));
   }
   if (!rtctx->use_fg_graph)
     iters_before_graph_capture = itersToTrain * epochsToTrain;
@@ -182,10 +181,10 @@ void JobContext::Test() {
     iters_before_graph_capture = totiters + 5;
 
   size_t i = 0;
-  while (!eval_dataset_pipeline_->IsDone()) {
+  while (!eval_dataset_->IsDone()) {
     total += model->GetGlobalBatchSize();
 
-    auto batch = eval_dataset_pipeline_->getNext();
+    auto batch = eval_dataset_->getNext();
     for (auto &input : batch.data)
       if (input.defined())
         input = input.to(rtctx->c10dev);
@@ -195,7 +194,7 @@ void JobContext::Test() {
       correct += pred.eq(batch.target.to(rtctx->c10dev)).sum();
     }
     DP_LOG(DEBUG, "Evaluate iteration %lu/%lu\n", ++i,
-           eval_dataset_pipeline_->GetItersPerEpoch());
+           eval_dataset_->GetItersPerEpoch());
   }
 
   iters_before_graph_capture = 0;
@@ -213,7 +212,7 @@ void JobContext::Test() {
   DP_LOG(NOTICE, "Evaluate: Total: %.1f Correct: %.1f | Accuracy: %.3f", total,
          corr, static_cast<double>(corr) / total);
   
-    eval_dataset_pipeline_->Reset();
+    eval_dataset_->Reset();
 }
 
 torch::Tensor JobContext::Infer(std::vector<torch::Tensor> inputs) {

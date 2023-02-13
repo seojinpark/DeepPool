@@ -82,7 +82,6 @@ torch::data::Example<> CatsDogs::get(size_t index)
 
     // std::cerr << "Read image from " << image_path << std::endl;
 
-
     return  {tensor_image.to(torch::kFloat32).div_(255), label_tensor.to(torch::kInt64)};
 
     // fake data

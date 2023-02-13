@@ -8,6 +8,9 @@
 #include "runnableModule.h"
 #include "runtime.h"
 #include "utils.h"
+#include <unordered_map>
+#include <iostream> 
+#include <sstream> 
 
 using namespace torch::indexing;
 

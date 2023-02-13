@@ -8,6 +8,9 @@
 #include <fstream>
 #include <string>
 #include <opencv2/opencv.hpp>
+#include <unordered_map>
+#include <iostream> 
+#include <sstream> 
 
 // CatsDogs dataset
 // based on: https://github.com/pytorch/pytorch/blob/master/torch/csrc/api/include/torch/data/datasets/mnist.h.

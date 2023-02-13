@@ -10,8 +10,9 @@
 ABSL_FLAG(std::string, cifar_dataset,
           "/home/friedj/data/cifar-10-batches-bin/", "");
 
-class FakeDataset : public Dataset {
- public:
+class FakeDataset : public Dataset
+{
+public:
   FakeDataset(size_t rank, long globalBatchSize,
               std::vector<std::shared_ptr<Layer>> input_layers,
               std::vector<long> sampleIndices, std::function<Example()> gen,
@@ -21,14 +22,15 @@ class FakeDataset : public Dataset {
   void Reset() override;
   size_t GetItersPerEpoch() override;
 
- private:
+private:
   size_t batches_per_epoch_;
   size_t ctr_{0};
   std::vector<Example> cached_;
 };
 
-class CifarDataset : public Dataset {
- public:
+class CifarDataset : public Dataset
+{
+public:
   CifarDataset(size_t rank, long globalBatchSize,
                std::vector<std::shared_ptr<Layer>> input_layers,
                std::vector<long> sampleIndices, bool is_eval);
@@ -37,7 +39,7 @@ class CifarDataset : public Dataset {
   void Reset() override;
   size_t GetItersPerEpoch() override;
 
- private:
+private:
   c10::optional<torch::data::Iterator<torch::data::Example<>>> cur_iter;
   size_t batches_per_epoch_;
 
@@ -50,12 +52,12 @@ class CifarDataset : public Dataset {
       loader;
 };
 
-
 FakeDataset::FakeDataset(size_t rank, long globalBatchSize,
                          std::vector<std::shared_ptr<Layer>> input_layers,
                          std::vector<long> sampleIndices,
                          std::function<Example()> gen, size_t samples_per_epoch)
-    : Dataset(rank, globalBatchSize, input_layers, sampleIndices) {
+    : Dataset(rank, globalBatchSize, input_layers, sampleIndices)
+{
   for (size_t i = 0; i < 64; i++)
     cached_.emplace_back(globalToPerRankExample(gen()));
   batches_per_epoch_ = samples_per_epoch / globalBatchSize;
@@ -122,7 +124,7 @@ class CatsDogsDataset : public Dataset
 public:
   CatsDogsDataset(size_t rank, long globalBatchSize,
                   std::vector<std::shared_ptr<Layer>> input_layers,
-                  std::vector<long> sampleIndices, bool is_eval, std::string filepath);
+                  std::vector<long> sampleIndices, bool is_eval, std::string filepath, int num_workers);
   Example getNext() override;
   bool IsDone() override;
   void Reset() override;
@@ -134,14 +136,15 @@ private:
 
   std::unique_ptr<torch::data::StatelessDataLoader<
       torch::data::datasets::MapDataset<
-              CatsDogs, torch::data::transforms::Stack<torch::data::Example<>>>,
-      torch::data::samplers::RandomSampler>>
+          CatsDogs, torch::data::transforms::Stack<torch::data::Example<>>>,
+      torch::data::samplers::SequentialSampler>>
       loader;
+  int iteration_count;
 };
 
 CatsDogsDataset::CatsDogsDataset(size_t rank, long globalBatchSize,
                                  std::vector<std::shared_ptr<Layer>> input_layers,
-                                 std::vector<long> sampleIndices, bool is_eval, std::string filepath)
+                                 std::vector<long> sampleIndices, bool is_eval, std::string filepath, int num_workers)
     : Dataset(rank, globalBatchSize, input_layers, sampleIndices)
 {
   DP_LOG(NOTICE, "Using CatsDogs dataset");
@@ -150,11 +153,11 @@ CatsDogsDataset::CatsDogsDataset(size_t rank, long globalBatchSize,
                .map(torch::data::transforms::Stack<>());
   batches_per_epoch_ = c.size().value() / globalBatchSize;
   loader =
-      torch::data::make_data_loader<torch::data::samplers::RandomSampler>(
-          std::move(c), torch::data::DataLoaderOptions().batch_size(globalBatchSize).workers(16).drop_last(true));
+      torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(
+          std::move(c), torch::data::DataLoaderOptions().batch_size(globalBatchSize).workers(num_workers).drop_last(true));
 
-      // torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(
-          // std::move(c), torch::data::DataLoaderOptions().batch_size(globalBatchSize).drop_last(true)); // good rule of thumb is number of workers equal to CPU cores
+  // torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(
+  // std::move(c), torch::data::DataLoaderOptions().batch_size(globalBatchSize).drop_last(true)); // good rule of thumb is number of workers equal to CPU cores
   cur_iter = loader->begin();
 }
 
@@ -162,10 +165,12 @@ bool CatsDogsDataset::IsDone()
 {
   if (cur_iter == loader->end())
   {
+    std::cout << "Total iterations: " << iteration_count << std::endl;
     return true;
   }
   else if (cur_iter.value()->data.sizes().vec()[0] < globalBatchSize_)
   {
+    std::cout << "Total iterations: " << iteration_count << std::endl;
     return true;
   }
 
@@ -177,6 +182,20 @@ Example CatsDogsDataset::getNext()
   assert(!IsDone());
   auto cur_example = *cur_iter.value();
   cur_iter = ++cur_iter.value();
+
+  iteration_count++;
+  // if (iteration_count < 10 || iteration_count > batches_per_epoch_ - 10)
+  // {
+  //   // save hash to make sure is valid
+  //   std::stringstream buffer;
+  //   buffer << cur_example.data;
+  //   std::hash<std::string> hasher;
+  //   size_t hash = hasher(buffer.str());
+
+  //   std::ofstream outfile;
+  //   outfile.open("imageHashes.txt", std::ios_base::app); // append instead of overwrite
+  //   outfile << iteration_count << " " << hash << std::endl;
+  // }
 
   // std::cout << cur_example.target << std::endl;
   // std::cout << cur_example.data << std::endl;
@@ -190,6 +209,7 @@ size_t CatsDogsDataset::GetItersPerEpoch() { return batches_per_epoch_; };
 void CatsDogsDataset::Reset()
 {
   cur_iter = loader->begin();
+  iteration_count = 0;
 }
 
 Dataset *Dataset::fromName(std::string name, json jobParams, size_t rank,
@@ -208,19 +228,31 @@ Dataset *Dataset::fromName(std::string name, json jobParams, size_t rank,
 
   if (name.find("catsDogs") != std::string::npos)
   {
+    int num_train_workers = 16;
+    if (jobParams.contains("num_train_workers"))
+    {
+      num_train_workers = jobParams["num_train_workers"].get<int>();
+    }
+    int num_eval_workers = 1;
+    if (jobParams.contains("num_eval_workers"))
+    {
+      num_eval_workers = jobParams["num_eval_workers"].get<int>();
+    }
     // evaluation dataset is different from training dataset
     if (jobParams.contains("evaluation_data") && eval)
     {
+      std::cout << " Using " << num_eval_workers << " eval workers" << std::endl;
       std::string data_path = jobParams["evaluation_data"].get<std::string>();
       return new CatsDogsDataset(rank, globalBatchSize, input_layers, sampleIndices,
-                                 eval, data_path);
+                                 eval, data_path, num_eval_workers);
     }
 
     if (jobParams.contains("training_data"))
     {
+      std::cout << " Using " << num_train_workers << " train workers" << std::endl;
       std::string data_path = jobParams["training_data"].get<std::string>();
       return new CatsDogsDataset(rank, globalBatchSize, input_layers, sampleIndices,
-                                 eval, data_path);
+                                 eval, data_path, num_train_workers);
     }
     else
     {
