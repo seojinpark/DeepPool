@@ -228,31 +228,25 @@ Dataset *Dataset::fromName(std::string name, json jobParams, size_t rank,
 
   if (name.find("catsDogs") != std::string::npos)
   {
-    int num_train_workers = 16;
-    if (jobParams.contains("num_train_workers"))
+    int num_workers = 1;
+    if (jobParams.contains("num_workers"))
     {
-      num_train_workers = jobParams["num_train_workers"].get<int>();
+      num_workers = jobParams["num_workers"].get<int>();
     }
-    int num_eval_workers = 1;
-    if (jobParams.contains("num_eval_workers"))
-    {
-      num_eval_workers = jobParams["num_eval_workers"].get<int>();
-    }
+
     // evaluation dataset is different from training dataset
     if (jobParams.contains("evaluation_data") && eval)
     {
-      std::cout << " Using " << num_eval_workers << " eval workers" << std::endl;
       std::string data_path = jobParams["evaluation_data"].get<std::string>();
       return new CatsDogsDataset(rank, globalBatchSize, input_layers, sampleIndices,
-                                 eval, data_path, num_eval_workers);
+                                 eval, data_path, num_workers);
     }
 
     if (jobParams.contains("training_data"))
     {
-      std::cout << " Using " << num_train_workers << " train workers" << std::endl;
       std::string data_path = jobParams["training_data"].get<std::string>();
       return new CatsDogsDataset(rank, globalBatchSize, input_layers, sampleIndices,
-                                 eval, data_path, num_train_workers);
+                                 eval, data_path, num_workers);
     }
     else
     {
