@@ -79,12 +79,14 @@ ABSL_FLAG(
 /**
  * Destructing RuntimeContext.
  */
-RuntimeContext::~RuntimeContext() {
+RuntimeContext::~RuntimeContext()
+{
   delete grpcService;
   delete grpcServer;
 }
 
-void initGrpcServer(RuntimeContext* ctx) {
+void initGrpcServer(RuntimeContext *ctx)
+{
   ctx->grpcService = new RuntimeServiceImpl(ctx);
   grpc::EnableDefaultHealthCheckService(true);
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();
@@ -98,7 +100,8 @@ void initGrpcServer(RuntimeContext* ctx) {
   // server->Wait();
 }
 
-void debugging(RuntimeContext* ctx) {
+void debugging(RuntimeContext *ctx)
+{
   DP_LOG(DEBUG, "runtime debugging function.");
 
   ServerContext serverCtx;
@@ -116,14 +119,16 @@ void debugging(RuntimeContext* ctx) {
   DP_LOG(DEBUG, "runtime debugging function exits.");
 }
 
-void debuggingGrpcComm() {
+void debuggingGrpcComm()
+{
   rtctx->rankToIpAndPort.resize(2);
   rtctx->rankToIpAndPort[0] = std::string("172.31.112.33:11140");
   rtctx->rankToIpAndPort[1] = std::string("172.31.112.33:11141");
   rtctx->grpcCommReady = true;
 }
 
-void grpcCommTest() {
+void grpcCommTest()
+{
   json tensorTags;
   json jobRankToGlobalRank;
   auto commHandler = std::make_unique<CommunicationHandlerGRPC>(
@@ -134,7 +139,8 @@ void grpcCommTest() {
   commHandler->testRingP2P();
 }
 
-void ncclCommTest() {
+void ncclCommTest()
+{
   json tensorTags;
   json jobRankToGlobalRank;
   auto commHandler = std::make_shared<CommunicationHandlerNCCL>(
@@ -151,7 +157,8 @@ void ncclCommTest() {
  *
  * \return  The number of jobs currently scheduled.
  */
-int RuntimeContext::addTrainingJob(std::unique_ptr<JobContext> job) {
+int RuntimeContext::addTrainingJob(std::unique_ptr<JobContext> job)
+{
   std::lock_guard<std::mutex> lock(jobListMutex);
   jobList.push_back(std::move(job));
   DP_LOG(LogLevel::NOTICE, "Added a new job. %s", jobList.back()->name.c_str());
@@ -163,26 +170,50 @@ int RuntimeContext::addTrainingJob(std::unique_ptr<JobContext> job) {
  *
  * \return The number of jobs that are executed (or scheduled to CUDA).
  */
-int RuntimeContext::poll() {
+int RuntimeContext::poll()
+{
   std::lock_guard<std::mutex> lock(jobListMutex);
 
-  if (jobList.empty()) {
+  if (jobList.empty())
+  {
     return 0;
   }
 
-  JobContext* mainJob = jobList[0].get();
+  JobContext *mainJob = jobList[0].get();
 
-  if (IsBeEnabled()) {
+  if (IsBeEnabled())
+  {
     if (mainJob->RunWithBe())
       GpuManager::getInstance()->EnableBe();
     else
       GpuManager::getInstance()->DisableBe();
   }
+  
+  // mainJob->restore_variables();
 
-  if (mainJob->ShouldRunTest()) mainJob->Test();
-  for (size_t i = 0; i < mainJob->GetEpochsToTrain(); i++) {
+  if (mainJob->ShouldRunTest())
+    mainJob->Test();
+  for (size_t i = 0; i < mainJob->GetEpochsToTrain(); i++)
+  {
+
+    std::chrono::_V2::steady_clock::time_point start = std::chrono::steady_clock::now();
+
     mainJob->TrainOneEpoch();
-    if (mainJob->ShouldRunTest()) mainJob->Test();
+
+    std::chrono::_V2::steady_clock::time_point end = std::chrono::steady_clock::now();
+    using msec = std::chrono::duration<double, std::milli>;
+    double elapsed_ms = std::chrono::duration_cast<msec>(end - start).count() / 1e3;
+    DP_LOG(
+        NOTICE,
+        "seconds per epoch : %.2f", elapsed_ms);
+
+    // mainJob->save_variables();
+    // mainJob->restore_variables();
+
+    if (mainJob->ShouldRunTest())
+      mainJob->Test();
+    
+
   }
 
   torch_stream.synchronize();
@@ -195,7 +226,8 @@ int RuntimeContext::poll() {
 
 static BeTaskConfig becfg;
 
-void parse_args(RuntimeContext& ctx, int argc, char** argv) {
+void parse_args(RuntimeContext &ctx, int argc, char **argv)
+{
   absl::ParseCommandLine(argc, argv);
 
 #define PARSEFLAG(x) ctx.x = absl::GetFlag(FLAGS_##x);
@@ -226,9 +258,10 @@ void parse_args(RuntimeContext& ctx, int argc, char** argv) {
   ctx.c10dev = c10::Device(c10::DeviceType::CUDA, ctx.device);
 }
 
-RuntimeContext* rtctx; /* global rtctx variable */
+RuntimeContext *rtctx; /* global rtctx variable */
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv)
+{
   // ProfilerInit(0);
   RuntimeContext ctx;
   rtctx = &ctx;
@@ -252,23 +285,28 @@ int main(int argc, char** argv) {
   std::cout << "myPID: " << getpid() << std::endl;
   initGrpcServer(&ctx);
 
-  if (ctx.debug) {
+  if (ctx.debug)
+  {
     debugging(&ctx);
     // debuggingGrpcComm();
   }
 
-  if (ctx.c10dBackend == "grpc") {
+  if (ctx.c10dBackend == "grpc")
+  {
     DP_LOG(DEBUG, "GRPC commBackend is used. Waiting for InitCommGRPC.");
-    while (!ctx.grpcCommReady.load(std::memory_order_relaxed)) {
+    while (!ctx.grpcCommReady.load(std::memory_order_relaxed))
+    {
     }
     DP_LOG(DEBUG, "InitCommGRPC done. Running test now.");
     grpcCommTest();
     DP_LOG(DEBUG, "GRPC comm test done.");
   }
 
-  if (ctx.c10dBackend == "nccl" && rtctx->worldSize > 1) {
+  if (ctx.c10dBackend == "nccl" && rtctx->worldSize > 1)
+  {
     DP_LOG(DEBUG, "NCCL commBackend is used. Waiting for InitCommNCCL.");
-    while (!ctx.ncclCommReady.load(std::memory_order_relaxed)) {
+    while (!ctx.ncclCommReady.load(std::memory_order_relaxed))
+    {
     }
     DP_LOG(DEBUG, "InitCommNCCL done. Running test now.");
     ncclCommTest();
@@ -276,7 +314,8 @@ int main(int argc, char** argv) {
 
   int version;
   CUDACHECK(cudaDriverGetVersion(&version));
-  if (version < 11040) {
+  if (version < 11040)
+  {
     std::cout
         << "WARNING: old cuda version detected, may have bugs with CUDA graphs"
         << std::endl;
@@ -288,7 +327,8 @@ int main(int argc, char** argv) {
         "WARNING: old cuda version detected, may have bugs with CUDA graphs");
   }
 
-  std::thread([&] {
+  std::thread([&]
+              {
     using namespace std::chrono;
     size_t lastc = GetBeCounter();
     size_t lastfg = ctx.fgcounter.load();
@@ -304,12 +344,14 @@ int main(int argc, char** argv) {
       lastt = now;
       lastc = newtr;
       lastfg = newfg;
-    }
-  }).detach();
+    } })
+      .detach();
 
-  std::cout << "poller is starting." << std::endl << std::flush;
+  std::cout << "poller is starting." << std::endl
+            << std::flush;
   DP_LOG(DEBUG, "Poller is starting.");
-  while (!ctx.shutdownRequested.load(std::memory_order_relaxed)) {
+  while (!ctx.shutdownRequested.load(std::memory_order_relaxed))
+  {
     ctx.poll();
   }
   std::cout << "poller exits." << std::endl;

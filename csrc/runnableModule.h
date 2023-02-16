@@ -85,6 +85,8 @@ struct Layer {
 
   torch::Tensor DoForward(RunnableModule *model, bool captureLayer);
   void DoBackward(RunnableModule *model, bool captureLayer);
+  void saveModule(std::string savePath){module.save(savePath);};
+  void loadModule(std::string loadPath){module = torch::jit::load(loadPath);};
 
   /* stores inputs on forward pass, gradients on backward pass */
   std::map<size_t, torch::Tensor> tensors_in;
@@ -243,6 +245,8 @@ class RunnableModule {
   void loss();
   void resetTimers();
   void SetupOptimizer();
+  void saveOptimizer(std::string savePath){torch::save(*optimizer.get(), savePath);};
+  void SetupOptimizer(std::string loadPath){torch::load(*optimizer.get(), loadPath);};
 
   ////////////////////////////////////////////
   // Internal data structure.

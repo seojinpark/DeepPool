@@ -44,6 +44,8 @@ class JobContext {
   bool RunWithBe() const { return run_with_be_; }
   size_t GetEpochsToTrain() const { return epochsToTrain; }
   bool ShouldRunTest() const { return runTestRoutine_; }
+  void save_variables(); 
+  void restore_variables();
 
   /* Run a sample through the NN */
   torch::Tensor Infer(std::vector<torch::Tensor> inputs);
@@ -92,6 +94,8 @@ class JobContext {
   bool iter_in_progress{false};
   size_t totiters{0};                     // total iters executed
   size_t iters_before_graph_capture{10};  // set high to disable graph capture
+
+  std::string checkpoint_path;
 };
 
 #endif  // TASK_MANAGER_H

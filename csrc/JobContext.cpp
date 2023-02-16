@@ -42,6 +42,8 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
   run_with_be_ = job_params["run_with_be"].get<bool>();
   nr_gpus_ = job_params["nr_gpus"].get<size_t>();
 
+if (job_params.contains("checkpoint_path")) checkpoint_path = job_params["checkpoint_path"].get<std::string>();
+
   std::string dset = "random";
   if (job_params.contains("dset")) dset = job_params["dset"].get<std::string>();
 
@@ -248,6 +250,15 @@ void JobContext::TrainOneEpoch() {
   end = std::chrono::steady_clock::now();
   be_img_end = GetBeCounter();
   dataset_pipeline_->Reset();
+
+  size_t iters = totiters - warmupIters;
+  using msec = std::chrono::duration<double, std::milli>;
+  double elapsed_ms = std::chrono::duration_cast<msec>(end - start).count();
+  double total_iter_ms = elapsed_ms / (double)iters;
+  double total_iter_ps = 1e3 / total_iter_ms;
+  DP_LOG(
+      NOTICE,
+      "iter/s : %.2f", total_iter_ps);
 }
 
 /**
@@ -264,4 +275,50 @@ void JobContext::FinishIteration() {
   do {
     StepOne(&iter_done);
   } while (!iter_done && !job_done_);
+}
+
+
+void JobContext::save_variables(){
+
+  if (checkpoint_path.empty()) {
+        std::cout << "No checkpoint path set, failed to save model." << std::endl;
+        return;
+  }
+        model->saveOptimizer(checkpoint_path + "/optimizer.pt");
+    // torch::save(*optimizer_.get(), std::filesystem::path(checkpoint_path_).append("optimizer.pt").string());
+    for (auto layer : model->layers){
+        if(layer->active){
+            // layer->module.train();
+            layer->saveModule(checkpoint_path + "/" + layer->layername + ".pt");
+        }
+    }
+
+    DP_LOG(
+      NOTICE,
+      "Saved model to %s", checkpoint_path.c_str());
+}
+
+void JobContext::restore_variables(){
+    if (checkpoint_path.empty()) {
+        std::cout << "No checkpoint path set, failed to load model." << std::endl;
+        return;
+  }
+
+    for (auto layer : model->layers){
+        if(layer->active){
+            layer->loadModule(checkpoint_path + "/" + layer->layername + ".pt");
+            layer->module.to(rtctx->c10dev);
+            // layer->module.train();
+            // for (const auto& params : layer->module.parameters()){
+            //     // std::cout << params.requires_grad() << std::endl;
+            //     model->parameters.push_back(params);
+            // }
+            // layer->module.to(rtctx->c10dev);
+        }
+    }
+    
+    model->SetupOptimizer(checkpoint_path + "/optimizer.pt");
+        DP_LOG(
+      NOTICE,
+      "Loaded model from %s", checkpoint_path.c_str());
 }
