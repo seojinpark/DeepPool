@@ -96,6 +96,8 @@ class JobContext {
   size_t iters_before_graph_capture{10};  // set high to disable graph capture
 
   std::string checkpoint_path;
+  std::string loading_path;
+
 };
 
 #endif  // TASK_MANAGER_H

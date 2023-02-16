@@ -43,6 +43,7 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
   nr_gpus_ = job_params["nr_gpus"].get<size_t>();
 
 if (job_params.contains("checkpoint_path")) checkpoint_path = job_params["checkpoint_path"].get<std::string>();
+if (job_params.contains("loading_path")) loading_path = job_params["loading_path"].get<std::string>();
 
   std::string dset = "random";
   if (job_params.contains("dset")) dset = job_params["dset"].get<std::string>();
@@ -299,14 +300,14 @@ void JobContext::save_variables(){
 }
 
 void JobContext::restore_variables(){
-    if (checkpoint_path.empty()) {
-        std::cout << "No checkpoint path set, failed to load model." << std::endl;
+    if (loading_path.empty()) {
+        std::cout << "No path set, failed to load model." << std::endl;
         return;
   }
 
     for (auto layer : model->layers){
         if(layer->active){
-            layer->loadModule(checkpoint_path + "/" + layer->layername + ".pt");
+            layer->loadModule(loading_path + "/" + layer->layername + ".pt");
             layer->module.to(rtctx->c10dev);
             // layer->module.train();
             // for (const auto& params : layer->module.parameters()){
@@ -317,8 +318,9 @@ void JobContext::restore_variables(){
         }
     }
     
-    model->SetupOptimizer(checkpoint_path + "/optimizer.pt");
+    model->SetupOptimizer();
+    model->SetupOptimizer(loading_path + "/optimizer.pt");
         DP_LOG(
       NOTICE,
-      "Loaded model from %s", checkpoint_path.c_str());
+      "Saved model to %s", loading_path.c_str());
 }

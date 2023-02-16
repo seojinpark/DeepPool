@@ -189,7 +189,7 @@ int RuntimeContext::poll()
       GpuManager::getInstance()->DisableBe();
   }
   
-  // mainJob->restore_variables();
+  mainJob->restore_variables();
 
   if (mainJob->ShouldRunTest())
     mainJob->Test();
@@ -207,8 +207,8 @@ int RuntimeContext::poll()
         NOTICE,
         "seconds per epoch : %.2f", elapsed_ms);
 
-    // mainJob->save_variables();
-    // mainJob->restore_variables();
+    mainJob->save_variables();
+    mainJob->restore_variables();
 
     if (mainJob->ShouldRunTest())
       mainJob->Test();
