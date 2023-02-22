@@ -10,8 +10,8 @@ import torch
 
 input_shape = (3,224,224)
 num_classes = 2
-global_batch_size = int(sys.argv[1])
-GPU_count = 1
+GPU_count = int(sys.argv[1])
+global_batch_size = int(sys.argv[2])
 
 model = resnet18(num_classes=num_classes)
 
@@ -30,11 +30,11 @@ jobParams["catsdogs"] = True
 
 jobParams['training_data'] = "/Data/catsDogs/train.csv"
 jobParams['evaluation_data'] = "/Data/catsDogs/test.csv"
-jobParams['num_workers'] = 16
+jobParams['num_workers'] = 64
 
 jobParams['epochs_to_train'] = 2
 
-jobParams['checkpoint_path'] = "/DeepPool/checkpoints"
-jobParams['loading_path'] = "/DeepPool/checkpoints"
+# jobParams['checkpoint_path'] = "/DeepPool/checkpoints"
+# jobParams['loading_path'] = "/DeepPool/checkpoints"
 
 cc.submitTrainingJob("ResNet18", job.dumpInJSON(), jobParams=jobParams)

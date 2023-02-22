@@ -50,51 +50,51 @@ CatsDogs::CatsDogs(std::string root)
 torch::data::Example<> CatsDogs::get(size_t index)
 {
 
-    // images have 3 channels with values from 0-255. Size is not consistent, seen 200-500 for width and height values.
-    // store image in Mat object
-    std::string image_path = std::get<0>(data[index]);
-    cv::Mat img = cv::imread(image_path);
-    if (img.empty())
-    {
-        std::cout << "Could not read the image: " << image_path << std::endl;
-        assert(false);
-    }
+    // // images have 3 channels with values from 0-255. Size is not consistent, seen 200-500 for width and height values.
+    // // store image in Mat object
+    // std::string image_path = std::get<0>(data[index]);
+    // cv::Mat img = cv::imread(image_path);
+    // if (img.empty())
+    // {
+    //     std::cout << "Could not read the image: " << image_path << std::endl;
+    //     assert(false);
+    // }
 
-    // pre-process image at train time
+    // // pre-process image at train time
 
-    // remove border
-    // int startX=10, startY=10, width=img.cols-20, height=img.rows-20;
-    // img = cv::Mat(img, cv::Rect(startX, startY, width, height));
+    // // remove border
+    // // int startX=10, startY=10, width=img.cols-20, height=img.rows-20;
+    // // img = cv::Mat(img, cv::Rect(startX, startY, width, height));
 
-    torch::Tensor label_tensor = torch::tensor(0);
+    // torch::Tensor label_tensor = torch::tensor(0);
 
-    // noising
-    float r = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
-    if (r < 0.5)
-    {
-        label_tensor = torch::tensor(1);
-        cv::blur(img, img, cv::Size(15, 15), cv::Point(-1, -1));
-    }
+    // // noising
+    // float r = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
+    // if (r < 0.5)
+    // {
+    //     label_tensor = torch::tensor(1);
+    //     cv::blur(img, img, cv::Size(15, 15), cv::Point(-1, -1));
+    // }
 
-    // resize
-    cv::resize(img, img, cv::Size(224, 224));
+    // // resize
+    // cv::resize(img, img, cv::Size(224, 224));
 
-    torch::Tensor tensor_image = torch::from_blob(img.data, {img.rows, img.cols, 3}, at::kByte);
+    // torch::Tensor tensor_image = torch::from_blob(img.data, {img.rows, img.cols, 3}, at::kByte);
 
-    // permute dimensions of tensor to Libtorch format [Channels, Height, Width]
-    tensor_image = tensor_image.permute({2, 0, 1});
+    // // permute dimensions of tensor to Libtorch format [Channels, Height, Width]
+    // tensor_image = tensor_image.permute({2, 0, 1});
 
-    // torch::Tensor label_tensor = torch::tensor(std::get<1>(data[index]));
+    // // torch::Tensor label_tensor = torch::tensor(std::get<1>(data[index]));
 
-    // std::cerr << "Read image from " << image_path << std::endl;
+    // // std::cerr << "Read image from " << image_path << std::endl;
 
-    return  {tensor_image.to(torch::kFloat32).div_(255), label_tensor.to(torch::kInt64)};
+    // return  {tensor_image.to(torch::kFloat32).div_(255), label_tensor.to(torch::kInt64)};
 
-    // fake data
+    // // fake data
     // torch::Tensor tensor_image = torch::zeros({3, 224, 224}, torch::kF32);
     // torch::Tensor label_tensor = torch::tensor(0); // note that tensor and Tensor are different!!
 
-    // return {tensor_image, label_tensor};
+    return {tensor_image, label_tensor};
 
     // noise data, ignore original label
 }

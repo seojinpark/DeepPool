@@ -807,22 +807,22 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
   } else if (state == JobState::SYNC) {
     DP_LOG(DEBUG, "JobState::SYNC.");
 
-    first_pass = false;
+    // first_pass = false;
 
-    for (auto& grp : grad_sync_groups) {
-      {
-        ScopedGraphRecorder graph(this, TASK_FLAGS_COMPUTE, "coalesce");
-        grp.second.Coalesce();
-      }
-      auto fn = [=](c10::cuda::CUDAStream stream) mutable {
-        grp.second.Sync(grp.first, stream, commHandler);
-      };
-      if (graph_recording)
-        cur_task->AddTask({fn, TASK_FLAGS_ALLREDUCE, "final_sync"});
-      fn(rtctx->torch_stream);
-    }
+    // for (auto& grp : grad_sync_groups) {
+    //   {
+    //     ScopedGraphRecorder graph(this, TASK_FLAGS_COMPUTE, "coalesce");
+    //     grp.second.Coalesce();
+    //   }
+    //   auto fn = [=](c10::cuda::CUDAStream stream) mutable {
+    //     grp.second.Sync(grp.first, stream, commHandler);
+    //   };
+    //   if (graph_recording)
+    //     cur_task->AddTask({fn, TASK_FLAGS_ALLREDUCE, "final_sync"});
+    //   fn(rtctx->torch_stream);
+    // }
 
-    TimerRecordStage("sync");
+    // TimerRecordStage("sync");
     state = JobState::STEP;
   } else if (state == JobState::STEP) {
     DP_LOG(DEBUG, "JobState::STEP");
@@ -853,8 +853,8 @@ int RunnableModule::AdvanceTraining(bool doGraphCapture, bool layerProfile) {
     }
 
     state = JobState::INIT;
-    TimerRecordStage("stop");
-    resetTimers();
+    // TimerRecordStage("stop");
+    // resetTimers();
     return 1;
   }
   return 0;

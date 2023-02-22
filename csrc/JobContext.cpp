@@ -153,7 +153,9 @@ void JobContext::StepOne(bool *iter_done) {
   }
 
   at::autocast::set_enabled(autocast_);
+
   iter_in_progress = !model->AdvanceTraining(graphCapture, profile);
+
   at::autocast::set_enabled(false);
 
   if (iter_done) *iter_done = !iter_in_progress;
@@ -234,32 +236,73 @@ void JobContext::Train(std::vector<torch::Tensor> inputs,
 }
 
 void JobContext::TrainOneEpoch() {
+      std::chrono::_V2::steady_clock::time_point start = std::chrono::steady_clock::now();
+  
+  double averageDataTime = 0;
+  double averageTrainTime = 0;
   size_t i = 0;
   if (!model->isTrain() && iters_before_graph_capture < totiters &&
       rtctx->use_fg_graph)
     iters_before_graph_capture = totiters + 5;
   while (!dataset_pipeline_->IsDone() && !job_done_) {
+    std::chrono::_V2::steady_clock::time_point startDataLoading = std::chrono::steady_clock::now();
     auto batch = dataset_pipeline_->getNext();
+    std::chrono::_V2::steady_clock::time_point endDataLoading = std::chrono::steady_clock::now();
+
+    std::chrono::_V2::steady_clock::time_point startTraining = std::chrono::steady_clock::now();
     Train(batch.data, batch.target);
-    DP_LOG(DEBUG, "Training iteration %lu/%lu\n", ++i,
-           dataset_pipeline_->GetItersPerEpoch());
+    std::chrono::_V2::steady_clock::time_point endTrianing = std::chrono::steady_clock::now();
+
+  using msec = std::chrono::duration<double, std::micro>;
+
+  double dataTime = std::chrono::duration_cast<msec>(endDataLoading - startDataLoading).count();
+  double trainTime = std::chrono::duration_cast<msec>(endTrianing - startTraining).count();
+
+  DP_LOG(
+      NOTICE,
+      "dataloading: %.2f\ttraining: %.2f", dataTime, trainTime);
+  i++;
+  averageDataTime += dataTime;
+  averageTrainTime += trainTime;
+
+    // DP_LOG(DEBUG, "Training iteration %lu/%lu\n", ++i,
+    //        dataset_pipeline_->GetItersPerEpoch());
   }
+
+  end = std::chrono::steady_clock::now();
+
+    std::chrono::_V2::steady_clock::time_point startSync0 = std::chrono::steady_clock::now();
   double loss = model->GetAvgLoss();
+      std::chrono::_V2::steady_clock::time_point startSync1 = std::chrono::steady_clock::now();
   DP_LOG(NOTICE, "Epoch done. Loss %.2f", loss);
   iters_before_graph_capture = 0;
   rtctx->torch_stream.synchronize();
-  end = std::chrono::steady_clock::now();
+      std::chrono::_V2::steady_clock::time_point startSync2 = std::chrono::steady_clock::now();
   be_img_end = GetBeCounter();
+      std::chrono::_V2::steady_clock::time_point startSync3 = std::chrono::steady_clock::now();
   dataset_pipeline_->Reset();
 
-  size_t iters = totiters - warmupIters;
-  using msec = std::chrono::duration<double, std::milli>;
+  std::chrono::_V2::steady_clock::time_point endSync = std::chrono::steady_clock::now();
+  using msec = std::chrono::duration<double, std::micro>;
+    double syncTime01 = std::chrono::duration_cast<msec>(startSync1 - startSync0).count();
+  double syncTime12 = std::chrono::duration_cast<msec>(startSync2 - startSync1).count();
+  double syncTime23 = std::chrono::duration_cast<msec>(startSync3 - startSync2).count();
+  double syncTime34 = std::chrono::duration_cast<msec>(endSync - startSync3).count();
+
+    DP_LOG(
+      NOTICE,
+      "sync times %.2f, %.2f, %.2f, %.2f", syncTime01, syncTime12, syncTime23, syncTime34);
+      
+
+  double syncTime = std::chrono::duration_cast<msec>(endSync - startSync0).count();
+
   double elapsed_ms = std::chrono::duration_cast<msec>(end - start).count();
-  double total_iter_ms = elapsed_ms / (double)iters;
-  double total_iter_ps = 1e3 / total_iter_ms;
+  double total_iter_ms = elapsed_ms / (double)i;
+  double total_iter_ps = 1e6 / total_iter_ms;
   DP_LOG(
       NOTICE,
-      "iter/s : %.2f", total_iter_ps);
+      "epoch time: %.2f ms, teardown time: %.2f ms, iter/s : %.2f, average data loading: %.2f ,s, average training time: %.2f ms", elapsed_ms / 1e3, syncTime / 1e3, total_iter_ps, averageDataTime/i/1e3, averageTrainTime/i/1e3);
+      
 }
 
 /**
@@ -273,9 +316,13 @@ void JobContext::TrainOneEpoch() {
  */
 void JobContext::FinishIteration() {
   bool iter_done = false;
+
   do {
     StepOne(&iter_done);
   } while (!iter_done && !job_done_);
+
+
+    
 }
 
 
@@ -322,5 +369,5 @@ void JobContext::restore_variables(){
     model->SetupOptimizer(loading_path + "/optimizer.pt");
         DP_LOG(
       NOTICE,
-      "Saved model to %s", loading_path.c_str());
+      "Loaded model from %s", loading_path.c_str());
 }

@@ -27,4 +27,8 @@ class CatsDogs : public torch::data::datasets::Dataset<CatsDogs> {
 
  private:
     std::vector<std::tuple<std::string, int>> data;
+        // fake data
+    torch::Tensor tensor_image = torch::zeros({3, 224, 224}, torch::kF32);
+    torch::Tensor label_tensor = torch::tensor(0); // note that tensor and Tensor are different!!
+
 };
