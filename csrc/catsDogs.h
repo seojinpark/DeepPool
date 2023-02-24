@@ -17,7 +17,7 @@
 class CatsDogs : public torch::data::datasets::Dataset<CatsDogs> {
  public:
     // The supplied path should be to the csv file pointing to all images and their labels
-    explicit CatsDogs(const std::string root);
+    explicit CatsDogs(const std::string root, size_t worldSize, size_t rank);
 
     // Returns the `Example` at the given `index`.
     torch::data::Example<> get(size_t index) override;
@@ -27,8 +27,6 @@ class CatsDogs : public torch::data::datasets::Dataset<CatsDogs> {
 
  private:
     std::vector<std::tuple<std::string, int>> data;
-        // fake data
-    torch::Tensor tensor_image = torch::zeros({3, 224, 224}, torch::kF32);
-    torch::Tensor label_tensor = torch::tensor(0); // note that tensor and Tensor are different!!
-
+    size_t worldSize;
+    size_t rank;
 };

@@ -54,17 +54,6 @@ if (job_params.contains("loading_path")) loading_path = job_params["loading_path
     /* cifar default includes 10 epochs with test routine */
     runTestRoutine_ = true;
     epochsToTrain = 1;
-  } else if (job_params.contains("cifar_training") &&
-      job_params["cifar_training"].get<bool>()) {
-    dset = "cifar";
-    /* cifar default includes 10 epochs with test routine */
-    runTestRoutine_ = true;
-    epochsToTrain = 20;
-  } else if (name.find("gpt2") != std::string::npos) {
-    dset = "gpt2";
-    runTestRoutine_ = false;
-  } else if (name.find("Inception") != std::string::npos) {
-    dset = "inception";
   }
 
   if (job_params.contains("autocast") && job_params["autocast"].get<bool>()) {
@@ -79,13 +68,13 @@ if (job_params.contains("loading_path")) loading_path = job_params["loading_path
     epochsToTrain = job_params["epochs_to_train"].get<size_t>();
 
   train_dataset_.reset(
-      Dataset::fromName(dset, job_params, rtctx->rank, model->globalBatchSize,
+      Dataset::fromName(dset, job_params, rtctx->worldSize, rtctx->rank, model->globalBatchSize,
                         model->input_layers, model->sampleIndices, 2000));
   dataset_pipeline_.reset(new DatasetPipelineWrapper(train_dataset_));
 
   if (runTestRoutine_) {
     eval_dataset_.reset(Dataset::fromName(
-        dset + "_eval", job_params, rtctx->rank, model->globalBatchSize,
+        dset + "_eval", job_params, rtctx->worldSize, rtctx->rank, model->globalBatchSize,
         model->input_layers, model->sampleIndices, 10));
   }
   if (!rtctx->use_fg_graph)

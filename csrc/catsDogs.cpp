@@ -41,15 +41,17 @@ std::vector<std::tuple<std::string, int>> read_data(std::string img_names_src)
     return data;
 }
 
-CatsDogs::CatsDogs(std::string root)
+CatsDogs::CatsDogs(std::string root, size_t _worldSize, size_t _rank)
 {
     data = read_data(root);
+    worldSize = _worldSize;
+    rank = _rank;
 }
 
 // get returns an image-label pair, which it does by loading the image from disk, augmenting it, and converting it to a tensor.
 torch::data::Example<> CatsDogs::get(size_t index)
 {
-
+    std::cout << index + rank*(data.size()/worldSize) << std::endl;
     // // images have 3 channels with values from 0-255. Size is not consistent, seen 200-500 for width and height values.
     // // store image in Mat object
     // std::string image_path = std::get<0>(data[index]);
@@ -91,8 +93,8 @@ torch::data::Example<> CatsDogs::get(size_t index)
     // return  {tensor_image.to(torch::kFloat32).div_(255), label_tensor.to(torch::kInt64)};
 
     // // fake data
-    // torch::Tensor tensor_image = torch::zeros({3, 224, 224}, torch::kF32);
-    // torch::Tensor label_tensor = torch::tensor(0); // note that tensor and Tensor are different!!
+    torch::Tensor tensor_image = torch::zeros({3, 224, 224}, torch::kF32).pin_memory();
+    torch::Tensor label_tensor = torch::tensor(0).pin_memory(); // note that tensor and Tensor are different!!
 
     return {tensor_image, label_tensor};
 
@@ -101,5 +103,5 @@ torch::data::Example<> CatsDogs::get(size_t index)
 
 torch::optional<size_t> CatsDogs::size() const
 {
-    return data.size();
+    return data.size()/worldSize;
 }

@@ -30,7 +30,7 @@ class Dataset {
   virtual size_t GetItersPerEpoch() = 0;
   virtual bool IsDone() = 0;
   virtual void Reset() = 0;
-  static Dataset *fromName(std::string name, json jobParams, size_t rank,
+  static Dataset *fromName(std::string name, json jobParams, size_t worldSize, size_t rank,
                            long globalBatchSize,
                            std::vector<std::shared_ptr<Layer>> input_layers,
                            std::vector<long> sampleIndices,
@@ -65,11 +65,16 @@ class Dataset {
   }
 
  protected:
+  size_t worldSize_;
+  size_t rank_;
   long globalBatchSize_;
-  Dataset(size_t rank, long globalBatchSize,
+  long localBatchSize;
+  Dataset(size_t worldSize, size_t rank, long globalBatchSize,
           std::vector<std::shared_ptr<Layer>> input_layers,
           std::vector<long> sampleIndices)
-      : globalBatchSize_(globalBatchSize),
+      : localBatchSize(globalBatchSize/worldSize),
+      globalBatchSize_(globalBatchSize),
+      worldSize_(worldSize),
         rank_(rank),
         input_layers(input_layers) {
     if (sampleIndices.size() == 0) return;
@@ -89,7 +94,6 @@ class Dataset {
   }
 
  private:
-  size_t rank_;
   std::vector<Slice> slices_;
   std::vector<std::shared_ptr<Layer>> input_layers;
 };
