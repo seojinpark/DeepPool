@@ -49,14 +49,18 @@ class Dataset {
       }
       size_t sample_start = iLayer->layerLocalBatch * iLayer->localRank;
       size_t sample_end = sample_start + iLayer->layerLocalBatch;
-      data.push_back(ex.data[i].index({Slice(sample_start, sample_end)}));
+      torch::Tensor dataSlice = ex.data[i].index({Slice(sample_start, sample_end)});
+      data.push_back(dataSlice.pin_memory());
     }
 
     std::vector<torch::Tensor> samplesOrdered;
     for (auto &slice : slices_)
       samplesOrdered.push_back(ex.target.index({slice}));
-    if (samplesOrdered.size()) target = torch::cat(samplesOrdered);
-
+  if (samplesOrdered.size()) {
+    target = torch::cat(samplesOrdered);
+    target = target.pin_memory();
+  }
+  
     return {data, target};
   }
 
@@ -99,6 +103,7 @@ class TensorPipeline {
     auto origstream = c10::cuda::getCurrentCUDAStream();
     c10::cuda::setCurrentCUDAStream(rtctx->xfer_stream);
     next_up_.clear();
+                std::chrono::_V2::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     for (auto &n : next) {
       if (n.defined() && n.nbytes())
         next_up_.push_back(
@@ -106,17 +111,38 @@ class TensorPipeline {
       else
         next_up_.push_back(n);
     }
+            std::chrono::_V2::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+
+  using msec = std::chrono::duration<double, std::micro>;
+  double load0 = std::chrono::duration_cast<msec>(t1 - t0).count();
+  DP_LOG(
+      NOTICE,
+      "moving from cpu to gpu async: %.2f", load0);
+
     c10::cuda::setCurrentCUDAStream(origstream);
   }
 
   std::vector<torch::Tensor> GetNext(std::vector<torch::Tensor> next) {
     /* current stream must wait for xfer before using returned tsr */
+        std::chrono::_V2::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     xfer_ev_.record(rtctx->xfer_stream);
     xfer_ev_.block(c10::cuda::getCurrentCUDAStream());
+
+        std::chrono::_V2::steady_clock::time_point t1 = std::chrono::steady_clock::now();
 
     auto out = next_up_;
     next_up_.clear();
     if (next.size()) SupplyNext(next);
+
+        std::chrono::_V2::steady_clock::time_point t2 = std::chrono::steady_clock::now();
+
+  using msec = std::chrono::duration<double, std::micro>;
+  double load0 = std::chrono::duration_cast<msec>(t1 - t0).count();
+  double load1 = std::chrono::duration_cast<msec>(t2 - t1).count();
+  DP_LOG(
+      NOTICE,
+      "waiting for stream: %.2f\tsupplyNext(): %.2f", load0, load1);
+
     return out;
   }
 
@@ -153,9 +179,22 @@ class DatasetPipelineWrapper {
       is_done_ = true;
       return {data, target.at(0)};
     }
+
+    std::chrono::_V2::steady_clock::time_point load0 = std::chrono::steady_clock::now();
     auto next_sample = dataset_->getNext();
+    std::chrono::_V2::steady_clock::time_point load1 = std::chrono::steady_clock::now();
     auto data = data_pipeline_->GetNext(next_sample.data);
+    std::chrono::_V2::steady_clock::time_point load2 = std::chrono::steady_clock::now();
     auto target = target_pipeline_->GetNext({next_sample.target});
+    std::chrono::_V2::steady_clock::time_point load3 = std::chrono::steady_clock::now();
+
+  using msec = std::chrono::duration<double, std::micro>;
+  double load01 = std::chrono::duration_cast<msec>(load1 - load0).count();
+  double load12 = std::chrono::duration_cast<msec>(load2 - load1).count();
+  double load23 = std::chrono::duration_cast<msec>(load3 - load2).count();
+  DP_LOG(
+      NOTICE,
+      "dataset.getNext(): %.2f\tdatapipeline.getNext(): %.2f\t targetpipeline.getNext(): %.2f", load01, load12, load23);
 
     return {data, target.at(0)};
   }

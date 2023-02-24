@@ -32,7 +32,7 @@ jobParams['training_data'] = "/Data/catsDogs/train.csv"
 jobParams['evaluation_data'] = "/Data/catsDogs/test.csv"
 jobParams['num_workers'] = 64
 
-jobParams['epochs_to_train'] = 2
+jobParams['epochs_to_train'] = 1
 
 # jobParams['checkpoint_path'] = "/DeepPool/checkpoints"
 # jobParams['loading_path'] = "/DeepPool/checkpoints"
