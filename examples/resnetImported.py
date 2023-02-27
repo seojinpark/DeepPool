@@ -30,7 +30,9 @@ jobParams["catsdogs"] = True
 
 jobParams['training_data'] = "/Data/catsDogs/train.csv"
 jobParams['evaluation_data'] = "/Data/catsDogs/test.csv"
-jobParams['num_workers'] = 64
+jobParams['run_test_routine'] = False
+
+jobParams['num_workers'] = 16
 
 jobParams['epochs_to_train'] = 1
 

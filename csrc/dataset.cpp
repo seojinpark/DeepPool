@@ -28,7 +28,7 @@ private:
   std::unique_ptr<torch::data::StatelessDataLoader<
       torch::data::datasets::MapDataset<
           CatsDogs, torch::data::transforms::Stack<torch::data::Example<>>>,
-      torch::data::samplers::RandomSampler>>
+      torch::data::samplers::DistributedRandomSampler>>
       loader;
   int iteration_count;
 };
@@ -40,12 +40,21 @@ CatsDogsDataset::CatsDogsDataset(size_t worldSize, size_t rank, long globalBatch
 {
   DP_LOG(NOTICE, "Using CatsDogs dataset");
 
-  auto c = CatsDogs(filepath, worldSize, rank)
+  auto dataset = CatsDogs(filepath, worldSize, rank)
                .map(torch::data::transforms::Stack<>());
-  batches_per_epoch_ = c.size().value() / (globalBatchSize/worldSize);
-  loader =
-      torch::data::make_data_loader<torch::data::samplers::RandomSampler>(
-          std::move(c), torch::data::DataLoaderOptions().batch_size(globalBatchSize/worldSize).workers(num_workers).drop_last(true));
+  batches_per_epoch_ = dataset.size().value() / (globalBatchSize/worldSize);
+
+
+  torch::data::samplers::DistributedRandomSampler sampler (dataset.size().value(), /*num_replicas=*/worldSize, /*rank=*/rank);
+
+  loader = torch::data::make_data_loader(
+                  std::move(dataset),
+                  sampler,
+                  torch::data::DataLoaderOptions().batch_size(globalBatchSize/worldSize).workers(num_workers).drop_last(true));
+
+  // loader =
+  //     torch::data::make_data_loader<torch::data::samplers::DistributedRandomSampler>(
+  //         std::move(dataset), torch::data::DataLoaderOptions().batch_size(globalBatchSize/worldSize).workers(num_workers).drop_last(true));
 
   // torch::data::make_data_loader<torch::data::samplers::SequentialSampler>(
   // std::move(c), torch::data::DataLoaderOptions().batch_size(globalBatchSize).drop_last(true)); // good rule of thumb is number of workers equal to CPU cores
@@ -88,7 +97,7 @@ Example CatsDogsDataset::getNext()
   //   outfile << iteration_count << " " << hash << std::endl;
   // }
 
-  // std::cout << cur_example.target << std::endl;
+  std::cout << cur_example.target << std::endl;
   // std::cout << cur_example.data << std::endl;
 
   // converts pytorch Example to our own class Example

@@ -45,7 +45,6 @@ Launch the cluster coordinator:
 ```
 python cluster.py \
     --addrToBind 127.0.0.1:12347 \
-    --hostfile hostfile.txt \
     --be_batch_size=0 \
     --cpp \
     --logdir /DeepPool/logs
