@@ -30,7 +30,9 @@ private:
           CatsDogs, torch::data::transforms::Stack<torch::data::Example<>>>,
       torch::data::samplers::DistributedRandomSampler>>
       loader;
+
   int iteration_count;
+  int epoch_count;
 };
 
 CatsDogsDataset::CatsDogsDataset(size_t worldSize, size_t rank, long globalBatchSize,
@@ -44,8 +46,9 @@ CatsDogsDataset::CatsDogsDataset(size_t worldSize, size_t rank, long globalBatch
                .map(torch::data::transforms::Stack<>());
   batches_per_epoch_ = dataset.size().value() / (globalBatchSize/worldSize);
 
-
-  torch::data::samplers::DistributedRandomSampler sampler (dataset.size().value(), /*num_replicas=*/worldSize, /*rank=*/rank);
+  epoch_count = 0;
+  torch::data::samplers::DistributedRandomSampler sampler = torch::data::samplers::DistributedRandomSampler(dataset.size().value(), /*num_replicas=*/worldSize, /*rank=*/rank);
+  sampler.set_epoch(epoch_count);
 
   loader = torch::data::make_data_loader(
                   std::move(dataset),
@@ -97,12 +100,28 @@ Example CatsDogsDataset::getNext()
   //   outfile << iteration_count << " " << hash << std::endl;
   // }
 
-  std::cout << cur_example.target << std::endl;
+  // std::cout << cur_example.target << std::endl;
   // std::cout << cur_example.data << std::endl;
 
   // converts pytorch Example to our own class Example
   // return globalToPerRankExample({cur_example.data, cur_example.target});
-    return {cur_example.data, cur_example.target};
+
+
+            std::chrono::_V2::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  torch::Tensor pinnedData = cur_example.data.pin_memory();
+            std::chrono::_V2::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+    torch::Tensor pinnedTarget = cur_example.target.pin_memory();
+            std::chrono::_V2::steady_clock::time_point t2 = std::chrono::steady_clock::now();
+
+  using msec = std::chrono::duration<double, std::micro>;
+  double load0 = std::chrono::duration_cast<msec>(t1 - t0).count();
+    double load1 = std::chrono::duration_cast<msec>(t2 - t1).count();
+
+  DP_LOG(
+      NOTICE,
+      "pinning data: %.2f\tpinning target: %.2f", load0, load1);
+
+    return {pinnedData, pinnedTarget};
 
 }
 
@@ -110,6 +129,11 @@ size_t CatsDogsDataset::GetItersPerEpoch() { return batches_per_epoch_; };
 
 void CatsDogsDataset::Reset()
 {
+  // must reset before creating the iterator
+  epoch_count++;
+  loader->sampler_.set_epoch(epoch_count);
+  std::cout << "Setting epoch to " << epoch_count << std::endl;
+
   cur_iter = loader->begin();
   iteration_count = 0;
 }

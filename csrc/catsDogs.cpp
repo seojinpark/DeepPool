@@ -51,9 +51,7 @@ CatsDogs::CatsDogs(std::string root, size_t _worldSize, size_t _rank)
 // get returns an image-label pair, which it does by loading the image from disk, augmenting it, and converting it to a tensor.
 torch::data::Example<> CatsDogs::get(size_t index)
 {
-    // size_t global_index = index + rank*(data.size()/worldSize);
-    // std::cout << global_index << std::endl;
-    
+    // std::cout << index << std::endl;
     // // images have 3 channels with values from 0-255. Size is not consistent, seen 200-500 for width and height values.
     // // store image in Mat object
     // std::string image_path = std::get<0>(data[index]);
@@ -96,8 +94,7 @@ torch::data::Example<> CatsDogs::get(size_t index)
 
     // // fake data
     torch::Tensor tensor_image = torch::zeros({3, 224, 224}, torch::kF32);
-    int target = index;
-    torch::Tensor label_tensor = torch::tensor(target); // note that tensor and Tensor are different!!
+    torch::Tensor label_tensor = torch::tensor(0); // note that tensor and Tensor are different!!
 
     return {tensor_image, label_tensor};
 
@@ -106,5 +103,5 @@ torch::data::Example<> CatsDogs::get(size_t index)
 
 torch::optional<size_t> CatsDogs::size() const
 {
-    return data.size()/worldSize;
+    return data.size();
 }
