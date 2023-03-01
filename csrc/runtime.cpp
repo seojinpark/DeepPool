@@ -195,29 +195,17 @@ int RuntimeContext::poll()
     mainJob->Test();
   for (size_t i = 0; i < mainJob->GetEpochsToTrain(); i++)
   {
-
-    std::chrono::_V2::steady_clock::time_point start = std::chrono::steady_clock::now();
-
     mainJob->TrainOneEpoch();
-
-    std::chrono::_V2::steady_clock::time_point end = std::chrono::steady_clock::now();
-    using msec = std::chrono::duration<double, std::milli>;
-    double elapsed_ms = std::chrono::duration_cast<msec>(end - start).count() / 1e3;
-    DP_LOG(
-        NOTICE,
-        "seconds per epoch : %.2f", elapsed_ms);
 
     mainJob->save_variables();
     mainJob->restore_variables();
 
     if (mainJob->ShouldRunTest())
       mainJob->Test();
-    
-
   }
 
   torch_stream.synchronize();
-  mainJob->printJobStatistics();
+  // mainJob->printJobStatistics();
   jobList.erase(jobList.begin());
   DP_LOG(NOTICE, "Removed the completed job. Remaining: %lu", jobList.size());
   c10::cuda::CUDACachingAllocator::emptyCache();

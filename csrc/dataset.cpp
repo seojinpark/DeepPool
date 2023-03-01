@@ -107,21 +107,21 @@ Example CatsDogsDataset::getNext()
   // return globalToPerRankExample({cur_example.data, cur_example.target});
 
 
-            std::chrono::_V2::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-  torch::Tensor pinnedData = cur_example.data.pin_memory();
-            std::chrono::_V2::steady_clock::time_point t1 = std::chrono::steady_clock::now();
-    torch::Tensor pinnedTarget = cur_example.target.pin_memory();
-            std::chrono::_V2::steady_clock::time_point t2 = std::chrono::steady_clock::now();
+  //           std::chrono::_V2::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  // torch::Tensor pinnedData = cur_example.data.pin_memory();
+  //           std::chrono::_V2::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+  //   torch::Tensor pinnedTarget = cur_example.target.pin_memory();
+  //           std::chrono::_V2::steady_clock::time_point t2 = std::chrono::steady_clock::now();
 
-  using msec = std::chrono::duration<double, std::micro>;
-  double load0 = std::chrono::duration_cast<msec>(t1 - t0).count();
-    double load1 = std::chrono::duration_cast<msec>(t2 - t1).count();
+  // using msec = std::chrono::duration<double, std::micro>;
+  // double load0 = std::chrono::duration_cast<msec>(t1 - t0).count();
+  //   double load1 = std::chrono::duration_cast<msec>(t2 - t1).count();
 
-  DP_LOG(
-      NOTICE,
-      "pinning data: %.2f\tpinning target: %.2f", load0, load1);
+  // DP_LOG(
+  //     NOTICE,
+  //     "pinning data: %.2f\tpinning target: %.2f", load0, load1);
 
-    return {pinnedData, pinnedTarget};
+    return {cur_example.data, cur_example.target};
 
 }
 

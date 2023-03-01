@@ -12,30 +12,28 @@ docker run \
     -it \
     --rm \
     -v "$(pwd)"/DeepPool:/DeepPool \
-    -v "$(pwd)"/Data:/Data \
+    -v "$(pwd)"path/to/Data:/Data \
     nvcr.io/nvidia/pytorch:22.01-py3
 ```
 
-Now in the container, build DeepPool:
+Make sure both /DeepPool and /Data are populated. If not, then the paths in the previous command were incorrect.
+
+Now in the container, modify pytorch, and build DeepPool:
 ```
 cd /DeepPool
+tar -xvf modifyPytorchSource.tar.gz -C /
 bash build.sh
 ```
 
+If during the build process you get an error that "dataloader->sampler_" is private, not public, then the tar file was incorrectly unzipped. Make sure it modifies the pytorch source code.
+
 ## Data
+
+Locate the data from the previous DeppPool version, it has not changed for this version.
 
 The CatsDogs dataset was downloaded from Kaggle [https://www.kaggle.com/competitions/dogs-vs-cats-redux-kernels-edition/data?select=train.zip]. The images in the Train directory were split into training data and evaluation data. For each of these two new directories a CSV file was generated, containing the filepaths and labels for each image.
 
-When submitting your model to the cluster you provide a filepath to a CSV file that contains a list of image-label pairs. An example CSV file looks like the below
-```
-/Data/catsDogs/train/dog.9636.jpg,1
-/Data/catsDogs/train/cat.3267.jpg,0
-/Data/catsDogs/train/cat.8683.jpg,0
-/Data/catsDogs/train/cat.4511.jpg,0
-/Data/catsDogs/train/dog.11091.jpg,1
-```
-
-For the example of the CatsDogs dataset, the code for loading and pre-processing can be seen in `/DeepPool/csrc/catsDogs.cpp` and `/DeepPool/csrc/dataset.cpp`. Dataloading is done in parallel by multiple workers. You define how many when submitting the model to the cluster, a good rule of thumb is to set the number of workers equal to the number of CPU cores available. If you get an error like `Caught signal 11 (Segmentation fault: address not mapped to object at address 0x7f96280568f4)`, then you are overloading your CPU and need to either decrease the batch size, decrease the number of workers, or give more RAM to the docker container.
+For the example of the CatsDogs dataset, the code for loading and pre-processing can be seen in `/DeepPool/csrc/catsDogs.cpp` and `/DeepPool/csrc/dataset.cpp`. Dataloading is done in parallel by multiple workers. Each GPU gets their own workers, so be careful with multiple GPUs that you don't over-subscribe your CPU cores. If you get an error like `Caught signal 11 (Segmentation fault: address not mapped to object at address 0x7f96280568f4)`, then you are overloading your CPU and need to either decrease the batch size, decrease the number of workers, or give more RAM to the docker container.
 
 After changing any c++ code, you rebuild the project with `bash build.sh`.
 
@@ -47,21 +45,22 @@ python cluster.py \
     --addrToBind 127.0.0.1:12347 \
     --be_batch_size=0 \
     --cpp \
-    --logdir /DeepPool/logs
+    --logdir /DeepPool/logs \
+    --hostfile hostfile.txt
 ```
 
 Once you see "Now, cluster is ready to accept training jobs." you may launch a job in another terminal.
-For example, to run ResNet18 with global batch size 32, run:
+For example, to run ResNet18 with global batch size 32 on a single GPU, run:
 ```
-python examples/resnetImported.py 32
+python examples/resnetImported.py 1 32
 ```
 
 To view the results of the run, inspect the contents of `logs/cpprt0.out`. For more detailed logs, like forward and backward times, look in the `logs/runtime` logs. When the job completes, you will see a line similar to the below in `logs/cpprt0.out`.
 ```
-A training job vgg16_8_32_2.0_DP is completed (1800 iters, 13.57 ms/iter, 73.71 iter/s, 0.00 be img/s, 32 globalBatchSize).
+1677704218.374995837 runtime.cpp:222 in poll NOTICE[1]: Removed the completed job. Remaining: 0
 ```
 
-Hitting Ctrl-C should kill the cluster, but if there are ever lingering processes, run
+Hitting Ctrl-C should kill the cluster, but if there are ever lingering processes, run twice
 ```
 pkill runtime
 ```
@@ -79,4 +78,4 @@ Update the hostfile to point to multiple GPUs. For example, to specify 4 GPUs on
 127.0.0.1,3
 ```
 
-Now when you generate the job for your model, pass in the number of GPUs to be used. For `examples/resnetImported.py` that would be in line `cs.searchBestSplitsV3(GPU_count, global_batch_size)`, where `GPU_count` has a value of 4.
+Now when you generate the job for your model, pass in the number of GPUs to be used. For example, `python examples/resnetImported.py 4 128` will run on the 4 GPUs with a global batch size of 128, meaning the local batch size is 32.

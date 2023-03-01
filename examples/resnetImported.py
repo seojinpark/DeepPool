@@ -30,13 +30,12 @@ jobParams["catsdogs"] = True
 
 jobParams['training_data'] = "/Data/catsDogs/train.csv"
 jobParams['evaluation_data'] = "/Data/catsDogs/test.csv"
-jobParams['run_test_routine'] = False
 
-jobParams['num_workers'] = 1
+jobParams['num_workers'] = 32
 
 jobParams['epochs_to_train'] = 1
 
-# jobParams['checkpoint_path'] = "/DeepPool/checkpoints"
 # jobParams['loading_path'] = "/DeepPool/checkpoints"
+jobParams['checkpoint_path'] = "/DeepPool/checkpoints"
 
 cc.submitTrainingJob("ResNet18", job.dumpInJSON(), jobParams=jobParams)

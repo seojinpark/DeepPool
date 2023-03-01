@@ -226,10 +226,12 @@ void JobContext::Train(std::vector<torch::Tensor> inputs,
 
 void JobContext::TrainOneEpoch() {
       std::chrono::_V2::steady_clock::time_point start = std::chrono::steady_clock::now();
-  
+        std::chrono::_V2::steady_clock::time_point end_setup = std::chrono::steady_clock::now();
+
+  bool warmingUp = true;
   double averageDataTime = 0;
   double averageTrainTime = 0;
-  size_t i = 0;
+  size_t timed_iters = 0;
   if (!model->isTrain() && iters_before_graph_capture < totiters &&
       rtctx->use_fg_graph)
     iters_before_graph_capture = totiters + 5;
@@ -242,23 +244,32 @@ void JobContext::TrainOneEpoch() {
     Train(batch.data, batch.target);
     std::chrono::_V2::steady_clock::time_point endTrianing = std::chrono::steady_clock::now();
 
-  using msec = std::chrono::duration<double, std::micro>;
+      using msec = std::chrono::duration<double, std::micro>;
 
-  double dataTime = std::chrono::duration_cast<msec>(endDataLoading - startDataLoading).count();
-  double trainTime = std::chrono::duration_cast<msec>(endTrianing - startTraining).count();
+      double dataTime = std::chrono::duration_cast<msec>(endDataLoading - startDataLoading).count();
+      double trainTime = std::chrono::duration_cast<msec>(endTrianing - startTraining).count();
 
-  DP_LOG(
-      NOTICE,
-      "dataloading: %.2f\ttraining: %.2f", dataTime, trainTime);
-  i++;
-  averageDataTime += dataTime;
-  averageTrainTime += trainTime;
+    if (warmingUp) {
+        DP_LOG(
+          NOTICE,
+          "Warmup:: dataloading: %.2f\ttraining: %.2f", dataTime, trainTime);
+          end_setup = std::chrono::steady_clock::now();
+    } else {
+        DP_LOG(
+          NOTICE,
+          "Training:: dataloading: %.2f\ttraining: %.2f", dataTime, trainTime);
 
+      averageDataTime += dataTime;
+      averageTrainTime += trainTime;
+      timed_iters++;
+    }
     // DP_LOG(DEBUG, "Training iteration %lu/%lu\n", ++i,
     //        dataset_pipeline_->GetItersPerEpoch());
-  }
 
-  end = std::chrono::steady_clock::now();
+    if (totiters == iters_before_graph_capture+1) {
+      warmingUp = false;
+    }
+  }
 
     std::chrono::_V2::steady_clock::time_point startSync0 = std::chrono::steady_clock::now();
   double loss = model->GetAvgLoss();
@@ -271,27 +282,35 @@ void JobContext::TrainOneEpoch() {
       std::chrono::_V2::steady_clock::time_point startSync3 = std::chrono::steady_clock::now();
   dataset_pipeline_->Reset();
 
-  std::chrono::_V2::steady_clock::time_point endSync = std::chrono::steady_clock::now();
+  end = std::chrono::steady_clock::now();
+
   using msec = std::chrono::duration<double, std::micro>;
-    double syncTime01 = std::chrono::duration_cast<msec>(startSync1 - startSync0).count();
-  double syncTime12 = std::chrono::duration_cast<msec>(startSync2 - startSync1).count();
-  double syncTime23 = std::chrono::duration_cast<msec>(startSync3 - startSync2).count();
-  double syncTime34 = std::chrono::duration_cast<msec>(endSync - startSync3).count();
+  // double syncTime01 = std::chrono::duration_cast<msec>(startSync1 - startSync0).count();
+  // double syncTime12 = std::chrono::duration_cast<msec>(startSync2 - startSync1).count();
+  // double syncTime23 = std::chrono::duration_cast<msec>(startSync3 - startSync2).count();
+  // double syncTime34 = std::chrono::duration_cast<msec>(end - startSync3).count();
 
-    DP_LOG(
-      NOTICE,
-      "sync times %.2f, %.2f, %.2f, %.2f", syncTime01, syncTime12, syncTime23, syncTime34);
+    // DP_LOG(
+    //   NOTICE,
+    //   "sync times %.2f, %.2f, %.2f, %.2f", syncTime01, syncTime12, syncTime23, syncTime34);
       
-
-  double syncTime = std::chrono::duration_cast<msec>(endSync - startSync0).count();
-
-  double elapsed_ms = std::chrono::duration_cast<msec>(end - start).count();
-  double total_iter_ms = elapsed_ms / (double)i;
+  double total_time = std::chrono::duration_cast<msec>(end - start).count();
+  double setup_time = std::chrono::duration_cast<msec>(end_setup - start).count();
+  double epoch_time = std::chrono::duration_cast<msec>(startSync0 - end_setup).count();
+  double syncTime = std::chrono::duration_cast<msec>(end - startSync0).count();
+  double total_iter_ms = epoch_time / (double)timed_iters;
   double total_iter_ps = 1e6 / total_iter_ms;
   DP_LOG(
       NOTICE,
-      "epoch time: %.2f ms, teardown time: %.2f ms, iter/s : %.2f, average data loading: %.2f ,s, average training time: %.2f ms", elapsed_ms / 1e3, syncTime / 1e3, total_iter_ps, averageDataTime/i/1e3, averageTrainTime/i/1e3);
-      
+      "Epoch complete:\
+      \n\tTotal: \t%.2f ms\
+      \n\tSetup: \t%.2f ms\
+      \n\tEpoch: \t%.2f ms\
+      \n\tTeardown: \t%.2f ms\
+      \n\tIter/s : \t%.2f\
+      \n\tAvg. dataloading: \t%.2f ms\
+      \n\tAvg. training: \t%.2f ms\
+      \n\tIterations: \t%zu", total_time / 1e3, setup_time / 1e3, epoch_time / 1e3, syncTime / 1e3, total_iter_ps, averageDataTime/timed_iters/1e3, averageTrainTime/timed_iters/1e3, timed_iters);
 }
 
 /**
