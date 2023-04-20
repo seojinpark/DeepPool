@@ -31,9 +31,9 @@ jobParams["catsdogs"] = True
 jobParams['training_data'] = "/Data/catsDogs/train.csv"
 jobParams['evaluation_data'] = "/Data/catsDogs/test.csv"
 
-jobParams['num_workers'] = 32
+jobParams['num_workers'] = 64
 
-jobParams['epochs_to_train'] = 1
+jobParams['epochs_to_train'] = 10
 
 # jobParams['loading_path'] = "/DeepPool/checkpoints"
 jobParams['checkpoint_path'] = "/DeepPool/checkpoints"

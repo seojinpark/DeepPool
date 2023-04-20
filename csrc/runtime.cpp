@@ -195,13 +195,33 @@ int RuntimeContext::poll()
     mainJob->Test();
   for (size_t i = 0; i < mainJob->GetEpochsToTrain(); i++)
   {
+    std::chrono::_V2::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+
     mainJob->TrainOneEpoch();
+
+    std::chrono::_V2::steady_clock::time_point t1 = std::chrono::steady_clock::now();
 
     mainJob->save_variables();
     mainJob->restore_variables();
 
+    std::chrono::_V2::steady_clock::time_point t2 = std::chrono::steady_clock::now();
+
     if (mainJob->ShouldRunTest())
       mainJob->Test();
+    
+    std::chrono::_V2::steady_clock::time_point t3 = std::chrono::steady_clock::now();
+
+    using msec = std::chrono::duration<double, std::micro>;
+    double totalEpoch = std::chrono::duration_cast<msec>(t3 - t0).count();
+    double savingLoading = std::chrono::duration_cast<msec>(t2 - t1).count();
+    double testing = std::chrono::duration_cast<msec>(t3 - t2).count();
+
+    DP_LOG(
+        NOTICE,
+        "\tTotal: \t%.2f ms\
+        \n\tSaving/Loading: \t%.2f ms\
+        \n\tValidation: \t%.2f ms", totalEpoch / 1e3, savingLoading / 1e3, testing / 1e3);
+
   }
 
   torch_stream.synchronize();

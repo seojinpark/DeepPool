@@ -250,14 +250,14 @@ void JobContext::TrainOneEpoch() {
       double trainTime = std::chrono::duration_cast<msec>(endTrianing - startTraining).count();
 
     if (warmingUp) {
-        DP_LOG(
-          NOTICE,
-          "Warmup:: dataloading: %.2f\ttraining: %.2f", dataTime, trainTime);
+        // DP_LOG(
+        //   NOTICE,
+        //   "Warmup:: dataloading: %.2f\ttraining: %.2f", dataTime, trainTime);
           end_setup = std::chrono::steady_clock::now();
     } else {
-        DP_LOG(
-          NOTICE,
-          "Training:: dataloading: %.2f\ttraining: %.2f", dataTime, trainTime);
+        // DP_LOG(
+        //   NOTICE,
+        //   "Training:: dataloading: %.2f\ttraining: %.2f", dataTime, trainTime);
 
       averageDataTime += dataTime;
       averageTrainTime += trainTime;
@@ -303,14 +303,14 @@ void JobContext::TrainOneEpoch() {
   DP_LOG(
       NOTICE,
       "Epoch complete:\
-      \n\tTotal: \t%.2f ms\
-      \n\tSetup: \t%.2f ms\
-      \n\tEpoch: \t%.2f ms\
-      \n\tTeardown: \t%.2f ms\
-      \n\tIter/s : \t%.2f\
-      \n\tAvg. dataloading: \t%.2f ms\
-      \n\tAvg. training: \t%.2f ms\
-      \n\tIterations: \t%zu", total_time / 1e3, setup_time / 1e3, epoch_time / 1e3, syncTime / 1e3, total_iter_ps, averageDataTime/timed_iters/1e3, averageTrainTime/timed_iters/1e3, timed_iters);
+      \n\tTrain step: \t%.2f ms\
+      \n\t\tSetup: \t%.2f ms\
+      \n\t\tModel: \t%.2f ms\
+      \n\t\tTeardown: \t%.2f ms\
+      \n\t\tIter/s : \t%.2f\
+      \n\t\tAvg. dataloading: \t%.2f ms\
+      \n\t\tAvg. training: \t%.2f ms\
+      \n\t\tIterations: \t%zu", total_time / 1e3, setup_time / 1e3, epoch_time / 1e3, syncTime / 1e3, total_iter_ps, averageDataTime/timed_iters/1e3, averageTrainTime/timed_iters/1e3, timed_iters);
 }
 
 /**
