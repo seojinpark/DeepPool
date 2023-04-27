@@ -144,11 +144,13 @@ GpuTask::GpuTask(bool hipri, c10::cuda::CUDAStream execution_stream,
   for (auto& p : pieces)
     tasks_.emplace_back(p, TASK_FLAGS_COMPUTE | TASK_FLAGS_EXTERNAL,
                         "BE task piece");
+  task_count_this_run = tasks_.size();
   TimeRun(true);
 }
 
 bool GpuTask::RunNext(c10::cuda::CUDAStream stream) {
   assert(next_run_idx < tasks_.size());
+  assert(next_run_idx < task_count_this_run);
   auto& t = tasks_[next_run_idx++];
 
   bool first = head_ptr++ == tail_ptr;
@@ -169,7 +171,7 @@ bool GpuTask::RunNext(c10::cuda::CUDAStream stream) {
     ev.block(nccl_stream);
     t.Run(nccl_stream);
     if (!t.IsAsync()) waiting_recv = true;
-    return next_run_idx >= tasks_.size();
+    return next_run_idx >= task_count_this_run;
   }
 
   if ((t.type_flags_ & TASK_FLAGS_STEP) > 0 && waiting_sync_side) {
@@ -185,7 +187,7 @@ bool GpuTask::RunNext(c10::cuda::CUDAStream stream) {
   }
 
   t.Run(stream);
-  return next_run_idx >= tasks_.size();
+  return next_run_idx >= task_count_this_run;
 }
 
 void GpuTask::ExecuteTasks() {
@@ -194,13 +196,22 @@ void GpuTask::ExecuteTasks() {
     ;
 }
 
-void GpuTask::Reset() {
+void GpuTask::ResetToEval() {
   FinishCompletion();
-  tasks_.clear();
   head_ptr = 0;
   tail_ptr = 0;
   waiting_recv = false;
+  task_count_this_run = task_count_eval_only;
 }
+
+void GpuTask::ResetToTrain() {
+  FinishCompletion();
+  head_ptr = 0;
+  tail_ptr = 0;
+  waiting_recv = false;
+  task_count_this_run = tasks_.size();
+}
+
 
 void GpuTask::TimeRun(bool no_bench) {
   std::vector<at::cuda::CUDAEvent> start_events;
@@ -266,7 +277,7 @@ void GpuTask::TimeRun(bool no_bench) {
 void GpuTask::DumpState() {
   std::set<size_t> active_tasks;
   for (uint32_t curptr = tail_ptr; curptr != head_ptr; curptr++)
-    active_tasks.insert(curptr % tasks_.size());
+    active_tasks.insert(curptr % task_count_this_run);
 
   double total_us_bench = 0, total_us_recent = 0, total_us_last = 0;
 
@@ -325,14 +336,24 @@ void GpuTask::CombineGraphs() {
 
     if (tf.cb_) {
       finMerge();
+
+      // Prev task marks end of forward pass
+      if (tf.type_flags_ & TASK_FLAGS_FWD_PASS_BARRIER)
+        task_count_eval_only = newTasks.size() + 1;
+
       newTasks.push_back(std::move(tf));
       tasks_.erase(tasks_.begin());
       continue;
     }
 
-    if (prevtype != tf.type_flags_ ||
+    if (prevtype != tf.type_flags_ || (prevtype & TASK_FLAGS_FWD_PASS_BARRIER) > 0 ||
         total_us + tf.timings_.benchmark_us > graph_merge_max_us) {
       finMerge();
+
+      // Prev task marks end of forward pass
+      if (prevtype & TASK_FLAGS_FWD_PASS_BARRIER)
+        task_count_eval_only = newTasks.size();
+
       prevtype = tf.type_flags_;
     }
 
@@ -348,6 +369,8 @@ void GpuTask::CombineGraphs() {
   finMerge();
 
   tasks_ = std::move(newTasks);
+  task_count_this_run = tasks_.size();
+
   TimeRun(true);
 
   total_us = 0;
@@ -397,7 +420,7 @@ void GpuTask::PollCompletions() {
   uint64_t now = Cycles::microtime();
 
   while (head_ptr != tail_ptr) {
-    auto& t = tasks_[tail_ptr % tasks_.size()];
+    auto& t = tasks_[tail_ptr % task_count_this_run];
     if (nr_completed >= 1) t.timings_.execute_time_begin = now;
     t.timings_.elapsed_execution_time = now - t.timings_.execute_time_begin;
     if (!t.timings_.ev.query()) break;
@@ -427,7 +450,7 @@ void GpuManager::DoWork() {
     while (task->IsManagerOwned() &&
            (task->GetEnqueuedNr() < fg_tasklet_depth)) {
       task->RunNext();
-      if (task->next_run_idx == task->tasks_.size()) {
+      if (task->next_run_idx == task->task_count_this_run) {
         task->next_run_idx = 0;
         task->ManagerReleaseOwnership();
         break;
@@ -471,7 +494,7 @@ void GpuManager::DoWork() {
     if (!can_run_be) continue;
 
     task->RunNext();
-    if (task->next_run_idx == task->tasks_.size()) {
+    if (task->next_run_idx == task->task_count_this_run) {
       task->next_run_idx = 0;
       task->ManagerReleaseOwnership();
     }

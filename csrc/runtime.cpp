@@ -193,6 +193,10 @@ int RuntimeContext::poll()
 
   if (mainJob->ShouldRunTest())
     mainJob->Test();
+
+  if (rtctx->use_fg_graph)
+     mainJob->QueueGraphCapture();
+
   for (size_t i = 0; i < mainJob->GetEpochsToTrain(); i++)
   {
     std::chrono::_V2::steady_clock::time_point t0 = std::chrono::steady_clock::now();

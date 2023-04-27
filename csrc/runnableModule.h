@@ -264,6 +264,7 @@ class RunnableModule {
   std::deque<std::shared_ptr<Layer>> layerQ;
   torch::Tensor fpTargets;
   torch::Tensor fpOutput;
+  torch::Tensor fpLoss;
   LossFunctions lossfn_;
 
   torch::Tensor loss_tracker_;
@@ -283,10 +284,10 @@ class RunnableModule {
 
   void ResetGraphs() {
     rtctx->torch_stream.synchronize();
-    if (has_graph) GpuManager::getInstance()->RemoveTask(cur_task);
-    cur_task->Reset();
-    has_graph = false;
-    // sync before possible future calls into NCCL
+    if (!has_graph) return;
+    GpuManager::getInstance()->RemoveTask(cur_task);
+    isTrain_ ? cur_task->ResetToTrain() : cur_task->ResetToEval();
+    GpuManager::getInstance()->AddTask(cur_task);
     rtctx->torch_stream.synchronize();
   }
 };

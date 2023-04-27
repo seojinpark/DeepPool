@@ -77,8 +77,8 @@ if (job_params.contains("loading_path")) loading_path = job_params["loading_path
         dset + "_eval", job_params, rtctx->worldSize, rtctx->rank, model->globalBatchSize,
         model->input_layers, model->sampleIndices, 10));
   }
-  if (!rtctx->use_fg_graph)
-    iters_before_graph_capture = itersToTrain * epochsToTrain;
+
+  iters_before_graph_capture = itersToTrain * epochsToTrain;
 }
 
 /**
@@ -171,9 +171,6 @@ void JobContext::Test() {
   torch::Tensor correct = torch::zeros({1}).to(at::kLong).to(rtctx->c10dev);
 
 
-  if (iters_before_graph_capture < totiters && rtctx->use_fg_graph)
-    iters_before_graph_capture = totiters + 5;
-
   size_t i = 0;
   while (!eval_dataset_->IsDone()) {
     total += model->GetGlobalBatchSize();
@@ -190,8 +187,6 @@ void JobContext::Test() {
     DP_LOG(DEBUG, "Evaluate iteration %lu/%lu\n", ++i,
            eval_dataset_->GetItersPerEpoch());
   }
-
-  iters_before_graph_capture = 0;
 
   if (nr_gpus_ > 1) {
     rtctx->torch_stream.synchronize();  // sync before calling into NCCL
@@ -232,9 +227,7 @@ void JobContext::TrainOneEpoch() {
   double averageDataTime = 0;
   double averageTrainTime = 0;
   size_t timed_iters = 0;
-  if (!model->isTrain() && iters_before_graph_capture < totiters &&
-      rtctx->use_fg_graph)
-    iters_before_graph_capture = totiters + 5;
+  size_t i = 0;
   while (!dataset_pipeline_->IsDone() && !job_done_) {
     std::chrono::_V2::steady_clock::time_point startDataLoading = std::chrono::steady_clock::now();
     auto batch = dataset_pipeline_->getNext();
@@ -275,7 +268,6 @@ void JobContext::TrainOneEpoch() {
   double loss = model->GetAvgLoss();
       std::chrono::_V2::steady_clock::time_point startSync1 = std::chrono::steady_clock::now();
   DP_LOG(NOTICE, "Epoch done. Loss %.2f", loss);
-  iters_before_graph_capture = 0;
   rtctx->torch_stream.synchronize();
       std::chrono::_V2::steady_clock::time_point startSync2 = std::chrono::steady_clock::now();
   be_img_end = GetBeCounter();

@@ -67,6 +67,10 @@ class JobContext {
 
   void printJobStatistics();
 
+  void QueueGraphCapture() {
+    iters_before_graph_capture = totiters + 5;
+  }
+
   std::unique_ptr<RunnableModule> model;
   std::string name;
   std::shared_ptr<CommunicationHandler> commHandler;
