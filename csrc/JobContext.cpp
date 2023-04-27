@@ -79,8 +79,7 @@ JobContext::JobContext(std::unique_ptr<RunnableModule> modelIn,
         dset + "_eval", job_params, rtctx->rank, model->globalBatchSize,
         model->input_layers, model->sampleIndices, 10));
 
-  if (!rtctx->use_fg_graph)
-    iters_before_graph_capture = itersToTrain * epochsToTrain;
+  iters_before_graph_capture = itersToTrain * epochsToTrain;
 }
 
 /**
@@ -172,9 +171,6 @@ void JobContext::Test() {
 
   eval_dataset_->Reset();
 
-  if (iters_before_graph_capture < totiters && rtctx->use_fg_graph)
-    iters_before_graph_capture = totiters + 5;
-
   size_t i = 0;
   while (!eval_dataset_->IsDone()) {
     total += model->GetGlobalBatchSize();
@@ -191,8 +187,6 @@ void JobContext::Test() {
     DP_LOG(DEBUG, "Evaluate iteration %lu/%lu\n", ++i,
            eval_dataset_->GetItersPerEpoch());
   }
-
-  iters_before_graph_capture = 0;
 
   if (nr_gpus_ > 1) {
     rtctx->torch_stream.synchronize();  // sync before calling into NCCL
@@ -225,9 +219,6 @@ void JobContext::Train(std::vector<torch::Tensor> inputs,
 
 void JobContext::TrainOneEpoch() {
   size_t i = 0;
-  if (!model->isTrain() && iters_before_graph_capture < totiters &&
-      rtctx->use_fg_graph)
-    iters_before_graph_capture = totiters + 5;
   while (!dataset_pipeline_->IsDone() && !job_done_) {
     auto batch = dataset_pipeline_->getNext();
     Train(batch.data, batch.target);
@@ -236,7 +227,6 @@ void JobContext::TrainOneEpoch() {
   }
   double loss = model->GetAvgLoss();
   DP_LOG(NOTICE, "Epoch done. Loss %.2f", loss);
-  iters_before_graph_capture = 0;
   rtctx->torch_stream.synchronize();
   end = std::chrono::steady_clock::now();
   be_img_end = GetBeCounter();

@@ -32,6 +32,7 @@
 #define TASK_FLAGS_MULTIPLEX (1U << 7)
 #define TASK_FLAGS_STEP (1U << 8)
 #define TASK_FLAGS_ALLREDUCE_SIDE (1U << 9)
+#define TASK_FLAGS_FWD_PASS_BARRIER (1U << 10)
 
 class OwnedGraph {
  public:
@@ -188,7 +189,10 @@ class GpuTask {
   bool RunNext() { return RunNext(execution_stream); }
 
   void ExecuteTasks();
-  void Reset();
+
+  void ResetToEval();
+  void ResetToTrain();
+
   void TimeRun(bool);
   void CombineGraphs();
 
@@ -238,6 +242,8 @@ class GpuTask {
 
   friend class GpuManager;
   std::vector<Tasklet> tasks_;
+  size_t task_count_this_run;
+  size_t task_count_eval_only;
   bool is_high_priority{true};
   bool waiting_recv{false};
   bool waiting_sync_side{false};

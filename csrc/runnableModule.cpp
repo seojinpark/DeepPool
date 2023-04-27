@@ -259,14 +259,16 @@ void RunnableModule::SetMode(bool train) {
   if (train == isTrain_) return;
   isTrain_ = train;
   ResetGraphs();
-  for (auto& l : layers) {
-    if (!l->active) continue;
-    if (train)
-      l->module.train();
-    else
-      l->module.eval();
+  if (!has_graph) {
+    for (auto& l : layers) {
+      if (!l->active) continue;
+      if (train)
+        l->module.train();
+      else
+        l->module.eval();
+    }
   }
-  loss_tracker_ = torch::zeros({1}).to(rtctx->c10dev);
+  loss_tracker_.zero_(); // = torch::zeros({1}).to(rtctx->c10dev);
   nr_iters_ = 0;
 }
 
@@ -423,11 +425,11 @@ void Layer::DoBackward(RunnableModule* model, bool captureLayer) {
   ScopedGraphRecorder graph(model, TASK_FLAGS_COMPUTE, "backward_" + layername);
 
   /* last layer */
-  if (nextLayers.size() == 0 && model->fpOutput.defined()) {
+  if (nextLayers.size() == 0 && model->fpLoss.defined()) {
     DP_LOG(DEBUG, "Backward on fpLoss:%s",
-           tsrSizeToStr(model->fpOutput).c_str());
-    model->fpOutput.backward();
-    model->fpOutput.reset();
+           tsrSizeToStr(model->fpLoss).c_str());
+    model->fpLoss.backward();
+    model->fpLoss.reset();
   }
 
   for (size_t nli = 0; nli < nextLayers.size(); nli++) {
@@ -612,6 +614,10 @@ JobStatus RunnableModule::forwardAStep(bool captureLayer) {
   if (layerQ.empty()) {
     DP_LOG(DEBUG, "no more layers to process.");
     fpOutput = output;
+
+    if (graph_recording)
+      cur_task->AddTask({[](c10::cuda::CUDAStream){}, TASK_FLAGS_FWD_PASS_BARRIER, "fwdpassbarrier"});
+
     return COMPLETED;
   }
 
@@ -628,16 +634,16 @@ void RunnableModule::loss() {
     std::vector<c10::IValue> iVec;
     iVec.emplace_back(fpOutput);
     iVec.emplace_back(fpTargets);
-    fpOutput = lossLayer->module.forward(iVec).toTensor();
+    fpLoss = lossLayer->module.forward(iVec).toTensor();
   } else if (lossfn_ == LossFunctions::CrossEntropyLoss) {
     auto loss_fct = torch::nn::CrossEntropyLoss();
-    fpOutput = loss_fct(fpOutput, fpTargets.view({-1}));
+    fpLoss = loss_fct(fpOutput, fpTargets.view({-1}));
   } else {
     assert(lossfn_ == LossFunctions::NLLLoss);
-    fpOutput = torch::nll_loss(fpOutput.log_softmax(1), fpTargets);
+    fpLoss = torch::nll_loss(fpOutput.log_softmax(1), fpTargets);
   }
 
-  loss_tracker_ += fpOutput;
+  loss_tracker_ += fpLoss;
 }
 
 /**
