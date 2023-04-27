@@ -117,11 +117,14 @@ def run_training():
     cs.computeInputDimensions((3,32,32))
     globalBatch = int(sys.argv[2])
     gpuCount = int(sys.argv[1])
-    job, iterMs, gpuMs, maxGpusUsed = cs.searchBestSplitsV3(gpuCount, globalBatch, amplificationLimit=float(sys.argv[3]))
+    job, iterMs, gpuMs, maxGpusUsed = cs.searchBestSplitsV3(gpuCount, globalBatch, dataParallelBaseline=True)
 
     from clusterClient import ClusterClient
     cc = ClusterClient()
-    cc.submitTrainingJob("vgg16_cifar", job.dumpInJSON())
+    jobParams = {}
+    jobParams['cifar_training'] = True
+    jobParams['epochs_to_train'] = 20
+    cc.submitTrainingJob("vgg16_cifar", job.dumpInJSON(), jobParams=jobParams)
 
 
 if __name__ == '__main__':
