@@ -205,8 +205,10 @@ int RuntimeContext::poll()
 
     std::chrono::_V2::steady_clock::time_point t1 = std::chrono::steady_clock::now();
 
-    mainJob->save_variables();
-    mainJob->restore_variables();
+    if (i == mainJob->GetEpochsToTrain() - 1) {
+      mainJob->save_variables();
+      mainJob->restore_variables();
+    }
 
     std::chrono::_V2::steady_clock::time_point t2 = std::chrono::steady_clock::now();
 
